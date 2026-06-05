@@ -9,7 +9,7 @@ build-backend = "hatchling.build"
 # `claude-orchestrator` name was already taken on PyPI by an unrelated
 # project, and (b) `cco` matches the binary that `pip install` exposes.
 name = "cco"
-version = "0.1.0"
+version = "0.1.1"
 description = "Linux-native dashboard + lifecycle orchestrator for Claude Code sessions"
 readme = "README.md"
 requires-python = ">=3.11"

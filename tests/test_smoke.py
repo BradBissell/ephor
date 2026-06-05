@@ -10,7 +10,7 @@ from claude_orchestrator.cli import main
 
 
 def test_version_attribute() -> None:
-    assert claude_orchestrator.__version__ == "0.1.0"
+    assert claude_orchestrator.__version__ == "0.1.1"
 
 
 def test_main_no_args_launches_tui(monkeypatch) -> None:
@@ -50,4 +50,4 @@ def test_version_via_subprocess() -> None:
         timeout=5,
         check=True,
     )
-    assert "cco 0.1.0" in result.stdout
+    assert "cco 0.1.1" in result.stdout

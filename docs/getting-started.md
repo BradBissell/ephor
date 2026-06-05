@@ -17,7 +17,7 @@ python3 -c 'import sys; assert sys.version_info >= (3,11)' && echo "✓ python �
 
 ```bash
 pipx install cco          # or: pip install --user cco / uv tool install cco
-cco --version             # → cco 0.1.0
+cco --version             # → cco 0.1.1
 ```
 
 To hack on cco itself, install editable from a checkout instead:
