@@ -319,9 +319,7 @@ class SpeechPlayer:
         elif kind == "stop":
             self.stop(sid)
 
-    def _spawn_summary_worker(
-        self, item: QueueItem, transcript_path: str, cwd: str | None
-    ) -> None:
+    def _spawn_summary_worker(self, item: QueueItem, transcript_path: str, cwd: str | None) -> None:
         """Run the summarizer in a daemon thread and post the resulting
         QueueItem back via ``self._pending``.
 

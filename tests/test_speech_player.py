@@ -599,9 +599,14 @@ def test_summary_mode_replaces_text_with_summarizer_output(
     transcript = tmp_path / "t.jsonl"
     transcript.write_text("{}\n")
 
-    player._route_event(_start_event("s1", "the full reply that we DO NOT want spoken",
-                                       transcript_path=str(transcript),
-                                       cwd=str(tmp_path)))
+    player._route_event(
+        _start_event(
+            "s1",
+            "the full reply that we DO NOT want spoken",
+            transcript_path=str(transcript),
+            cwd=str(tmp_path),
+        )
+    )
 
     # Nothing playing yet — the worker has to run + the next tick drains
     # the pending queue.
