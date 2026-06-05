@@ -15,12 +15,16 @@ python3 -c 'import sys; assert sys.version_info >= (3,11)' && echo "✓ python �
 
 ## 2. Install
 
-While the project is in pre-v1, install editable from your local checkout:
+```bash
+pipx install cco          # or: pip install --user cco / uv tool install cco
+cco --version             # → cco 0.1.0
+```
+
+To hack on cco itself, install editable from a checkout instead:
 
 ```bash
 cd ~/projects/claude-orchestrator
 pipx install --editable .
-cco --version  # → cco 0.0.0
 ```
 
 ## 3. Wire up hooks
@@ -93,7 +97,15 @@ The widget output is colour-coded:
 | `I:N`    | N idle sessions (dim) |
 | `·`      | No sessions detected |
 
-## 6. Per-session details on demand
+## 6. The dashboard (`cco`)
+
+Bare `cco` (or the explicit `cco tui`) opens the live Textual
+dashboard — the daily-driver UI. Use
+`j`/`k` or arrows to move, `Enter` to jump to a session's tmux pane,
+`/` to filter, `x` to kill, `n` to hop to the next session needing
+attention, and `?` for the full keymap.
+
+Prefer the shell? The same state is available script-side:
 
 ```bash
 # Watch the table refresh (2s default; tweak with -n)
@@ -103,10 +115,63 @@ watch -n 2 'cco list'
 cat ~/.local/state/claude-orchestrator/sessions/<sid>.json | jq .
 ```
 
-A real Textual dashboard (`cco tui`) is wired in P6 of the roadmap. For
-now, `watch cco list` is the daily-driver UI.
+## 7. Hear your sessions (TTS speak-back)
 
-## 7. Troubleshooting
+When you're juggling many sessions, the hard part is noticing which one
+just finished. cco can speak a one-line summary of each reply so you can
+stay focused on one window and still track the rest by ear.
+
+Requires a local [kokoro](https://github.com/hexgrad/kokoro) TTS
+pipeline (cco looks for `~/.local/share/kokoro-tts/play-ducked.sh`, or
+set `CCO_TTS_COMMAND` to your own). No Anthropic API key is needed — the
+summarizer reuses your existing Claude Code login via `claude -p`.
+
+```bash
+# Hand playback to cco. Removes the tts-speak-response Stop hook so cco's
+# cross-session FIFO queue is the single source of audio. Preview first:
+cco speech install --dry-run
+cco speech install
+
+# Speak a one-sentence summary instead of the whole reply — ideal for
+# parallel work. You'll hear e.g. "DR-1423: added retry to upload client".
+cco speech mode summary
+
+# Confirm what's on and which layer (env / file / default) decided it.
+cco speech status
+```
+
+Now launch `cco` and let a session finish — its summary speaks as soon
+as the reply lands. If several sessions finish at once they queue and
+play one at a time (newest reply for a given session wins; a stale one
+mid-playback is preempted). The bottom speech bar shows who's talking
+and who's waiting.
+
+Handy controls while the TUI is open:
+
+| Key | Action |
+|---|---|
+| `m` | Mute / unmute (the bar still mirrors speech; no audio) |
+| `M` | Toggle full reply ↔ one-line summary live |
+| `t` | Jump to the session currently speaking |
+| `s` | Summarize the selected session on demand |
+
+And from the shell:
+
+```bash
+cco speech mode full          # read the whole reply instead of a summary
+cco speech disable            # silence audio (persisted)
+cco speech reset-calibration  # forget the learned rate after changing voice/speed
+
+# One-shot overrides (no disk write) — e.g. silence cco for a meeting:
+CCO_TTS_ENABLED=0 cco
+CCO_TTS_MODE=summary cco
+```
+
+Without the kokoro pipeline installed, every `cco speech` command and
+the speech bar still work — they just show what *would* play instead of
+producing audio.
+
+## 8. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
@@ -116,13 +181,10 @@ now, `watch cco list` is the daily-driver UI.
 | Hook handler errors in `~/.claude/settings.json.bak.*` | `cco uninstall --restore-backup` resets to the most recent good backup |
 | Want to nuke everything | `cco uninstall && rm -rf ~/.local/state/claude-orchestrator ~/.config/claude-orchestrator` |
 
-## 8. What's next
+## 9. Going deeper
 
-See `docs/project-brief.md` for the full roadmap. The next milestone (P5+)
-adds:
-
-- Reconciliation pass (mark dead sessions DEAD)
-- Textual TUI dashboard (`cco tui`)
-- Linux notifications via `notify-send`
-- Rules engine (auto-allow/deny via `~/.config/claude-orchestrator/rules.yaml`)
-- claude-resume-recent integration (tmux pane tagging)
+- [`architecture.md`](architecture.md) — how the hook → state-file → TUI
+  pipeline fits together, plus the speech subsystem.
+- [`../SECURITY.md`](../SECURITY.md) — the full network/disk surface area.
+- `cco doctor` — checks that hooks, paths, and dependencies are wired up
+  correctly if something looks off.
