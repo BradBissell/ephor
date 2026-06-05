@@ -294,9 +294,10 @@ emit_speech_start_event() {
   # than relying on the parent's top-level vars, since the parent may have
   # exited by the time we get here.
   local hook_json="$1"
-  local sid transcript
+  local sid transcript cwd
   sid="$(printf '%s' "$hook_json" | jq -r '.session_id // empty' 2>/dev/null)"
   transcript="$(printf '%s' "$hook_json" | jq -r '.transcript_path // empty' 2>/dev/null)"
+  cwd="$(printf '%s' "$hook_json" | jq -r '.cwd // empty' 2>/dev/null)"
   [ -z "$sid" ] && return 0
   [ -z "$transcript" ] && return 0
   [ ! -f "$transcript" ] && return 0
@@ -344,6 +345,12 @@ try:
 except ValueError:
     speed = 1.3
 raw = sys.argv[3] if len(sys.argv) > 3 else ""
+# Optional extras — passed positionally; absent values arrive as "".
+# Carried in the start record so consumers (e.g. the cco speech_player
+# in summary-mode) can re-derive a brief without re-walking the
+# transcript on disk. Old listeners ignore unknown fields.
+transcript_path = sys.argv[4] if len(sys.argv) > 4 else ""
+cwd = sys.argv[5] if len(sys.argv) > 5 else ""
 
 # Cap on the *bar* text. To actually HEAR more, the user must also raise
 # the cap inside ~/.claude/hooks/tts-speak-response (the kokoro pipeline
@@ -379,15 +386,20 @@ if buf:
     out.append(buf)
 
 ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-sys.stdout.write(json.dumps({
+record = {
     "event": "start",
     "ts": ts,
     "session_id": sid,
     "text": t,
     "sentences": out,
     "speed": speed,
-}, separators=(",", ":")))
-' "$sid" "${KOKORO_SPEED:-1.3}" "$text" 2>/dev/null)"
+}
+if transcript_path:
+    record["transcript_path"] = transcript_path
+if cwd:
+    record["cwd"] = cwd
+sys.stdout.write(json.dumps(record, separators=(",", ":")))
+' "$sid" "${KOKORO_SPEED:-1.3}" "$text" "$transcript" "$cwd" 2>/dev/null)"
   [ -z "$payload" ] && return 0
   speech_append_locked "$payload"
 }

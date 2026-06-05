@@ -24,6 +24,15 @@ from pathlib import Path
 from typing import Any
 
 ENV_VAR = "CCO_TTS_ENABLED"
+MODE_ENV_VAR = "CCO_TTS_MODE"
+
+# Speak-mode values. ``full`` reads the entire assistant message (the
+# legacy behaviour); ``summary`` reads a one-sentence brief — same
+# summary the dashboard column already shows — so the user is notified
+# without having to listen to the whole response.
+SPEAK_MODE_FULL = "full"
+SPEAK_MODE_SUMMARY = "summary"
+_VALID_SPEAK_MODES = {SPEAK_MODE_FULL, SPEAK_MODE_SUMMARY}
 
 
 class SettingsSource(Enum):
@@ -44,6 +53,12 @@ class SpeechSettings:
     # by speech.py's rate function so the karaoke + progress bar advance
     # at YOUR kokoro's actual reading speed instead of a hardcoded guess.
     calibrated_chars_per_sec: float | None = None
+    # What gets spoken on each Stop event. ``full`` = the whole reply
+    # (legacy); ``summary`` = the same one-sentence summary the dashboard
+    # column shows, so the user gets a verbal notification instead of an
+    # entire monologue. Persisted alongside `enabled`.
+    speak_mode: str = SPEAK_MODE_FULL
+    mode_source: SettingsSource = SettingsSource.DEFAULT
 
 
 def settings_path() -> Path:
@@ -84,6 +99,7 @@ def load() -> SpeechSettings:
             pass
 
     calibrated = _coerce_calibrated_rate(file_data.get("calibrated_chars_per_sec"))
+    mode, mode_source = _resolve_speak_mode(file_data)
 
     env_val = _parse_bool(os.environ.get(ENV_VAR))
     if env_val is not None:
@@ -91,6 +107,8 @@ def load() -> SpeechSettings:
             enabled=env_val,
             source=SettingsSource.ENV,
             calibrated_chars_per_sec=calibrated,
+            speak_mode=mode,
+            mode_source=mode_source,
         )
 
     if "enabled" in file_data:
@@ -98,13 +116,35 @@ def load() -> SpeechSettings:
             enabled=bool(file_data["enabled"]),
             source=SettingsSource.FILE,
             calibrated_chars_per_sec=calibrated,
+            speak_mode=mode,
+            mode_source=mode_source,
         )
 
     return SpeechSettings(
         enabled=_default_enabled(),
         source=SettingsSource.DEFAULT,
         calibrated_chars_per_sec=calibrated,
+        speak_mode=mode,
+        mode_source=mode_source,
     )
+
+
+def _resolve_speak_mode(file_data: dict[str, Any]) -> tuple[str, SettingsSource]:
+    """Pick the effective speak_mode + report which layer set it.
+
+    Order matches `enabled`: env wins, then file, then default. Unknown
+    values fall through silently to the next layer (a typo in the env
+    shouldn't lock the user into a broken mode).
+    """
+    env_raw = os.environ.get(MODE_ENV_VAR)
+    if env_raw:
+        candidate = env_raw.strip().lower()
+        if candidate in _VALID_SPEAK_MODES:
+            return candidate, SettingsSource.ENV
+    file_raw = file_data.get("speak_mode")
+    if isinstance(file_raw, str) and file_raw.lower() in _VALID_SPEAK_MODES:
+        return file_raw.lower(), SettingsSource.FILE
+    return SPEAK_MODE_FULL, SettingsSource.DEFAULT
 
 
 def _coerce_calibrated_rate(value: object) -> float | None:
@@ -127,12 +167,15 @@ def save(
     *,
     calibrated_chars_per_sec: float | None = None,
     clear_calibration: bool = False,
+    speak_mode: str | None = None,
 ) -> Path:
     """Atomically merge updates into the config file.
 
     Only the kwargs you pass get written; everything else is preserved.
     `clear_calibration=True` removes the calibrated_chars_per_sec field
-    (used by `cco speech reset-calibration`).
+    (used by `cco speech reset-calibration`). ``speak_mode`` accepts
+    ``"full"`` or ``"summary"``; other values raise ValueError so a CLI
+    typo doesn't silently persist garbage.
     """
     p = settings_path()
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -153,6 +196,12 @@ def save(
         current.pop("calibrated_chars_per_sec", None)
     elif calibrated_chars_per_sec is not None:
         current["calibrated_chars_per_sec"] = float(calibrated_chars_per_sec)
+    if speak_mode is not None:
+        if speak_mode not in _VALID_SPEAK_MODES:
+            raise ValueError(
+                f"speak_mode must be one of {sorted(_VALID_SPEAK_MODES)}; got {speak_mode!r}"
+            )
+        current["speak_mode"] = speak_mode
 
     payload = json.dumps(current, indent=2) + "\n"
     tmp = p.with_suffix(p.suffix + ".tmp")

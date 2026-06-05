@@ -275,3 +275,37 @@ async def test_row_marker_clears_when_speech_stops(populated_dir: Path, speech_l
         await pilot.pause()
         alpha_text = str(app._rows_by_sid["alpha-id"].render())  # type: ignore[union-attr]
         assert "▌" not in alpha_text
+
+
+@pytest.mark.asyncio
+async def test_action_toggle_speak_mode_flips_player_and_persists(
+    populated_dir: Path,
+    speech_log: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`M` flips between full and summary modes, persists to disk, and
+    keeps the player's runtime mode in sync."""
+    monkeypatch.setenv("CCO_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("CCO_TTS_ENABLED", raising=False)
+    monkeypatch.delenv("CCO_TTS_MODE", raising=False)
+    from claude_orchestrator import speech_settings
+
+    app = CcoApp(manager=StateManager(populated_dir))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        await pilot.pause()
+        # Default is "full" — a clean install never starts in summary mode
+        # (that would surprise existing users on first launch after upgrade).
+        assert app._speech_player.speak_mode == speech_settings.SPEAK_MODE_FULL
+
+        app.action_toggle_speak_mode()
+        await pilot.pause()
+        assert app._speech_player.speak_mode == speech_settings.SPEAK_MODE_SUMMARY
+        # Persistence: the file reflects the new mode.
+        assert speech_settings.load().speak_mode == speech_settings.SPEAK_MODE_SUMMARY
+
+        # Toggle back.
+        app.action_toggle_speak_mode()
+        await pilot.pause()
+        assert app._speech_player.speak_mode == speech_settings.SPEAK_MODE_FULL
+        assert speech_settings.load().speak_mode == speech_settings.SPEAK_MODE_FULL

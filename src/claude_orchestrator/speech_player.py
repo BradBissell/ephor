@@ -33,10 +33,13 @@ Design discipline:
 
 from __future__ import annotations
 
+import logging
 import os
+import queue
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -45,7 +48,20 @@ from typing import Any
 
 from claude_orchestrator.speech import SpeechWatcher, estimated_duration_ms
 
+log = logging.getLogger(__name__)
+
 MAX_QUEUE = 5
+
+# Speak modes (mirrors speech_settings — duplicated here so this module
+# stays importable without dragging in the settings module on the hot
+# path. The values must stay in sync.)
+SPEAK_MODE_FULL = "full"
+SPEAK_MODE_SUMMARY = "summary"
+
+# Type alias for an injectable summarizer — keeps the player testable
+# without shelling out to `claude -p`. Matches summarize_transcript's
+# (path, cwd) signature so the default binding is a one-liner.
+SummarizeFn = Callable[[Path, str | None], str]
 
 # Default playback command: pipe `text` on stdin, ducks other audio, plays
 # via kokoro+paplay. Mirrors the user's existing tts-speak-response wiring
@@ -137,6 +153,8 @@ class SpeechPlayer:
         watcher: SpeechWatcher | None = None,
         max_queue: int = MAX_QUEUE,
         muted: bool = False,
+        speak_mode: str = SPEAK_MODE_FULL,
+        summarizer: SummarizeFn | None = None,
     ) -> None:
         if spawner is None:
             cmd = default_tts_command()
@@ -151,6 +169,16 @@ class SpeechPlayer:
         # spawner is bypassed — no audio. Toggling mute terminates any
         # in-flight playback.
         self._muted = muted
+        # Speak mode governs WHAT we read: full assistant reply vs. a
+        # one-sentence summary. Summary mode runs the existing
+        # subscription-auth summarizer (no API key required) on a
+        # background thread; results land back on the main thread via
+        # `_pending` and get enqueued during the next tick().
+        self._speak_mode = (
+            speak_mode if speak_mode in (SPEAK_MODE_FULL, SPEAK_MODE_SUMMARY) else SPEAK_MODE_FULL
+        )
+        self._summarizer = summarizer
+        self._pending: queue.Queue[QueueItem] = queue.Queue()
 
     # ---- introspection (used by SpeechBar / tests) -----------------------
 
@@ -165,6 +193,20 @@ class SpeechPlayer:
     @property
     def is_muted(self) -> bool:
         return self._muted
+
+    @property
+    def speak_mode(self) -> str:
+        return self._speak_mode
+
+    def set_speak_mode(self, mode: str) -> None:
+        """Switch between "full" and "summary" at runtime.
+
+        Mode change affects only NEW start events — items already
+        playing or queued keep whatever text they were enqueued with.
+        Unknown values are ignored (keeps a typo from breaking audio).
+        """
+        if mode in (SPEAK_MODE_FULL, SPEAK_MODE_SUMMARY):
+            self._speak_mode = mode
 
     def set_muted(self, muted: bool) -> None:
         """Flip the audio gate.
@@ -230,6 +272,16 @@ class SpeechPlayer:
         if self._watcher is not None:
             for ev in self._watcher.poll():
                 self._route_event(ev)
+        # Drain any summary-mode work that completed since the last tick.
+        # Each background worker pushes one finished QueueItem here; the
+        # tick is where it joins the regular FIFO so all the
+        # preempt/dedup rules apply uniformly.
+        while True:
+            try:
+                pending = self._pending.get_nowait()
+            except queue.Empty:
+                break
+            self.enqueue(pending)
         self._reap_if_finished()
 
     # ---- internals -------------------------------------------------------
@@ -247,16 +299,74 @@ class SpeechPlayer:
                 speed = float(ev.get("speed") or 1.3)
             except (TypeError, ValueError):
                 speed = 1.3
-            self.enqueue(
-                QueueItem(
-                    session_id=sid,
-                    text=text,
-                    sentences=sentences,
-                    speed=speed,
-                )
+            item = QueueItem(
+                session_id=sid,
+                text=text,
+                sentences=sentences,
+                speed=speed,
             )
+            transcript_raw = ev.get("transcript_path")
+            cwd_raw = ev.get("cwd")
+            if (
+                self._speak_mode == SPEAK_MODE_SUMMARY
+                and isinstance(transcript_raw, str)
+                and transcript_raw
+            ):
+                cwd = cwd_raw if isinstance(cwd_raw, str) and cwd_raw else None
+                self._spawn_summary_worker(item, transcript_raw, cwd)
+            else:
+                self.enqueue(item)
         elif kind == "stop":
             self.stop(sid)
+
+    def _spawn_summary_worker(
+        self, item: QueueItem, transcript_path: str, cwd: str | None
+    ) -> None:
+        """Run the summarizer in a daemon thread and post the resulting
+        QueueItem back via ``self._pending``.
+
+        The summarizer shells out to ``claude -p`` (subscription auth —
+        no API key needed), which can take 2-3 seconds. Doing this on
+        the main tick would freeze the TUI; doing it sync would also
+        break the FIFO ordering of fast-following responses.
+
+        On any failure (timeout, missing binary, empty result) we fall
+        back to a truncated version of the original assistant text so
+        the user still gets *some* audible signal that a response
+        arrived. That's the whole point of summary mode: notification.
+        """
+
+        def worker() -> None:
+            summary = ""
+            try:
+                if self._summarizer is not None:
+                    summary = self._summarizer(Path(transcript_path), cwd)
+                else:
+                    # Lazy import: pulling summarizer eagerly would drag
+                    # subprocess+json into every cco process at startup.
+                    from claude_orchestrator.summarizer import summarize_transcript
+
+                    summary = summarize_transcript(Path(transcript_path), cwd=cwd)
+            except Exception:  # noqa: BLE001 - background work must not crash the TUI
+                log.debug("summary worker failed", exc_info=True)
+                summary = ""
+            if not summary:
+                # Fallback: a short preamble so the user is still
+                # notified audibly that something completed. 200 chars
+                # is roughly 15 seconds at speed=1.3.
+                summary = (item.text[:200] + "…") if len(item.text) > 200 else item.text
+            if not summary:
+                return
+            self._pending.put(
+                QueueItem(
+                    session_id=item.session_id,
+                    text=summary,
+                    sentences=[summary],
+                    speed=item.speed,
+                )
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _start(self, item: QueueItem) -> None:
         # When muted, deliberately route through the null spawner so the

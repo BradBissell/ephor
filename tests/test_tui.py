@@ -272,7 +272,7 @@ async def test_summarize_action_writes_to_store_and_repaints(
     monkeypatch.setattr("claude_orchestrator.summary_store.summary_dir", lambda: summary_dir)
     monkeypatch.setattr(
         "claude_orchestrator.tui.app.summarize_transcript",
-        lambda _path: "stubbed summary",
+        lambda _path, cwd=None: "stubbed summary",
     )
 
     app = CcoApp(manager=StateManager(populated_dir))

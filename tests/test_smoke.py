@@ -13,11 +13,21 @@ def test_version_attribute() -> None:
     assert claude_orchestrator.__version__ == "0.1.0"
 
 
-def test_main_no_args_prints_help_and_exits_zero(capsys) -> None:
+def test_main_no_args_launches_tui(monkeypatch) -> None:
+    # Bare `cco` is the dashboard launcher. Stub the TUI runner so the test
+    # doesn't start Textual; just assert main() dispatches to it.
+    import claude_orchestrator.cli as cli
+
+    called = {}
+
+    def fake_tui() -> int:
+        called["tui"] = True
+        return 0
+
+    monkeypatch.setattr(cli, "_cmd_tui", fake_tui)
     rc = main([])
-    captured = capsys.readouterr()
     assert rc == 0
-    assert "cco" in captured.err.lower() or "cco" in captured.out.lower()
+    assert called.get("tui") is True
 
 
 def test_unknown_subcommand_exits_two(capsys) -> None:

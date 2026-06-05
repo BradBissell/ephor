@@ -109,6 +109,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "useful after changing KOKORO_VOICE / KOKORO_SPEED."
         ),
     )
+    speech_mode_p = speech_sub.add_parser(
+        "mode",
+        help=(
+            "Switch between speaking the full reply ('full') or a one-sentence "
+            "summary ('summary'). Summary mode uses the same Claude Code login "
+            "as the dashboard summarizer — no API key required."
+        ),
+    )
+    speech_mode_p.add_argument(
+        "mode",
+        choices=["full", "summary"],
+        help="full = read the whole reply; summary = one-sentence brief.",
+    )
 
     return parser
 
@@ -118,8 +131,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command is None:
-        parser.print_help(sys.stderr)
-        return 0
+        # Bare `cco` launches the dashboard — the common case. Explicit
+        # subcommands (list/status/speech/…) and `cco --help` still work.
+        return _cmd_tui()
 
     if args.command == "list":
         return _cmd_list()
@@ -154,6 +168,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_speech_status()
         if sub == "reset-calibration":
             return _cmd_speech_reset_calibration()
+        if sub == "mode":
+            return _cmd_speech_mode(args.mode)
         # No subcommand → show help.
         parser.parse_args(["speech", "--help"])
         return 0
@@ -318,6 +334,13 @@ def _cmd_speech_status() -> int:
     else:
         print(f"Kokoro pipeline: {cmd[0]}")
 
+    # Speak mode: which slice of the reply gets read aloud. Summary mode
+    # reuses the dashboard summarizer (claude -p, no API key).
+    print(f"Speak mode: {s.speak_mode}  (decided by: {s.mode_source.value})")
+    mode_env_raw = os.environ.get(speech_settings.MODE_ENV_VAR)
+    if mode_env_raw is not None:
+        print(f"Mode env override: {speech_settings.MODE_ENV_VAR}={mode_env_raw!r}")
+
     # Calibration line: surface what rate the bar will use AND why.
     if s.calibrated_chars_per_sec:
         print(
@@ -345,6 +368,29 @@ def _cmd_speech_reset_calibration() -> int:
         print(f"cco: failed to save settings: {exc}", file=sys.stderr)
         return 1
     print("Calibration cleared. Next playback will recalibrate from scratch.")
+    return 0
+
+
+def _cmd_speech_mode(mode: str) -> int:
+    """Persist the speak-mode (full vs. summary) for future Stop events."""
+    from claude_orchestrator import speech_settings
+
+    try:
+        path = speech_settings.save(speak_mode=mode)
+    except (OSError, ValueError) as exc:
+        print(f"cco: failed to save settings: {exc}", file=sys.stderr)
+        return 1
+    if mode == speech_settings.SPEAK_MODE_SUMMARY:
+        blurb = "one-sentence summary (uses your Claude Code login — no API key)"
+    else:
+        blurb = "full assistant reply"
+    print(f"TTS speak mode: {mode}  — {blurb}")
+    print(f"Saved to: {path}")
+    if os.environ.get(speech_settings.MODE_ENV_VAR) is not None:
+        print(
+            f"\nNote: {speech_settings.MODE_ENV_VAR} is set in your shell — "
+            f"that env override will win until you `unset {speech_settings.MODE_ENV_VAR}`."
+        )
     return 0
 
 

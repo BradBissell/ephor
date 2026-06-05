@@ -111,6 +111,13 @@ class CcoApp(App[int]):
     TITLE = "claude-orchestrator"
     SUB_TITLE = "live session dashboard"
 
+    # Register our command-palette provider alongside the built-in
+    # system commands (theme picker, help, quit). Ctrl+P opens the
+    # palette; CcoCommands surfaces every keybinding action.
+    from claude_orchestrator.tui.commands import CcoCommands as _CcoCommands
+
+    COMMANDS = App.COMMANDS | {_CcoCommands}
+
     BINDINGS: ClassVar[Sequence[Binding]] = [  # type: ignore[assignment]
         Binding("q", "quit", "quit"),
         Binding("ctrl+c", "quit", "quit", show=False),
@@ -122,6 +129,7 @@ class CcoApp(App[int]):
         Binding("s", "summarize", "summarize selected session"),
         Binding("t", "jump_speaking", "jump to TTS speaking session"),
         Binding("m", "toggle_mute", "mute / unmute TTS playback"),
+        Binding("M", "toggle_speak_mode", "TTS: full reply ↔ summary"),
         Binding("n", "next_attention", "jump cursor to next PERM/WAIT/ERR row"),
         Binding("slash", "filter", "filter sessions by substring"),
         Binding("escape", "clear_filter", "clear filter", show=False),
@@ -148,6 +156,7 @@ class CcoApp(App[int]):
         self._speech_player = SpeechPlayer(
             watcher=SpeechWatcher(),
             muted=not self._speech_settings.enabled,
+            speak_mode=self._speech_settings.speak_mode,
         )
         self._activity = ActivitySampler()
         self._tokens = TokenTracker()
@@ -810,6 +819,47 @@ class CcoApp(App[int]):
         if self._speech_bar is not None:
             self._speech_bar.refresh_now()
 
+    def action_toggle_speak_mode(self) -> None:
+        """Flip the TTS speak mode (full ↔ summary) and persist.
+
+        Summary mode reuses the dashboard's `claude -p` summarizer, so
+        the user's subscription auth carries through — no API key
+        configuration required. The change applies to the NEXT Stop
+        event; anything already queued / playing keeps its original
+        text so the user isn't surprised by a mid-sentence swap.
+        """
+        from claude_orchestrator.speech_settings import (
+            MODE_ENV_VAR,
+            SPEAK_MODE_FULL,
+            SPEAK_MODE_SUMMARY,
+            SettingsSource,
+        )
+
+        new_mode = (
+            SPEAK_MODE_SUMMARY
+            if self._speech_player.speak_mode == SPEAK_MODE_FULL
+            else SPEAK_MODE_FULL
+        )
+        self._speech_player.set_speak_mode(new_mode)
+        try:
+            save_speech_settings(speak_mode=new_mode)
+        except OSError as exc:
+            # In-memory toggle still applies; only the disk write failed.
+            self._set_toast(f"speak mode → {new_mode} (couldn't save: {exc})")
+            return
+
+        # Reload so the cached mode_source on the app stays accurate for
+        # the next env-override toast.
+        self._speech_settings = load_speech_settings()
+
+        if new_mode == SPEAK_MODE_SUMMARY:
+            msg = "📝 TTS: summary mode (brief notifications)"
+        else:
+            msg = "📜 TTS: full mode (whole reply)"
+        if self._speech_settings.mode_source == SettingsSource.ENV:
+            msg += f" (note: {MODE_ENV_VAR} env will reapply on next launch)"
+        self._set_toast(msg)
+
     # ---- utilities ------------------------------------------------------
 
     def _set_toast(self, text: str) -> None:
@@ -929,7 +979,7 @@ class CcoApp(App[int]):
                 # Show progress toast on the UI thread.
                 self.call_from_thread(self._set_toast, f"summarizing {sid[:8]}…")
             path = transcript_path(cwd, sid)
-            text = summarize_transcript(path)
+            text = summarize_transcript(path, cwd=cwd)
             self.call_from_thread(self._on_summary_done, sid, text, manual)
         finally:
             self._summarizing.discard(sid)

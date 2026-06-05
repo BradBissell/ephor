@@ -169,3 +169,77 @@ def test_is_heartbeat_stale_tolerates_garbage_timestamp() -> None:
         last_event_time="not-a-date",
     )
     assert not is_heartbeat_stale(a)
+
+
+# ---- SessionRow column composition ---------------------------------------
+
+
+def _agent_for_row(cwd: str = "/tmp/proj", *, sid: str = "abcdef1234") -> AgentState:
+    return AgentState(
+        session_id=sid,
+        cwd=cwd,
+        started_at="2026-01-01T00:00:00Z",
+        status=AgentStatus.WORKING,
+        project_name="proj",
+        last_event="PreToolUse",
+        last_event_time="2026-01-01T00:00:01Z",
+        last_event_seq=1,
+        tool_count=7,
+        error_count=2,
+    )
+
+
+def test_session_row_drops_tool_and_error_columns(tmp_path: Path) -> None:
+    """The T<n> and E<n> cells were removed in favor of the Jira column."""
+    from claude_orchestrator.tui.widgets.session_row import SessionRow
+
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(tmp_path))
+    row.update_agent(agent, summary="doing things")
+    rendered = str(row.render())
+    # The literal "T7" or "E2" used to appear here. Their absence is the
+    # contract — Jira column replaced them.
+    assert "T7" not in rendered
+    assert "E2" not in rendered
+
+
+def test_session_row_renders_jira_ticket_when_present(tmp_path: Path) -> None:
+    """The Jira cell replaces the session_id suffix when a key is inferable."""
+    from claude_orchestrator.tui.widgets.session_row import SessionRow
+
+    worktree = tmp_path / "DR-4242"
+    worktree.mkdir()
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(worktree))
+    row.update_agent(agent, summary="ok")
+    rendered = str(row.render())
+    assert "DR-4242" in rendered
+    # The old session_id suffix must no longer appear.
+    assert "abcdef12" not in rendered
+
+
+def test_session_row_uses_em_dash_when_no_ticket(tmp_path: Path) -> None:
+    """A bare cwd with no Jira-shaped component renders a placeholder."""
+    from claude_orchestrator.tui.widgets.session_row import SessionRow
+
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(tmp_path))
+    row.update_agent(agent, summary="x")
+    rendered = str(row.render())
+    # Em-dash placeholder is rendered when no ticket inference succeeds.
+    assert "—" in rendered
+
+
+def test_session_row_prefers_summary_prefix_over_cwd(tmp_path: Path) -> None:
+    """When the LLM summary already begins with a Jira key, that wins
+    over a cwd-derived key (summary is the freshest signal)."""
+    from claude_orchestrator.tui.widgets.session_row import SessionRow
+
+    worktree = tmp_path / "DR-1111"
+    worktree.mkdir()
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(worktree))
+    row.update_agent(agent, summary="DR-2222: fresh signal")
+    rendered = str(row.render())
+    assert "DR-2222" in rendered
+    assert "DR-1111" not in rendered

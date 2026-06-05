@@ -26,10 +26,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+from claude_orchestrator.jira import ticket_for_cwd
 
 log = logging.getLogger(__name__)
 
@@ -128,8 +131,14 @@ def _claude_binary() -> str | None:
     return shutil.which("claude")
 
 
-def summarize_transcript(path: Path) -> str:
+def summarize_transcript(path: Path, cwd: str | Path | None = None) -> str:
     """Return a one-sentence summary of the transcript, or "" on any failure.
+
+    When ``cwd`` is supplied and a Jira ticket key can be resolved (from
+    the branch name or any directory in the path), the summary is
+    prefixed with ``<KEY>: ``. The ticket-prefix consumes part of the
+    MAX_LENGTH budget so the truncation rule still produces a single
+    bounded line.
 
     All exceptions are caught and logged at DEBUG so the UI never sees a
     stack trace.
@@ -187,6 +196,22 @@ def summarize_transcript(path: Path) -> str:
     text = result.strip(" \t\n\"'`")
     if text.endswith("."):
         text = text[:-1].rstrip()
+
+    # Jira-ticket prefix is a single source of truth — the model is told
+    # nothing about tickets, and we glue the key on here so the column
+    # rendering and TTS read-out share the same convention. Strip any
+    # accidental duplicate prefix the model might have invented.
+    ticket = ticket_for_cwd(cwd) if cwd is not None else None
+    if ticket:
+        dup = re.match(rf"^{re.escape(ticket)}\s*[:\-]\s*", text)
+        if dup:
+            text = text[dup.end() :]
+        prefix = f"{ticket}: "
+        budget = max(8, MAX_LENGTH - len(prefix))
+        if len(text) > budget:
+            text = text[: budget - 1].rstrip() + "…"
+        return prefix + text
+
     if len(text) > MAX_LENGTH:
         text = text[: MAX_LENGTH - 1].rstrip() + "…"
     return text

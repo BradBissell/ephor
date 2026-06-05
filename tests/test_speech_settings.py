@@ -231,3 +231,63 @@ def test_calibration_loads_even_when_env_overrides_enabled(
     assert s.source == speech_settings.SettingsSource.ENV
     assert s.enabled is False
     assert s.calibrated_chars_per_sec == 16.0
+
+
+# ---- speak_mode ----------------------------------------------------------
+
+
+def test_default_speak_mode_is_full(isolated_config: Path) -> None:
+    s = speech_settings.load()
+    assert s.speak_mode == speech_settings.SPEAK_MODE_FULL
+    assert s.mode_source == SettingsSource.DEFAULT
+
+
+def test_save_speak_mode_persists_and_loads(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(speech_settings.MODE_ENV_VAR, raising=False)
+    speech_settings.save(speak_mode=speech_settings.SPEAK_MODE_SUMMARY)
+    s = speech_settings.load()
+    assert s.speak_mode == speech_settings.SPEAK_MODE_SUMMARY
+    assert s.mode_source == SettingsSource.FILE
+
+
+def test_speak_mode_env_overrides_file(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    speech_settings.save(speak_mode=speech_settings.SPEAK_MODE_FULL)
+    monkeypatch.setenv(speech_settings.MODE_ENV_VAR, "summary")
+    s = speech_settings.load()
+    assert s.speak_mode == speech_settings.SPEAK_MODE_SUMMARY
+    assert s.mode_source == SettingsSource.ENV
+
+
+def test_save_rejects_unknown_speak_mode(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(speech_settings.MODE_ENV_VAR, raising=False)
+    with pytest.raises(ValueError):
+        speech_settings.save(speak_mode="loud-please")
+
+
+def test_unknown_env_value_falls_through_to_file_or_default(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo in CCO_TTS_MODE must not lock the user into a broken mode."""
+    speech_settings.save(speak_mode=speech_settings.SPEAK_MODE_SUMMARY)
+    monkeypatch.setenv(speech_settings.MODE_ENV_VAR, "garbage")
+    s = speech_settings.load()
+    assert s.speak_mode == speech_settings.SPEAK_MODE_SUMMARY
+    assert s.mode_source == SettingsSource.FILE
+
+
+def test_save_speak_mode_preserves_enabled(
+    isolated_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(speech_settings.MODE_ENV_VAR, raising=False)
+    speech_settings.save(enabled=False)
+    speech_settings.save(speak_mode=speech_settings.SPEAK_MODE_SUMMARY)
+    s = speech_settings.load()
+    # The earlier `enabled=False` write must survive the mode update.
+    assert s.enabled is False
+    assert s.speak_mode == speech_settings.SPEAK_MODE_SUMMARY

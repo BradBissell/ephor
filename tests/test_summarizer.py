@@ -265,3 +265,79 @@ def test_summarize_returns_empty_when_result_field_missing(
     p = tmp_path / "t.jsonl"
     _write_jsonl(p, {"message": {"role": "user", "content": "?"}})
     assert summarize_transcript(p) == ""
+
+
+# ---- Jira ticket prefix ---------------------------------------------------
+
+
+def test_summarize_prefixes_jira_ticket_from_cwd_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When cwd's path contains a Jira key, the summary is prefixed."""
+    _stub_claude_binary(monkeypatch)
+    _stub_subprocess_run(
+        monkeypatch,
+        stdout=json.dumps({"result": "Refactoring auth middleware"}),
+    )
+    p = tmp_path / "t.jsonl"
+    _write_jsonl(p, {"message": {"role": "user", "content": "x"}})
+
+    # Make a worktree-shaped path that doesn't have git but does have a key.
+    worktree = tmp_path / "DR-9999"
+    worktree.mkdir()
+
+    assert summarize_transcript(p, cwd=worktree) == "DR-9999: Refactoring auth middleware"
+
+
+def test_summarize_without_cwd_does_not_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_claude_binary(monkeypatch)
+    _stub_subprocess_run(
+        monkeypatch,
+        stdout=json.dumps({"result": "Doing stuff"}),
+    )
+    p = tmp_path / "t.jsonl"
+    _write_jsonl(p, {"message": {"role": "user", "content": "x"}})
+    assert summarize_transcript(p) == "Doing stuff"
+
+
+def test_summarize_does_not_double_prefix_when_model_emits_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the model invented its own DR-X: prefix, we must not double it."""
+    _stub_claude_binary(monkeypatch)
+    _stub_subprocess_run(
+        monkeypatch,
+        stdout=json.dumps({"result": "DR-1234: Wiring up the new column"}),
+    )
+    p = tmp_path / "t.jsonl"
+    _write_jsonl(p, {"message": {"role": "user", "content": "x"}})
+
+    worktree = tmp_path / "DR-1234"
+    worktree.mkdir()
+
+    out = summarize_transcript(p, cwd=worktree)
+    assert out == "DR-1234: Wiring up the new column"
+
+
+def test_summarize_truncates_to_fit_with_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The total length stays bounded — the ticket prefix eats into MAX_LENGTH."""
+    _stub_claude_binary(monkeypatch)
+    long_result = "x" * (MAX_LENGTH + 30)
+    _stub_subprocess_run(
+        monkeypatch,
+        stdout=json.dumps({"result": long_result}),
+    )
+    p = tmp_path / "t.jsonl"
+    _write_jsonl(p, {"message": {"role": "user", "content": "x"}})
+
+    worktree = tmp_path / "DR-42"
+    worktree.mkdir()
+
+    out = summarize_transcript(p, cwd=worktree)
+    assert out.startswith("DR-42: ")
+    assert out.endswith("…")
+    assert len(out) <= MAX_LENGTH + len("DR-42: ")

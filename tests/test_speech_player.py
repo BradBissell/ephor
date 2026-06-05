@@ -526,3 +526,161 @@ def test_watcher_recovers_from_truncation(tmp_path: Path, monkeypatch: pytest.Mo
     events = watcher.poll()
     assert len(events) == 1
     assert events[0]["session_id"] == "c"
+
+
+# ---- speak_mode: summary --------------------------------------------------
+
+
+def _start_event(
+    sid: str,
+    text: str = "long full assistant reply.",
+    *,
+    transcript_path: str | None = None,
+    cwd: str | None = None,
+) -> dict[str, object]:
+    ev: dict[str, object] = {
+        "event": "start",
+        "session_id": sid,
+        "text": text,
+        "sentences": [text],
+        "speed": 1.3,
+    }
+    if transcript_path is not None:
+        ev["transcript_path"] = transcript_path
+    if cwd is not None:
+        ev["cwd"] = cwd
+    return ev
+
+
+def test_full_mode_routes_event_directly_into_queue(
+    proc_log: list[FakeProc],
+) -> None:
+    """In `full` mode, the player ignores transcript_path and speaks the
+    full text the hook captured. No summarizer call."""
+    import claude_orchestrator.speech_player as sp
+
+    sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
+
+    calls: list[tuple[Path, str | None]] = []
+
+    def fake_summarizer(path: Path, cwd: str | None) -> str:
+        calls.append((path, cwd))
+        return "should-not-be-used"
+
+    player = SpeechPlayer(
+        spawner=lambda _i: proc_log.append(FakeProc()) or proc_log[-1],  # type: ignore[return-value]
+        speak_mode=sp.SPEAK_MODE_FULL,
+        summarizer=fake_summarizer,
+    )
+    player._route_event(_start_event("s1", "full reply", transcript_path="/tmp/x"))
+
+    assert calls == []
+    assert player.now_playing is not None
+    assert player.now_playing.text == "full reply"
+
+
+def test_summary_mode_replaces_text_with_summarizer_output(
+    proc_log: list[FakeProc], tmp_path: Path
+) -> None:
+    """A start event in summary mode is held back until the summarizer
+    finishes; the resulting QueueItem carries the brief, not the full reply."""
+    import claude_orchestrator.speech_player as sp
+
+    sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
+
+    def fake_summarizer(path: Path, cwd: str | None) -> str:
+        return "DR-1: brief"
+
+    player = SpeechPlayer(
+        spawner=lambda _i: proc_log.append(FakeProc()) or proc_log[-1],  # type: ignore[return-value]
+        speak_mode=sp.SPEAK_MODE_SUMMARY,
+        summarizer=fake_summarizer,
+    )
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("{}\n")
+
+    player._route_event(_start_event("s1", "the full reply that we DO NOT want spoken",
+                                       transcript_path=str(transcript),
+                                       cwd=str(tmp_path)))
+
+    # Nothing playing yet — the worker has to run + the next tick drains
+    # the pending queue.
+    _wait_for_pending(player)
+    player.tick()
+
+    assert player.now_playing is not None
+    assert player.now_playing.text == "DR-1: brief"
+
+
+def test_summary_mode_falls_back_to_truncated_text_when_summarizer_returns_empty(
+    proc_log: list[FakeProc], tmp_path: Path
+) -> None:
+    import claude_orchestrator.speech_player as sp
+
+    sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
+
+    def empty_summarizer(_p: Path, _cwd: str | None) -> str:
+        return ""
+
+    player = SpeechPlayer(
+        spawner=lambda _i: proc_log.append(FakeProc()) or proc_log[-1],  # type: ignore[return-value]
+        speak_mode=sp.SPEAK_MODE_SUMMARY,
+        summarizer=empty_summarizer,
+    )
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("{}\n")
+
+    full_text = "short reply"
+    player._route_event(_start_event("s1", full_text, transcript_path=str(transcript)))
+
+    _wait_for_pending(player)
+    player.tick()
+    assert player.now_playing is not None
+    # Fallback: speaks the original text (audible notification still happens).
+    assert player.now_playing.text == full_text
+
+
+def test_summary_mode_without_transcript_path_falls_back_to_full(
+    proc_log: list[FakeProc],
+) -> None:
+    """A start event missing transcript_path can't be summarized — play
+    the full text rather than dropping the notification entirely."""
+    import claude_orchestrator.speech_player as sp
+
+    sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
+
+    def panic_summarizer(_p: Path, _cwd: str | None) -> str:
+        raise AssertionError("summarizer should not be called without transcript_path")
+
+    player = SpeechPlayer(
+        spawner=lambda _i: proc_log.append(FakeProc()) or proc_log[-1],  # type: ignore[return-value]
+        speak_mode=sp.SPEAK_MODE_SUMMARY,
+        summarizer=panic_summarizer,
+    )
+    player._route_event(_start_event("s1", "fallback content"))
+    assert player.now_playing is not None
+    assert player.now_playing.text == "fallback content"
+
+
+def test_set_speak_mode_runtime_switch() -> None:
+    import claude_orchestrator.speech_player as sp
+
+    player = SpeechPlayer(spawner=lambda _i: None)
+    assert player.speak_mode == sp.SPEAK_MODE_FULL
+    player.set_speak_mode(sp.SPEAK_MODE_SUMMARY)
+    assert player.speak_mode == sp.SPEAK_MODE_SUMMARY
+    # Unknown values are ignored — defense against typos in env / CLI.
+    player.set_speak_mode("loud-please")
+    assert player.speak_mode == sp.SPEAK_MODE_SUMMARY
+
+
+def _wait_for_pending(player: SpeechPlayer, *, timeout: float = 2.0) -> None:
+    """Block until the background summarizer thread posts a result."""
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not player._pending.empty():
+            return
+        time.sleep(0.01)
+    raise AssertionError("summarizer thread did not produce a pending item in time")
