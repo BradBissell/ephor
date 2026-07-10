@@ -6,7 +6,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from claude_orchestrator.usage import (
+from ephor.usage import (
     FiveHourBlock,
     UsageSnapshot,
     WeeklyTotal,

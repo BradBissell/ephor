@@ -1,4 +1,4 @@
-"""End-to-end test: install hooks → simulate hook firing → cco list shows it.
+"""End-to-end test: install hooks → simulate hook firing → ephor list shows it.
 
 This is the v0 smoke test that proves the whole pipeline (shell handler →
 state file → CLI) works as a unit.
@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator.cli import main
-from claude_orchestrator.config import hook_handler_path
+from ephor.cli import main
+from ephor.config import hook_handler_path
 
 
 def _required_tools_present() -> bool:
@@ -32,21 +32,21 @@ def test_full_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """End-to-end: fire 3 fake hook events, verify cco list reports them."""
+    """End-to-end: fire 3 fake hook events, verify ephor list reports them."""
     state_dir = tmp_path / "sessions"
     pending_dir = tmp_path / "pending"
     lock_dir = tmp_path / "locks"
-    monkeypatch.setenv("CCO_STATE_DIR", str(state_dir))
-    monkeypatch.setenv("CCO_PENDING_DIR", str(pending_dir))
-    monkeypatch.setenv("CCO_LOCK_DIR", str(lock_dir))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("EPHOR_PENDING_DIR", str(pending_dir))
+    monkeypatch.setenv("EPHOR_LOCK_DIR", str(lock_dir))
 
     # Sandbox env for the hook handler subprocess too.
     sub_env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": str(tmp_path),
-        "CCO_STATE_DIR": str(state_dir),
-        "CCO_PENDING_DIR": str(pending_dir),
-        "CCO_LOCK_DIR": str(lock_dir),
+        "EPHOR_STATE_DIR": str(state_dir),
+        "EPHOR_PENDING_DIR": str(pending_dir),
+        "EPHOR_LOCK_DIR": str(lock_dir),
     }
 
     handler = hook_handler_path()
@@ -102,12 +102,12 @@ def test_full_pipeline(
     # would produce.
     import os as _os
 
-    a["claude_pid"] = _os.getpid()
-    b["claude_pid"] = _os.getppid()
+    a["agent_pid"] = _os.getpid()
+    b["agent_pid"] = _os.getppid()
     (state_dir / "e2e-session-A.json").write_text(json.dumps(a))
     (state_dir / "e2e-session-B.json").write_text(json.dumps(b))
 
-    # cco status reports both.
+    # ephor status reports both.
     rc = main(["status"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -115,7 +115,7 @@ def test_full_pipeline(
     assert "P:1" in out  # one PermissionRequest
     assert "W:1" in out  # one Working
 
-    # cco list shows both rows.
+    # ephor list shows both rows.
     rc = main(["list"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -128,7 +128,7 @@ def test_round_trip_install_uninstall_via_cli(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """`cco init` followed by `cco uninstall` is byte-clean for empty input."""
+    """`ephor init` followed by `ephor uninstall` is byte-clean for empty input."""
     settings = tmp_path / "claude_settings.json"
     monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(settings))
 

@@ -6,11 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator import account
+from ephor import account
 
 
 def test_returns_defaults_when_file_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CCO_ACCOUNT_CONFIG", str(tmp_path / "missing.toml"))
+    monkeypatch.setenv("EPHOR_ACCOUNT_CONFIG", str(tmp_path / "missing.toml"))
     cfg = account.load_account_config()
     assert cfg.weekly_cap_tokens is None
 
@@ -18,7 +18,7 @@ def test_returns_defaults_when_file_absent(tmp_path: Path, monkeypatch: pytest.M
 def test_loads_weekly_cap_from_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     p = tmp_path / "account.toml"
     p.write_text("weekly_cap_tokens = 3_000_000\n")
-    monkeypatch.setenv("CCO_ACCOUNT_CONFIG", str(p))
+    monkeypatch.setenv("EPHOR_ACCOUNT_CONFIG", str(p))
     cfg = account.load_account_config()
     assert cfg.weekly_cap_tokens == 3_000_000
 
@@ -26,7 +26,7 @@ def test_loads_weekly_cap_from_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 def test_rejects_non_positive_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     p = tmp_path / "account.toml"
     p.write_text("weekly_cap_tokens = 0\n")
-    monkeypatch.setenv("CCO_ACCOUNT_CONFIG", str(p))
+    monkeypatch.setenv("EPHOR_ACCOUNT_CONFIG", str(p))
     cfg = account.load_account_config()
     assert cfg.weekly_cap_tokens is None
 
@@ -36,7 +36,7 @@ def test_garbled_toml_logs_and_returns_defaults(
 ) -> None:
     p = tmp_path / "account.toml"
     p.write_text("not valid = = toml\n")
-    monkeypatch.setenv("CCO_ACCOUNT_CONFIG", str(p))
+    monkeypatch.setenv("EPHOR_ACCOUNT_CONFIG", str(p))
     cfg = account.load_account_config()
     assert cfg.weekly_cap_tokens is None
 
@@ -51,7 +51,7 @@ def test_explicit_path_argument_overrides_env(tmp_path: Path) -> None:
 def test_loads_five_hour_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     p = tmp_path / "account.toml"
     p.write_text("weekly_cap_tokens = 3_000_000_000\nfive_hour_cap_tokens = 200_000_000\n")
-    monkeypatch.setenv("CCO_ACCOUNT_CONFIG", str(p))
+    monkeypatch.setenv("EPHOR_ACCOUNT_CONFIG", str(p))
     cfg = account.load_account_config()
     assert cfg.weekly_cap_tokens == 3_000_000_000
     assert cfg.five_hour_cap_tokens == 200_000_000
@@ -62,7 +62,7 @@ def test_five_hour_cap_defaults_to_none_when_unset(
 ) -> None:
     p = tmp_path / "account.toml"
     p.write_text("weekly_cap_tokens = 1\n")
-    monkeypatch.setenv("CCO_ACCOUNT_CONFIG", str(p))
+    monkeypatch.setenv("EPHOR_ACCOUNT_CONFIG", str(p))
     cfg = account.load_account_config()
     assert cfg.five_hour_cap_tokens is None
 
@@ -78,7 +78,7 @@ def test_loads_per_account_profiles(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         "weekly_cap_tokens = 10_000_000_000\n"
         "five_hour_cap_tokens = 500_000_000\n"
     )
-    monkeypatch.setenv("CCO_ACCOUNT_CONFIG", str(p))
+    monkeypatch.setenv("EPHOR_ACCOUNT_CONFIG", str(p))
     cfg = account.load_account_config()
     assert cfg.profiles["max"]["weekly_cap_tokens"] == 3_000_000_000
     assert cfg.profiles["max"]["five_hour_cap_tokens"] == 200_000_000
@@ -97,7 +97,7 @@ def test_profiles_drop_non_positive_or_unknown_keys(
         "five_hour_cap_tokens = 200\n"  # kept
         "weeky_cap_tokens = 999\n"  # rejected: typo, unknown key
     )
-    monkeypatch.setenv("CCO_ACCOUNT_CONFIG", str(p))
+    monkeypatch.setenv("EPHOR_ACCOUNT_CONFIG", str(p))
     cfg = account.load_account_config()
     assert cfg.profiles["max"] == {"five_hour_cap_tokens": 200}
 
@@ -107,6 +107,6 @@ def test_profiles_default_to_empty_dict_when_absent(
 ) -> None:
     p = tmp_path / "account.toml"
     p.write_text("weekly_cap_tokens = 1\n")
-    monkeypatch.setenv("CCO_ACCOUNT_CONFIG", str(p))
+    monkeypatch.setenv("EPHOR_ACCOUNT_CONFIG", str(p))
     cfg = account.load_account_config()
     assert cfg.profiles == {}

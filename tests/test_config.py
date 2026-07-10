@@ -7,41 +7,41 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator import config
+from ephor import config
 
 
 def test_state_dir_defaults_to_xdg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("CCO_STATE_DIR", raising=False)
+    monkeypatch.delenv("EPHOR_STATE_DIR", raising=False)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-    expected = tmp_path / "claude-orchestrator" / "sessions"
+    expected = tmp_path / "ephor" / "sessions"
     assert config.state_dir() == expected
 
 
 def test_state_dir_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     custom = tmp_path / "custom"
-    monkeypatch.setenv("CCO_STATE_DIR", str(custom))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(custom))
     assert config.state_dir() == custom
 
 
 def test_state_dir_falls_back_to_dot_local(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("CCO_STATE_DIR", raising=False)
+    monkeypatch.delenv("EPHOR_STATE_DIR", raising=False)
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     sd = config.state_dir()
-    assert "claude-orchestrator" in str(sd)
+    assert "ephor" in str(sd)
     assert sd.name == "sessions"
 
 
 def test_pending_dir_is_sibling_of_sessions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("CCO_STATE_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(tmp_path / "sessions"))
     assert config.pending_dir() == tmp_path / "pending"
 
 
 def test_ensure_state_dirs_creates_with_0700(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("CCO_STATE_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(tmp_path / "sessions"))
     config.ensure_state_dirs()
     assert (tmp_path / "sessions").is_dir()
     assert (tmp_path / "pending").is_dir()

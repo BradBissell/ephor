@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator import jira as jira_module
-from claude_orchestrator.jira import extract_ticket, ticket_for_cwd
+from ephor import jira as jira_module
+from ephor.jira import extract_ticket, ticket_for_cwd
 
 
 def test_extract_ticket_finds_key_at_start() -> None:

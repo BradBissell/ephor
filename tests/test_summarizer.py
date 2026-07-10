@@ -13,8 +13,8 @@ from typing import Any
 
 import pytest
 
-from claude_orchestrator import summarizer as summarizer_module
-from claude_orchestrator.summarizer import (
+from ephor import summarizer as summarizer_module
+from ephor.summarizer import (
     MAX_LENGTH,
     _extract_messages,
     _extract_text,
@@ -180,7 +180,7 @@ def test_summarize_passes_transcript_text_via_stdin(
 def test_summarize_sets_cco_internal_env_var(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Without CCO_INTERNAL=1, the cco hook handler would create a ghost
+    """Without EPHOR_INTERNAL=1, the ephor hook handler would create a ghost
     session for our summarizer subprocess."""
     _stub_claude_binary(monkeypatch)
     captured = _stub_subprocess_run(monkeypatch, stdout=json.dumps({"result": "ok"}))
@@ -189,7 +189,7 @@ def test_summarize_sets_cco_internal_env_var(
 
     summarize_transcript(p)
     env = captured[0]["kwargs"].get("env") or {}
-    assert env.get("CCO_INTERNAL") == "1"
+    assert env.get("EPHOR_INTERNAL") == "1"
 
 
 def test_summarize_strips_quotes_and_trailing_period(

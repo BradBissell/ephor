@@ -3,19 +3,18 @@ requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
 
 [project]
-# Distribution name on PyPI. The import package stays `claude_orchestrator`
-# (see [tool.hatch.build.targets.wheel] below) so existing imports keep
-# working; we picked `cco` as the distribution name because (a) the
-# `claude-orchestrator` name was already taken on PyPI by an unrelated
-# project, and (b) `cco` matches the binary that `pip install` exposes.
-name = "cco"
-version = "0.1.1"
-description = "Linux-native dashboard + lifecycle orchestrator for Claude Code sessions"
+# Distribution name on PyPI. The import package and the installed command are
+# both `ephor` (see [project.scripts] and [tool.hatch...wheel]); the bare
+# `ephor` name is taken on PyPI by an unrelated project, so we publish under
+# `ephor-orchestrator` while the binary users type stays `ephor`.
+name = "ephor-orchestrator"
+version = "0.2.0"
+description = "Linux-native dashboard + lifecycle orchestrator for coding-agent CLI sessions (Claude Code, Gemini, Codex, Grok)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Brad Bissell" }]
-keywords = ["claude-code", "tmux", "dashboard", "linux", "orchestrator"]
+keywords = ["claude-code", "gemini-cli", "codex", "grok", "tmux", "dashboard", "linux", "orchestrator"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -47,7 +46,7 @@ dev = [
 ]
 
 [project.scripts]
-cco = "claude_orchestrator.cli:main"
+ephor = "ephor.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/BradBissell/claude-orchestrator"
@@ -55,11 +54,11 @@ Issues = "https://github.com/BradBissell/claude-orchestrator/issues"
 Source = "https://github.com/BradBissell/claude-orchestrator"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/claude_orchestrator"]
+packages = ["src/ephor"]
 
 # Include the shell hook handlers in the wheel so installer.py can find them.
 [tool.hatch.build.targets.wheel.shared-data]
-"src/claude_orchestrator/hooks" = "share/claude-orchestrator/hooks"
+"src/ephor/hooks" = "share/ephor/hooks"
 
 [tool.ruff]
 line-length = 100
@@ -86,10 +85,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S108", "S603", "S607"]
-"src/claude_orchestrator/tmux/navigator.py" = ["S603", "S607"]
-"src/claude_orchestrator/tmux/discover.py" = ["S603", "S607"]
-"src/claude_orchestrator/summarizer.py" = ["S603"]
-"src/claude_orchestrator/hooks/installer.py" = ["S603"]
+"src/ephor/tmux/navigator.py" = ["S603", "S607"]
+"src/ephor/tmux/discover.py" = ["S603", "S607"]
+"src/ephor/summarizer.py" = ["S603"]
+"src/ephor/hooks/installer.py" = ["S603"]
 
 [tool.mypy]
 python_version = "3.11"

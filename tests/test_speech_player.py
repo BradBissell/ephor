@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator import speech
-from claude_orchestrator.speech_player import (
+from ephor import speech
+from ephor.speech_player import (
     MAX_QUEUE,
     QueueItem,
     SpeechPlayer,
@@ -68,7 +68,7 @@ def player(proc_log: list[FakeProc]) -> SpeechPlayer:
 
     # Patch os.killpg in the player module so terminate doesn't try to
     # signal a real process group on the FakeProc's bogus pid.
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     sp.os.killpg = lambda *_args, **_kwargs: None  # type: ignore[assignment]
     return SpeechPlayer(spawner=spawner)
@@ -215,14 +215,14 @@ def test_tick_routes_log_events_into_queue(
     """The player's tick reads new log records via SpeechWatcher and
     routes them into the queue, so the TUI just needs to call tick()."""
     log = tmp_path / "speech.jsonl"
-    monkeypatch.setenv("CCO_SPEECH_LOG", str(log))
+    monkeypatch.setenv("EPHOR_SPEECH_LOG", str(log))
 
     def spawner(_item: QueueItem) -> FakeProc:
         proc = FakeProc()
         proc_log.append(proc)
         return proc  # type: ignore[return-value]
 
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
@@ -242,14 +242,14 @@ def test_tick_advances_after_subprocess_exits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proc_log: list[FakeProc]
 ) -> None:
     log = tmp_path / "speech.jsonl"
-    monkeypatch.setenv("CCO_SPEECH_LOG", str(log))
+    monkeypatch.setenv("EPHOR_SPEECH_LOG", str(log))
 
     def spawner(_item: QueueItem) -> FakeProc:
         proc = FakeProc()
         proc_log.append(proc)
         return proc  # type: ignore[return-value]
 
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
@@ -277,7 +277,7 @@ def test_muted_player_does_not_spawn_real_subprocess(
 ) -> None:
     """When muted, the player still tracks the queue (so the bar mirrors
     activity) but spawner is bypassed — no audio."""
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
@@ -355,12 +355,12 @@ def test_natural_completion_updates_calibrated_rate(
     """When a real subprocess exits cleanly, the player records the
     observed chars/sec back to speech_settings so the next playback's
     progress estimate matches actual kokoro speed."""
-    monkeypatch.setenv("CCO_CONFIG_DIR", str(tmp_path / "config"))
-    monkeypatch.delenv("CCO_TTS_ENABLED", raising=False)
-    monkeypatch.delenv("CCO_SPEECH_CHARS_PER_SEC", raising=False)
+    monkeypatch.setenv("EPHOR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("EPHOR_TTS_ENABLED", raising=False)
+    monkeypatch.delenv("EPHOR_SPEECH_CHARS_PER_SEC", raising=False)
 
-    import claude_orchestrator.speech_player as sp
-    from claude_orchestrator import speech_settings
+    import ephor.speech_player as sp
+    from ephor import speech_settings
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
@@ -394,11 +394,11 @@ def test_preempted_playback_does_not_calibrate(
 ) -> None:
     """A killed playback's duration is truncated and would skew the
     rolling average low. Make sure preempt → no calibration."""
-    monkeypatch.setenv("CCO_CONFIG_DIR", str(tmp_path / "config"))
-    monkeypatch.delenv("CCO_TTS_ENABLED", raising=False)
+    monkeypatch.setenv("EPHOR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("EPHOR_TTS_ENABLED", raising=False)
 
-    import claude_orchestrator.speech_player as sp
-    from claude_orchestrator import speech_settings
+    import ephor.speech_player as sp
+    from ephor import speech_settings
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
@@ -424,11 +424,11 @@ def test_short_text_is_not_calibrated(
 ) -> None:
     """Tiny messages are dominated by startup latency and produce noisy
     estimates. Player should skip calibration below the threshold."""
-    monkeypatch.setenv("CCO_CONFIG_DIR", str(tmp_path / "config"))
-    monkeypatch.delenv("CCO_TTS_ENABLED", raising=False)
+    monkeypatch.setenv("EPHOR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("EPHOR_TTS_ENABLED", raising=False)
 
-    import claude_orchestrator.speech_player as sp
-    from claude_orchestrator import speech_settings
+    import ephor.speech_player as sp
+    from ephor import speech_settings
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
     base_time = 1_000_000.0
@@ -457,11 +457,11 @@ def test_calibration_uses_exponential_moving_average(
 ) -> None:
     """A single bad reading shouldn't yank the rate; multiple consistent
     readings should converge."""
-    monkeypatch.setenv("CCO_CONFIG_DIR", str(tmp_path / "config"))
-    monkeypatch.delenv("CCO_TTS_ENABLED", raising=False)
+    monkeypatch.setenv("EPHOR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("EPHOR_TTS_ENABLED", raising=False)
 
-    import claude_orchestrator.speech_player as sp
-    from claude_orchestrator import speech_settings
+    import ephor.speech_player as sp
+    from ephor import speech_settings
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
@@ -499,7 +499,7 @@ def test_calibration_uses_exponential_moving_average(
 
 def test_watcher_returns_only_new_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     log = tmp_path / "speech.jsonl"
-    monkeypatch.setenv("CCO_SPEECH_LOG", str(log))
+    monkeypatch.setenv("EPHOR_SPEECH_LOG", str(log))
     speech.append_start("alpha", "Old.")
     watcher = speech.SpeechWatcher(log)
     # Initial position is end-of-file → first poll should return nothing.
@@ -514,7 +514,7 @@ def test_watcher_returns_only_new_events(tmp_path: Path, monkeypatch: pytest.Mon
 
 def test_watcher_recovers_from_truncation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     log = tmp_path / "speech.jsonl"
-    monkeypatch.setenv("CCO_SPEECH_LOG", str(log))
+    monkeypatch.setenv("EPHOR_SPEECH_LOG", str(log))
     speech.append_start("a", "A.")
     speech.append_start("b", "B.")
     watcher = speech.SpeechWatcher(log)
@@ -557,7 +557,7 @@ def test_full_mode_routes_event_directly_into_queue(
 ) -> None:
     """In `full` mode, the player ignores transcript_path and speaks the
     full text the hook captured. No summarizer call."""
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
@@ -584,7 +584,7 @@ def test_summary_mode_replaces_text_with_summarizer_output(
 ) -> None:
     """A start event in summary mode is held back until the summarizer
     finishes; the resulting QueueItem carries the brief, not the full reply."""
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
@@ -620,7 +620,7 @@ def test_summary_mode_replaces_text_with_summarizer_output(
 def test_summary_mode_falls_back_to_truncated_text_when_summarizer_returns_empty(
     proc_log: list[FakeProc], tmp_path: Path
 ) -> None:
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
@@ -650,7 +650,7 @@ def test_summary_mode_without_transcript_path_falls_back_to_full(
 ) -> None:
     """A start event missing transcript_path can't be summarized — play
     the full text rather than dropping the notification entirely."""
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
@@ -668,7 +668,7 @@ def test_summary_mode_without_transcript_path_falls_back_to_full(
 
 
 def test_set_speak_mode_runtime_switch() -> None:
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     player = SpeechPlayer(spawner=lambda _i: None)
     assert player.speak_mode == sp.SPEAK_MODE_FULL

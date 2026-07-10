@@ -1,0 +1,205 @@
+"""Coding-agent CLI providers.
+
+ephor started as a Claude-Code-only dashboard. Four terminal coding agents now
+expose the same fundamental hook contract Claude Code pioneered — a shell
+command invoked with event JSON on **stdin**, carrying at least a session id, a
+working directory, and an event name. This module describes each one so the
+rest of ephor (installer, discovery, doctor) can stay provider-agnostic.
+
+The five supported/known agents and how they differ:
+
+  claude  ~/.claude/settings.json          JSON `hooks` obj   stdin JSON
+  gemini  ~/.gemini/settings.json           JSON `hooks` obj   stdin JSON  (diff event names)
+  codex   ~/.codex/hooks.json               JSON hooks file    stdin JSON
+  grok    ~/.grok/user-settings.json        JSON `hooks` obj   stdin JSON  (superagent-ai/grok-cli)
+
+Claude, Gemini and Grok share the *identical* settings-file `hooks` shape, so
+they use the same installer strategy (`SETTINGS_JSON_HOOKS`); Codex keeps its
+hooks in a dedicated `hooks.json` (`CODEX_HOOKS_JSON`). The single shell
+handler (`hooks/event_handler.sh`) understands every provider's event-name and
+field-name dialect and is told which agent fired it via `EPHOR_PROVIDER`.
+
+OpenCode is intentionally absent: its plugins are JS/TS (not shell hooks), so it
+needs a different bridge (a plugin shim or the HTTP `/event` SSE stream) that is
+out of scope for this pass.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+# Installer strategies — how a provider's config is mutated to register a hook.
+SETTINGS_JSON_HOOKS = (
+    "settings_json_hooks"  # claude/gemini/grok: `hooks` obj in a JSON settings file
+)
+CODEX_HOOKS_JSON = "codex_hooks_json"  # codex: a dedicated ~/.codex/hooks.json
+
+
+@dataclass(frozen=True)
+class Provider:
+    """Static description of one coding-agent CLI ephor can monitor."""
+
+    name: str  # canonical short id, e.g. "claude" — also the EPHOR_PROVIDER value
+    display_name: str  # human label, e.g. "Claude Code"
+    binary: str  # process/command name, used for `pgrep -x <binary>` and PATH checks
+    install_kind: str  # one of the *_HOOKS constants above
+    # Native event names to register the handler for. The handler maps each to a
+    # status; unknown events are recorded but don't fabricate a status.
+    events: tuple[str, ...]
+    # Path to the config/settings file the installer mutates. `_settings`
+    # holds the default; `settings_env` names an env var that overrides it
+    # (used by tests and non-default installs).
+    _settings: str = ""
+    settings_env: str = ""
+    # cmdline flags that immediately precede a session id (best-effort argv
+    # parse in discover.py; the @ephor_sid pane tag is the robust path).
+    resume_flags: tuple[str, ...] = ()
+    # Command prefix used by summary-mode TTS to condense a reply, e.g.
+    # ("claude", "-p"). None → summary mode falls back to the full reply.
+    summarize_cmd: tuple[str, ...] | None = None
+
+    def settings_path(self) -> Path:
+        """Resolve the config file the installer reads/writes for this provider."""
+        raw = os.environ.get(self.settings_env) if self.settings_env else None
+        if raw:
+            return Path(raw).expanduser()
+        return Path(os.path.expanduser(self._settings))
+
+
+# Event registration lists. Kept close to each CLI's real lifecycle so we don't
+# clutter a user's settings file with events the agent never emits.
+
+# Claude Code — preserves ephor's original registration set (a superset; Claude
+# simply never fires the events it doesn't emit).
+_CLAUDE_EVENTS = (
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Notification",
+    "PermissionRequest",
+    "PermissionDenied",
+    "Stop",
+    "StopFailure",
+    "SessionEnd",
+    "SubagentStart",
+    "SubagentStop",
+)
+
+# Gemini CLI — distinct vocabulary (Before*/After*), permission surfaced via
+# Notification(notification_type="ToolPermission").
+_GEMINI_EVENTS = (
+    "SessionStart",
+    "SessionEnd",
+    "BeforeAgent",
+    "AfterAgent",
+    "BeforeTool",
+    "AfterTool",
+    "Notification",
+)
+
+# Codex CLI — real hook events (no SessionEnd); permission via PermissionRequest.
+_CODEX_EVENTS = (
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "Stop",
+)
+
+# Grok CLI (superagent-ai/grok-cli) — near-identical to Claude's set.
+_GROK_EVENTS = (
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Notification",
+    "Stop",
+    "StopFailure",
+    "SubagentStart",
+    "SubagentStop",
+)
+
+
+PROVIDERS: dict[str, Provider] = {
+    "claude": Provider(
+        name="claude",
+        display_name="Claude Code",
+        binary="claude",
+        install_kind=SETTINGS_JSON_HOOKS,
+        events=_CLAUDE_EVENTS,
+        _settings="~/.claude/settings.json",
+        settings_env="CLAUDE_SETTINGS_PATH",
+        resume_flags=("--resume", "-r"),
+        summarize_cmd=("claude", "-p"),
+    ),
+    "gemini": Provider(
+        name="gemini",
+        display_name="Gemini CLI",
+        binary="gemini",
+        install_kind=SETTINGS_JSON_HOOKS,
+        events=_GEMINI_EVENTS,
+        _settings="~/.gemini/settings.json",
+        settings_env="GEMINI_SETTINGS_PATH",
+        resume_flags=(),
+        summarize_cmd=("gemini", "-p"),
+    ),
+    "codex": Provider(
+        name="codex",
+        display_name="Codex CLI",
+        binary="codex",
+        install_kind=CODEX_HOOKS_JSON,
+        events=_CODEX_EVENTS,
+        _settings="~/.codex/hooks.json",
+        settings_env="CODEX_HOOKS_PATH",
+        resume_flags=(),
+        summarize_cmd=("codex", "exec"),
+    ),
+    "grok": Provider(
+        name="grok",
+        display_name="Grok CLI",
+        binary="grok",
+        install_kind=SETTINGS_JSON_HOOKS,
+        events=_GROK_EVENTS,
+        _settings="~/.grok/user-settings.json",
+        settings_env="GROK_SETTINGS_PATH",
+        resume_flags=("-s", "--session"),
+        summarize_cmd=None,
+    ),
+}
+
+# Stable display order for CLI output (`ephor init --provider all`, doctor).
+PROVIDER_ORDER: tuple[str, ...] = ("claude", "gemini", "codex", "grok")
+
+# Binaries we scan for in process discovery, in preference order.
+KNOWN_BINARIES: tuple[str, ...] = tuple(PROVIDERS[n].binary for n in PROVIDER_ORDER)
+
+
+def get_provider(name: str) -> Provider:
+    """Look up a provider by canonical name. Raises KeyError on unknown name."""
+    return PROVIDERS[name]
+
+
+def all_providers() -> list[Provider]:
+    """Every provider in stable display order."""
+    return [PROVIDERS[n] for n in PROVIDER_ORDER]
+
+
+def resolve_providers(selector: str | None) -> list[Provider]:
+    """Map a CLI `--provider` selector to Provider objects.
+
+    None → default (`claude`, preserving pre-multi-CLI behaviour).
+    "all" → every provider. Otherwise a single provider name.
+    Raises KeyError for an unknown name so the CLI can report it.
+    """
+    if selector is None:
+        return [PROVIDERS["claude"]]
+    if selector == "all":
+        return all_providers()
+    return [PROVIDERS[selector]]

@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-If you find a security issue in `cco`, please **do not open a public
+If you find a security issue in `ephor`, please **do not open a public
 GitHub issue**. Instead:
 
 - Use [GitHub's private vulnerability reporting][advisory] on this
@@ -20,9 +20,9 @@ Only the latest minor release on `main` receives security fixes during
 the `0.x` series. Once `1.0` ships, we'll backport critical fixes to
 the previous minor.
 
-## What `cco` Touches on Your Machine
+## What `ephor` Touches on Your Machine
 
-`cco` is a local TUI. It runs entirely on your workstation and never
+`ephor` is a local TUI. It runs entirely on your workstation and never
 sends your data to any third party. For full transparency:
 
 - **Read** `~/.claude/.credentials.json` to compute per-account usage
@@ -32,19 +32,19 @@ sends your data to any third party. For full transparency:
   to count tokens and produce a one-line summary. Transcript content
   never leaves your machine.
 - **Write** per-session state files at
-  `$XDG_STATE_HOME/claude-orchestrator/sessions/<session>.json` (mode
+  `$XDG_STATE_HOME/ephor/sessions/<session>.json` (mode
   `0600`, parent dir `0700`). Each file contains the first 70 chars of
   your most recent prompt as a "last summary" hint, plus tmux pane IDs
   and Claude session metadata.
-- **Write** usage caches at `$XDG_CACHE_HOME/claude-orchestrator/` (mode
+- **Write** usage caches at `$XDG_CACHE_HOME/ephor/` (mode
   `0600`, parent dir `0700`). Contains hashed account fingerprints and
   aggregate token counts — no prompts, no responses, no tokens.
 - **Run** `tmux` subprocesses to discover panes and switch the user's
   current window. All arguments are passed as argv lists (never a shell
   string); pane and session IDs are validated before use.
 - **Install** Claude Code hooks into `~/.claude/settings.json` when you
-  run `cco init`. The hook script lives in this repo at
-  `src/claude_orchestrator/hooks/event_handler.sh` and runs once per
+  run `ephor init`. The hook script lives in this repo at
+  `src/ephor/hooks/event_handler.sh` and runs once per
   Claude tool event with `set -u`, a sanitized `PATH`, and unset
   `BASH_ENV`/`ENV`/`PROMPT_COMMAND` so it can't be hijacked by a
   poisoned environment.

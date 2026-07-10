@@ -7,13 +7,13 @@ from typing import Any
 
 import pytest
 
-from claude_orchestrator import speech
-from claude_orchestrator.speech import SpeechState
-from claude_orchestrator.state.manager import StateManager
-from claude_orchestrator.state.models import AgentState
-from claude_orchestrator.tui import app as tui_app
-from claude_orchestrator.tui.app import CcoApp
-from claude_orchestrator.tui.widgets.speech_bar import render_bar
+from ephor import speech
+from ephor.speech import SpeechState
+from ephor.state.manager import StateManager
+from ephor.state.models import AgentState
+from ephor.tui import app as tui_app
+from ephor.tui.app import EphorApp
+from ephor.tui.widgets.speech_bar import render_bar
 
 
 def _write_state(directory: Path, sid: str, **overrides: Any) -> None:
@@ -30,7 +30,7 @@ def _write_state(directory: Path, sid: str, **overrides: Any) -> None:
 @pytest.fixture
 def speech_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     log = tmp_path / "speech.jsonl"
-    monkeypatch.setenv("CCO_SPEECH_LOG", str(log))
+    monkeypatch.setenv("EPHOR_SPEECH_LOG", str(log))
     return log
 
 
@@ -39,7 +39,7 @@ def _no_real_tts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make sure tests never try to invoke kokoro. Forcing default_tts_command
     to return None routes the player through its null-spawner code path,
     which preserves queue semantics without ever fork()-ing."""
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     monkeypatch.setattr(sp, "default_tts_command", lambda: None)
 
@@ -48,7 +48,7 @@ def _no_real_tts(monkeypatch: pytest.MonkeyPatch) -> None:
 def populated_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     sd = tmp_path / "sessions"
     sd.mkdir()
-    monkeypatch.setenv("CCO_STATE_DIR", str(sd))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
     _write_state(sd, "alpha-id", project_name="alpha")
     _write_state(sd, "beta-id", project_name="beta")
     return sd
@@ -104,9 +104,9 @@ def test_render_bar_escapes_brackets_in_assistant_text() -> None:
 
 @pytest.mark.asyncio
 async def test_speech_bar_picks_up_new_start_record(populated_dir: Path, speech_log: Path) -> None:
-    """When cco owns playback, a new Stop event lands in the log → the
+    """When ephor owns playback, a new Stop event lands in the log → the
     player picks it up on tick → the bar reflects it on the next refresh."""
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         assert app._speech_bar is not None
@@ -128,7 +128,7 @@ async def test_jump_speaking_routes_to_active_session(
     speech_log: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from claude_orchestrator.tmux import navigator
+    from ephor.tmux import navigator
 
     captured: list[AgentState] = []
 
@@ -144,7 +144,7 @@ async def test_jump_speaking_routes_to_active_session(
 
     monkeypatch.setattr(tui_app, "jump_to", fake_jump)
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         # Append AFTER app creation so the watcher (which starts at EOF
@@ -164,7 +164,7 @@ async def test_jump_speaking_toasts_when_nothing_is_speaking(
     populated_dir: Path,
     speech_log: Path,
 ) -> None:
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         await app.action_jump_speaking()
@@ -185,12 +185,12 @@ async def test_action_toggle_mute_flips_player_and_persists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`m` flips the player's mute state AND writes the new value to disk
-    so the choice survives a cco restart."""
-    monkeypatch.setenv("CCO_CONFIG_DIR", str(tmp_path / "config"))
-    monkeypatch.delenv("CCO_TTS_ENABLED", raising=False)
-    from claude_orchestrator import speech_settings
+    so the choice survives a ephor restart."""
+    monkeypatch.setenv("EPHOR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("EPHOR_TTS_ENABLED", raising=False)
+    from ephor import speech_settings
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         starting = app._speech_player.is_muted
@@ -216,10 +216,10 @@ async def test_bar_shows_muted_icon_when_muted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CCO_CONFIG_DIR", str(tmp_path / "config"))
-    monkeypatch.delenv("CCO_TTS_ENABLED", raising=False)
+    monkeypatch.setenv("EPHOR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("EPHOR_TTS_ENABLED", raising=False)
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         # Force muted from a known starting state.
@@ -243,7 +243,7 @@ async def test_row_marker_appears_on_speaking_session(
     """The row whose session is speaking must render the 🔊 marker; others
     must not. Lets users spot the speaker at a glance without consulting
     the bar."""
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         # Append AFTER app creation; the watcher starts at EOF on init.
@@ -266,7 +266,7 @@ async def test_row_marker_clears_when_speech_stops(populated_dir: Path, speech_l
     speech.append_start("alpha-id", "Hello.")
     speech.append_stop("alpha-id")
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         app._speech_player.tick()
@@ -286,12 +286,12 @@ async def test_action_toggle_speak_mode_flips_player_and_persists(
 ) -> None:
     """`M` flips between full and summary modes, persists to disk, and
     keeps the player's runtime mode in sync."""
-    monkeypatch.setenv("CCO_CONFIG_DIR", str(tmp_path / "config"))
-    monkeypatch.delenv("CCO_TTS_ENABLED", raising=False)
-    monkeypatch.delenv("CCO_TTS_MODE", raising=False)
-    from claude_orchestrator import speech_settings
+    monkeypatch.setenv("EPHOR_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("EPHOR_TTS_ENABLED", raising=False)
+    monkeypatch.delenv("EPHOR_TTS_MODE", raising=False)
+    from ephor import speech_settings
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         # Default is "full" — a clean install never starts in summary mode

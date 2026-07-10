@@ -6,16 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator.cli import main
-from claude_orchestrator.constants import AgentStatus
-from claude_orchestrator.state.models import AgentState
+from ephor.cli import main
+from ephor.constants import AgentStatus
+from ephor.state.models import AgentState
 
 
 @pytest.fixture
 def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     sd = tmp_path / "sessions"
     sd.mkdir(parents=True)
-    monkeypatch.setenv("CCO_STATE_DIR", str(sd))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
     return sd
 
 
@@ -80,7 +80,7 @@ def test_tmux_widget_empty_outputs_dot(state_dir: Path, capsys: pytest.CaptureFi
     rc = main(["tmux-widget"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "cco" in out
+    assert "ephor" in out
     # Empty state shows dim dot.
     assert "·" in out
 
@@ -137,7 +137,7 @@ def test_kill_unique_prefix_signals_pid_and_unlinks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Use a fake kill_session so the test doesn't need a real process."""
-    from claude_orchestrator.tmux import navigator
+    from ephor.tmux import navigator
 
     _write(state_dir, "abc-12345", project_name="proj")
     captured: list[object] = []
@@ -153,7 +153,7 @@ def test_kill_unique_prefix_signals_pid_and_unlinks(
 
     monkeypatch.setattr(navigator, "kill_session", fake_kill)
     # main() imports kill_session lazily — patch in cli too if needed.
-    import claude_orchestrator.cli as cli_module
+    import ephor.cli as cli_module
 
     monkeypatch.setattr(cli_module, "_cmd_kill", cli_module._cmd_kill)
 

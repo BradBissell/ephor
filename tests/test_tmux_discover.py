@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from claude_orchestrator.tmux import discover
+from ephor.tmux import discover
 
 
 def _fake_run_factory(panes_stdout: str = "", pgrep_stdout: str = ""):
@@ -73,7 +73,7 @@ def test_discover_finds_claude_in_pane(monkeypatch: pytest.MonkeyPatch) -> None:
     assert info.tmux_session == "work"
     assert info.tmux_window == "claude"
     assert info.tmux_pane == "%1"
-    assert info.claude_pid == 5678
+    assert info.agent_pid == 5678
     assert info.cwd == "/tmp/projX"
 
 
@@ -123,7 +123,7 @@ def test_enrich_state_files_writes_tmux_fields(
                 tmux_session="work",
                 tmux_window="claude",
                 tmux_pane="%5",
-                claude_pid=5678,
+                agent_pid=5678,
                 cwd="/tmp/projX",
             )
         ],
@@ -171,7 +171,7 @@ def test_enrich_skips_when_already_populated(
                 tmux_session="stale",
                 tmux_window="stale",
                 tmux_pane="%1",
-                claude_pid=1,
+                agent_pid=1,
                 cwd="/tmp/projX",
             )
         ],
@@ -212,7 +212,7 @@ def _make_state(directory: Path, sid: str, **overrides: object) -> Path:
         "tmux_session": None,
         "tmux_window": None,
         "tmux_pane": None,
-        "claude_pid": None,
+        "agent_pid": None,
         "notification": None,
     }
     base.update(overrides)
@@ -222,12 +222,12 @@ def _make_state(directory: Path, sid: str, **overrides: object) -> Path:
 
 
 def test_enrich_prefers_pid_match_over_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Two state files share a cwd but each records a distinct claude_pid.
+    """Two state files share a cwd but each records a distinct agent_pid.
     The discoverer's two distinct pids should map to the right state files."""
     sd = tmp_path / "sessions"
     sd.mkdir()
-    _make_state(sd, "sid-A", claude_pid=100)
-    _make_state(sd, "sid-B", claude_pid=200)
+    _make_state(sd, "sid-A", agent_pid=100)
+    _make_state(sd, "sid-B", agent_pid=200)
 
     monkeypatch.setattr(
         discover,
@@ -237,14 +237,14 @@ def test_enrich_prefers_pid_match_over_cwd(tmp_path: Path, monkeypatch: pytest.M
                 tmux_session="work",
                 tmux_window="A",
                 tmux_pane="%1",
-                claude_pid=100,
+                agent_pid=100,
                 cwd="/tmp/sharedcwd",
             ),
             discover.TmuxPaneInfo(
                 tmux_session="work",
                 tmux_window="B",
                 tmux_pane="%2",
-                claude_pid=200,
+                agent_pid=200,
                 cwd="/tmp/sharedcwd",
             ),
         ],
@@ -264,12 +264,12 @@ def test_enrich_prefers_pid_match_over_cwd(tmp_path: Path, monkeypatch: pytest.M
 def test_enrich_skips_ambiguous_cwd_when_pid_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Two state files share a cwd, neither records claude_pid, and two
+    """Two state files share a cwd, neither records agent_pid, and two
     discovered panes share that cwd. The matcher must NOT guess — it
     should skip both and wait for the hook handler to record pids."""
     sd = tmp_path / "sessions"
     sd.mkdir()
-    _make_state(sd, "sid-A")  # claude_pid intentionally null
+    _make_state(sd, "sid-A")  # agent_pid intentionally null
     _make_state(sd, "sid-B")
 
     monkeypatch.setattr(
@@ -280,14 +280,14 @@ def test_enrich_skips_ambiguous_cwd_when_pid_unknown(
                 tmux_session="work",
                 tmux_window="A",
                 tmux_pane="%1",
-                claude_pid=100,
+                agent_pid=100,
                 cwd="/tmp/sharedcwd",
             ),
             discover.TmuxPaneInfo(
                 tmux_session="work",
                 tmux_window="B",
                 tmux_pane="%2",
-                claude_pid=200,
+                agent_pid=200,
                 cwd="/tmp/sharedcwd",
             ),
         ],
@@ -304,7 +304,7 @@ def test_enrich_skips_ambiguous_cwd_when_pid_unknown(
 def test_enrich_records_claude_pid_when_matched_by_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cwd-matched state files should also get claude_pid backfilled so the
+    """Cwd-matched state files should also get agent_pid backfilled so the
     next enrich call can use the unambiguous pid path."""
     sd = tmp_path / "sessions"
     sd.mkdir()
@@ -318,7 +318,7 @@ def test_enrich_records_claude_pid_when_matched_by_cwd(
                 tmux_session="work",
                 tmux_window="X",
                 tmux_pane="%9",
-                claude_pid=42,
+                agent_pid=42,
                 cwd="/tmp/uniqueX",
             ),
         ],
@@ -326,7 +326,7 @@ def test_enrich_records_claude_pid_when_matched_by_cwd(
 
     discover.enrich_state_files(sd)
     after = json.loads((sd / "sid-X.json").read_text())
-    assert after["claude_pid"] == 42
+    assert after["agent_pid"] == 42
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +340,7 @@ def test_session_id_extracted_from_resume_argv(
     sd = tmp_path / "sessions"
     sd.mkdir()
     sid = "abc12345-1234-1234-1234-1234567890ab"
-    _make_state(sd, sid)  # default cwd /tmp/sharedcwd, claude_pid null
+    _make_state(sd, sid)  # default cwd /tmp/sharedcwd, agent_pid null
 
     monkeypatch.setattr(
         discover,
@@ -350,7 +350,7 @@ def test_session_id_extracted_from_resume_argv(
                 tmux_session="work",
                 tmux_window="A",
                 tmux_pane="%9",
-                claude_pid=999,
+                agent_pid=999,
                 cwd="/tmp/sharedcwd",
                 session_id=sid,
             ),
@@ -359,7 +359,7 @@ def test_session_id_extracted_from_resume_argv(
     discover.enrich_state_files(sd)
     after = json.loads((sd / f"{sid}.json").read_text())
     assert after["tmux_pane"] == "%9"
-    assert after["claude_pid"] == 999  # backfilled from definitive match
+    assert after["agent_pid"] == 999  # backfilled from definitive match
 
 
 def test_session_id_priority_disambiguates_same_cwd(
@@ -380,7 +380,7 @@ def test_session_id_priority_disambiguates_same_cwd(
                 tmux_session="work",
                 tmux_window="A",
                 tmux_pane="%1",
-                claude_pid=100,
+                agent_pid=100,
                 cwd="/tmp/sharedcwd",
                 session_id=sid_a,
             ),
@@ -388,7 +388,7 @@ def test_session_id_priority_disambiguates_same_cwd(
                 tmux_session="work",
                 tmux_window="B",
                 tmux_pane="%2",
-                claude_pid=200,
+                agent_pid=200,
                 cwd="/tmp/sharedcwd",
                 session_id=sid_b,
             ),
@@ -426,7 +426,7 @@ def test_definitive_match_overwrites_wrong_existing_tmux(
                 tmux_session="fresh",
                 tmux_window="fresh-w",
                 tmux_pane="%5",
-                claude_pid=1,
+                agent_pid=1,
                 cwd="/tmp/sharedcwd",
                 session_id=sid,
             ),
@@ -465,7 +465,7 @@ def test_corrupt_tab_concat_treated_as_missing(
                 tmux_session="work",
                 tmux_window="claude",
                 tmux_pane="%9",
-                claude_pid=42,
+                agent_pid=42,
                 cwd="/tmp/uniqueX",  # session_id intentionally None
             ),
         ],
@@ -500,7 +500,7 @@ def test_read_session_id_from_cmdline_round_trip(tmp_path: Path) -> None:
 
     builtins.open = fake_open  # type: ignore[assignment]
     try:
-        got = discover._read_session_id_from_cmdline(1234)
+        got = discover._read_session_id_from_cmdline(1234, ("--resume", "-r"))
     finally:
         builtins.open = real_open  # type: ignore[assignment]
     assert got == sid
@@ -527,18 +527,18 @@ def test_read_session_id_rejects_garbage(tmp_path: Path, monkeypatch: pytest.Mon
 
     builtins.open = fake_open  # type: ignore[assignment]
     try:
-        got = discover._read_session_id_from_cmdline(9999)
+        got = discover._read_session_id_from_cmdline(9999, ("--resume", "-r"))
     finally:
         builtins.open = real_open  # type: ignore[assignment]
     assert got is None
 
 
 def test_discover_uses_pane_claude_sid_option(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When the per-pane @claude_sid user option is set (by the SessionStart
+    """When the per-pane @ephor_sid user option is set (by the SessionStart
     hook), discover_panes uses it instead of parsing the claude --resume
     argv. This is what disambiguates same-cwd panes."""
     monkeypatch.setattr(discover, "has_tmux", lambda: True)
-    # 5-tab-separated: pid, session, window, pane_id, @claude_sid
+    # 5-tab-separated: pid, session, window, pane_id, @ephor_sid
     panes = "1234\twork\tclaude\t%1\tabc-pane-sid\n"
     pgrep = "5678\n"
     monkeypatch.setattr(subprocess, "run", _fake_run_factory(panes, pgrep))
@@ -546,7 +546,9 @@ def test_discover_uses_pane_claude_sid_option(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(discover, "_read_proc_ppid", lambda pid: 1234 if pid == 5678 else None)
 
     # If discover read cmdline, it'd return this — but pane option must win.
-    monkeypatch.setattr(discover, "_read_session_id_from_cmdline", lambda pid: "wrong-cmdline-sid")
+    monkeypatch.setattr(
+        discover, "_read_session_id_from_cmdline", lambda pid, flags: "wrong-cmdline-sid"
+    )
 
     found = discover.discover_panes()
     assert len(found) == 1
@@ -556,7 +558,7 @@ def test_discover_uses_pane_claude_sid_option(monkeypatch: pytest.MonkeyPatch) -
 def test_discover_falls_back_to_cmdline_when_pane_option_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When @claude_sid isn't set on the pane (older claude that hasn't
+    """When @ephor_sid isn't set on the pane (older claude that hasn't
     fired SessionStart yet, or pre-fix state), fall back to argv parsing."""
     monkeypatch.setattr(discover, "has_tmux", lambda: True)
     # Trailing tab-then-empty mimics tmux 5-field format with empty option.
@@ -565,7 +567,9 @@ def test_discover_falls_back_to_cmdline_when_pane_option_unset(
     monkeypatch.setattr(subprocess, "run", _fake_run_factory(panes, pgrep))
     monkeypatch.setattr(discover, "_read_proc_cwd", lambda pid: "/tmp/projX")
     monkeypatch.setattr(discover, "_read_proc_ppid", lambda pid: 1234 if pid == 5678 else None)
-    monkeypatch.setattr(discover, "_read_session_id_from_cmdline", lambda pid: "fallback-sid")
+    monkeypatch.setattr(
+        discover, "_read_session_id_from_cmdline", lambda pid, flags: "fallback-sid"
+    )
 
     found = discover.discover_panes()
     assert len(found) == 1
@@ -575,7 +579,7 @@ def test_discover_falls_back_to_cmdline_when_pane_option_unset(
 def test_list_tmux_panes_handles_legacy_4_field_format(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Older tmux versions trim trailing empty fields (no `@claude_sid`).
+    """Older tmux versions trim trailing empty fields (no `@ephor_sid`).
     Must still parse without crashing."""
     monkeypatch.setattr(discover, "has_tmux", lambda: True)
     panes = "1234\twork\tclaude\t%1\n"
