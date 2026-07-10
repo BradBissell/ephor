@@ -24,16 +24,22 @@ reconciler, speech) reads the state files and never cares who wrote them.
 
 Agents differ only at the edges:
 
-| Agent | Settings file | Event-name dialect |
+| Agent | Config the installer writes | Event-name dialect |
 |---|---|---|
-| Claude Code | `~/.claude/settings.json` | `PreToolUse`, `PostToolUse`, `Stop`, … |
-| Gemini CLI | `~/.gemini/settings.json` | `BeforeTool`, `AfterTool`, `AfterAgent`, `Notification(ToolPermission)` |
+| Claude Code | `~/.claude/settings.json` (`hooks`) | `PreToolUse`, `PostToolUse`, `Stop`, … |
+| Gemini CLI | `~/.gemini/settings.json` (`hooks`) | `BeforeTool`, `AfterTool`, `AfterAgent`, `Notification(ToolPermission)` |
 | Codex CLI | `~/.codex/hooks.json` | `PreToolUse`, `PermissionRequest`, `Stop`, … |
-| Grok CLI | `~/.grok/user-settings.json` | Claude-like; `UserPromptSubmit` carries `user_prompt` |
+| Grok CLI | `~/.grok/user-settings.json` (`hooks`) | Claude-like; `UserPromptSubmit` carries `user_prompt` |
+| OpenCode | `~/.config/opencode/plugins/ephor.js` | JS plugin → canonical events |
 
-OpenCode is out of scope for now: its plugins are JS/TS rather than shell
-hooks, so it would need a plugin shim or an SSE-stream watcher against
-`opencode serve`'s HTTP `/event` endpoint.
+OpenCode has no shell hooks, only JS/TS plugins, so it uses the
+`OPENCODE_PLUGIN` strategy: `ephor init --provider opencode` writes a generated
+plugin whose `event` hook (plus `tool.execute.before/after`) maps OpenCode's
+bus events — `session.status`/`session.idle`, `permission.*`, tool execution —
+onto ephor's canonical events and pipes them, via Bun's `$` shell, straight
+into `event_handler.sh` (tagged `EPHOR_PROVIDER=opencode`). So even the
+plugin-based agent funnels through the one shared state writer. (Summary-mode
+TTS is Claude-transcript-specific and not yet wired for OpenCode sessions.)
 
 ## Components
 
@@ -49,7 +55,8 @@ hooks, so it would need a plugin shim or an SSE-stream watcher against
 src/ephor/
 ├── providers.py               ← registry: per-agent binary, settings path, events, resume flags
 ├── hooks/event_handler.sh     ← shell, set -u, sanitized PATH, jq --arg only; all dialects
-├── hooks/installer.py         ← installs/uninstalls hooks per provider
+├── hooks/opencode_plugin.js   ← generated OpenCode plugin (event bus → event_handler.sh)
+├── hooks/installer.py         ← installs/uninstalls hooks per provider (+ the opencode plugin)
 ├── state/manager.py           ← scans + reads state files
 ├── state/reconciler.py        ← prunes dead sessions, fixes stuck waits
 ├── tmux/discover.py           ← walks /proc + tmux to find pane → agent pid (all agent binaries)

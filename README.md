@@ -5,9 +5,9 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
 A Linux-native TUI that watches every terminal coding-agent session you
-have running — **Claude Code, Gemini CLI, Codex CLI, and Grok CLI** — and
-tells you, at a glance, which ones need your attention, which are still
-working, and which went idle.
+have running — **Claude Code, Gemini CLI, Codex CLI, Grok CLI, and
+OpenCode** — and tells you, at a glance, which ones need your attention,
+which are still working, and which went idle.
 
 > `ephor` (Greek *ἔφορος*, "overseer") began as `cco`, a Claude-Code-only
 > dashboard. It now speaks the hook protocol of four coding agents that
@@ -21,11 +21,14 @@ working, and which went idle.
 | **Gemini CLI** | `~/.gemini/settings.json` | same `hooks` shape (`Before*`/`After*` events) |
 | **Codex CLI** | `~/.codex/hooks.json` | dedicated hooks file, command + stdin JSON |
 | **Grok CLI** ([superagent-ai/grok-cli](https://github.com/superagent-ai/grok-cli)) | `~/.grok/user-settings.json` | same `hooks` shape |
+| **OpenCode** | `~/.config/opencode/plugins/ephor.js` | bundled JS plugin → shells out to the handler |
 
-One shell handler serves all four — it understands each agent's event-name
-and field-name dialect and records which agent a session belongs to.
-OpenCode isn't supported yet (its plugins are JS/TS rather than shell
-hooks, so it needs a different bridge).
+The first four share the stdin-JSON hook model, so one shell handler serves
+them all — it understands each agent's event-name and field-name dialect and
+records which agent a session belongs to. OpenCode has no shell hooks, so
+`ephor init --provider opencode` installs a tiny JS **plugin** that translates
+OpenCode's bus events and pipes them into the *same* handler — so every agent
+funnels through one state writer.
 
 <img width="2806" height="1972" alt="image" src="https://github.com/user-attachments/assets/50f4b678-2da8-4ee1-b52e-3d148ce4ae7c" />
 
