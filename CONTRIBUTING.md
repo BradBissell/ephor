@@ -1,13 +1,13 @@
-# Contributing to cco
+# Contributing to ephor
 
-Thanks for your interest! `cco` is a small, opinionated tool — bug
+Thanks for your interest! `ephor` is a small, opinionated tool — bug
 reports, fixes, and well-scoped features are all welcome.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/BradBissell/claude-orchestrator
-cd claude-orchestrator
+cd ephor
 
 # Editable install with dev + TUI extras.
 python -m venv .venv && . .venv/bin/activate
@@ -22,7 +22,7 @@ ruff format --check .
 mypy src
 
 # Shell-lint the hook handler.
-shellcheck src/claude_orchestrator/hooks/event_handler.sh
+shellcheck src/ephor/hooks/event_handler.sh
 ```
 
 The CI workflow at `.github/workflows/ci.yml` runs all of the above
@@ -43,7 +43,7 @@ opening a PR and you'll save a round-trip.
 
 ## Areas where help is especially welcome
 
-- **More terminal emulator support.** `cco` is terminal-agnostic
+- **More terminal emulator support.** `ephor` is terminal-agnostic
   today (it only talks to tmux), but if you find a setup where Enter
   doesn't switch panes, a bug report with `tmux info` output is gold.
 - **Notification backends** beyond libnotify (mako, dunst-rs, etc).
@@ -57,7 +57,7 @@ opening a PR and you'll save a round-trip.
   please don't add `# type: ignore` without a comment explaining why.
 - Shell: `shellcheck` clean, `set -u` everywhere, every variable
   flowing into `tmux` / `jq` is quoted and (where it crosses a trust
-  boundary) regex-validated. See `src/claude_orchestrator/hooks/event_handler.sh`
+  boundary) regex-validated. See `src/ephor/hooks/event_handler.sh`
   for the established patterns.
 
 ## Reporting security issues

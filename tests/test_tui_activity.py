@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from claude_orchestrator.tui.activity import (
+from ephor.tui.activity import (
     WINDOW,
     ActivitySampler,
     _read_cpu_jiffies,
@@ -58,7 +58,7 @@ def test_sampler_clamps_to_one() -> None:
     pid = 12345
     # Inject a fake "previous" sample, then patch _read_cpu_jiffies to force a huge delta.
     s._last[pid] = (time.monotonic() - 0.5, 0)
-    import claude_orchestrator.tui.activity as activity_module
+    import ephor.tui.activity as activity_module
 
     real = activity_module._read_cpu_jiffies
     activity_module._read_cpu_jiffies = lambda _pid: 10**9  # type: ignore[assignment]
@@ -87,6 +87,6 @@ def test_samples_for_none_returns_empty() -> None:
 
 def test_window_matches_sparkline_width() -> None:
     """If these drift apart, the sparkline column visibly stops filling."""
-    from claude_orchestrator.tui.widgets.session_row import _SPARK_WIDTH
+    from ephor.tui.widgets.session_row import _SPARK_WIDTH
 
     assert WINDOW == _SPARK_WIDTH

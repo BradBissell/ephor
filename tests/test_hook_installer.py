@@ -1,7 +1,7 @@
 """Tests for the hook installer.
 
 Critical property: install → uninstall round-trip must be byte-identical when
-the user has no other hooks, AND must preserve all non-cco hook entries when
+the user has no other hooks, AND must preserve all non-ephor hook entries when
 they coexist.
 """
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator.hooks import installer
+from ephor.hooks import installer
 
 
 @pytest.fixture
@@ -39,13 +39,13 @@ def settings_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def test_install_into_empty_settings(settings_path: Path, fake_handler: Path) -> None:
     plan = installer.install(dry_run=False)
-    assert plan.events_to_add == list(installer.CCO_EVENTS)
+    assert plan.events_to_add == list(installer.EPHOR_EVENTS)
     assert plan.events_already_installed == []
     assert plan.backup_path is not None  # backup of "empty" file (sentinel)
 
     data = json.loads(settings_path.read_text())
     assert "hooks" in data
-    for event in installer.CCO_EVENTS:
+    for event in installer.EPHOR_EVENTS:
         assert event in data["hooks"]
         entries = data["hooks"][event]
         assert any(str(fake_handler) in h["hooks"][0]["command"] for h in entries)
@@ -53,7 +53,7 @@ def test_install_into_empty_settings(settings_path: Path, fake_handler: Path) ->
 
 def test_install_dry_run_does_not_write(settings_path: Path, fake_handler: Path) -> None:
     plan = installer.install(dry_run=True)
-    assert plan.events_to_add == list(installer.CCO_EVENTS)
+    assert plan.events_to_add == list(installer.EPHOR_EVENTS)
     assert not settings_path.exists()
 
 
@@ -61,7 +61,7 @@ def test_install_idempotent(settings_path: Path, fake_handler: Path) -> None:
     installer.install()
     plan = installer.install()  # second time should be a no-op
     assert plan.events_to_add == []
-    assert sorted(plan.events_already_installed) == sorted(installer.CCO_EVENTS)
+    assert sorted(plan.events_already_installed) == sorted(installer.EPHOR_EVENTS)
 
 
 def test_install_preserves_existing_hooks(settings_path: Path, fake_handler: Path) -> None:
@@ -104,7 +104,7 @@ def test_install_preserves_existing_hooks(settings_path: Path, fake_handler: Pat
 def test_uninstall_removes_all_cco_entries(settings_path: Path, fake_handler: Path) -> None:
     installer.install()
     plan = installer.uninstall()
-    assert sorted(plan.events_with_cco_hook) == sorted(installer.CCO_EVENTS)
+    assert sorted(plan.events_with_ephor_hook) == sorted(installer.EPHOR_EVENTS)
 
     data = json.loads(settings_path.read_text()) if settings_path.read_text() else {}
     # No "hooks" key when nothing else was using it.
@@ -115,7 +115,7 @@ def test_uninstall_dry_run_does_not_write(settings_path: Path, fake_handler: Pat
     installer.install()
     before = settings_path.read_bytes()
     plan = installer.uninstall(dry_run=True)
-    assert sorted(plan.events_with_cco_hook) == sorted(installer.CCO_EVENTS)
+    assert sorted(plan.events_with_ephor_hook) == sorted(installer.EPHOR_EVENTS)
     assert settings_path.read_bytes() == before
 
 
@@ -154,7 +154,7 @@ def test_uninstall_preserves_other_hooks(settings_path: Path, fake_handler: Path
             "permissions": {"defaultMode": "auto"},
             "statusLine": {"type": "command", "command": "/x"},
         },
-        # Existing gsd-style hooks, no cco.
+        # Existing gsd-style hooks, no ephor.
         {
             "hooks": {
                 "PreToolUse": [
@@ -190,7 +190,7 @@ def test_install_uninstall_roundtrip_preserves_user_hooks(
     installer.uninstall()
 
     if not settings_path.exists() or not settings_path.read_text().strip():
-        # File only ever contained cco hooks → uninstall correctly removed it
+        # File only ever contained ephor hooks → uninstall correctly removed it
         # OR the file remained empty.
         assert not before_user_hooks, "cleared file but user had hooks"
         assert not before_other, "cleared file but user had other config"
@@ -246,7 +246,7 @@ def test_backups_rotate_to_keep_last_three(settings_path: Path, fake_handler: Pa
 def test_restore_backup(settings_path: Path, fake_handler: Path) -> None:
     settings_path.write_text('{"original": true}\n')
     installer.install()
-    # Sanity: cco hooks are now in the file.
+    # Sanity: ephor hooks are now in the file.
     assert "hooks" in json.loads(settings_path.read_text())
 
     restored = installer.restore_backup()
@@ -263,12 +263,12 @@ def test_restore_backup_with_no_backup_returns_none(
 
 
 # ---------------------------------------------------------------------------
-# speech install (handing TTS playback to cco)
+# speech install (handing TTS playback to ephor)
 # ---------------------------------------------------------------------------
 
 
 def _settings_with_tts_and_cco_hooks(handler: Path) -> dict:
-    """Mimic a user's settings.json that has both cco's event_handler.sh
+    """Mimic a user's settings.json that has both ephor's event_handler.sh
     AND tts-speak-response wired to the Stop hook."""
     return {
         "hooks": {
@@ -278,7 +278,7 @@ def _settings_with_tts_and_cco_hooks(handler: Path) -> dict:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": f'CCO_EVENT=Stop "{handler}"',
+                            "command": f'EPHOR_EVENT=Stop "{handler}"',
                             "async": True,
                         },
                         {
@@ -314,7 +314,7 @@ def test_speech_install_removes_only_tts_entries(settings_path: Path, fake_handl
 
     after = json.loads(settings_path.read_text())
     stop_inner = after["hooks"]["Stop"][0]["hooks"]
-    # cco's event_handler stays.
+    # ephor's event_handler stays.
     assert any("event_handler" in str(h.get("command", "")) for h in stop_inner)
     # tts-speak-response is gone.
     assert not any("tts-speak-response" in str(h.get("command", "")) for h in stop_inner)
@@ -335,7 +335,7 @@ def test_speech_install_dry_run_writes_nothing(settings_path: Path, fake_handler
 
 def test_speech_install_no_op_when_no_tts_hook(settings_path: Path, fake_handler: Path) -> None:
     """User who never set up tts-speak-response should get a clean no-op."""
-    installer.install(dry_run=False)  # only cco's hooks present
+    installer.install(dry_run=False)  # only ephor's hooks present
     plan = installer.install_speech(dry_run=False)
     assert plan.affected_events == []
     assert plan.backup_path is None
@@ -370,3 +370,79 @@ def test_speech_install_drops_event_when_tts_was_only_hook(
     installer.install_speech(dry_run=False)
     after = json.loads(settings_path.read_text())
     assert "hooks" not in after, "Stop should be dropped, then empty hooks dict removed"
+
+
+# ---------------------------------------------------------------------------
+# multi-provider install (gemini / codex / grok)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def provider_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
+    """Point every provider's settings file at an isolated tmp path via its
+    documented env override, and bundle a fake handler."""
+    handler = tmp_path / "fake_event_handler.sh"
+    handler.write_text("#!/bin/sh\nexit 0\n")
+    handler.chmod(0o755)
+    monkeypatch.setattr(installer, "hook_handler_path", lambda: handler)
+
+    paths = {
+        "claude": tmp_path / "claude.json",
+        "gemini": tmp_path / "gemini.json",
+        "codex": tmp_path / "codex-hooks.json",
+        "grok": tmp_path / "grok.json",
+    }
+    monkeypatch.setattr(installer, "claude_settings_path", lambda: paths["claude"])
+    monkeypatch.setenv("GEMINI_SETTINGS_PATH", str(paths["gemini"]))
+    monkeypatch.setenv("CODEX_HOOKS_PATH", str(paths["codex"]))
+    monkeypatch.setenv("GROK_SETTINGS_PATH", str(paths["grok"]))
+    return paths
+
+
+@pytest.mark.parametrize("provider", ["gemini", "codex", "grok"])
+def test_install_registers_provider_events_and_tag(
+    provider: str, provider_paths: dict[str, Path]
+) -> None:
+    from ephor.providers import get_provider
+
+    prov = get_provider(provider)
+    plan = installer.install(provider)
+    assert sorted(plan.events_to_add) == sorted(prov.events)
+
+    data = json.loads(provider_paths[provider].read_text())
+    for event in prov.events:
+        cmd = data["hooks"][event][0]["hooks"][0]["command"]
+        # Every registered command tags the handler with its provider.
+        assert f"EPHOR_PROVIDER={provider}" in cmd
+
+
+def test_install_all_providers_are_isolated(provider_paths: dict[str, Path]) -> None:
+    for name in ("claude", "gemini", "codex", "grok"):
+        installer.install(name)
+    # Each provider's events landed only in its own file.
+    from ephor.providers import get_provider
+
+    for name in ("claude", "gemini", "codex", "grok"):
+        data = json.loads(provider_paths[name].read_text())
+        assert sorted(data["hooks"].keys()) == sorted(get_provider(name).events)
+
+
+@pytest.mark.parametrize("provider", ["gemini", "codex", "grok"])
+def test_install_uninstall_roundtrip_per_provider(
+    provider: str, provider_paths: dict[str, Path]
+) -> None:
+    installer.install(provider)
+    plan = installer.uninstall(provider)
+    from ephor.providers import get_provider
+
+    assert sorted(plan.events_with_ephor_hook) == sorted(get_provider(provider).events)
+    # File emptied of hooks after uninstall.
+    data = json.loads(provider_paths[provider].read_text())
+    assert "hooks" not in data
+
+
+def test_codex_writes_dedicated_hooks_json(provider_paths: dict[str, Path]) -> None:
+    installer.install("codex")
+    # Codex keeps hooks in its own file, not ~/.claude/settings.json.
+    assert provider_paths["codex"].exists()
+    assert not provider_paths["claude"].exists()

@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator.constants import AgentStatus
-from claude_orchestrator.state.manager import StateManager
-from claude_orchestrator.state.models import AgentState
+from ephor.constants import AgentStatus
+from ephor.state.manager import StateManager
+from ephor.state.models import AgentState
 
 
 def _write_state(directory: Path, sid: str, **kwargs: object) -> Path:
@@ -79,16 +79,16 @@ def test_get_summary_aggregates(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# liveness check (claude_pid → DEAD when process is gone)
+# liveness check (agent_pid → DEAD when process is gone)
 # ---------------------------------------------------------------------------
 
 
 def test_scan_marks_dead_when_pid_not_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from claude_orchestrator.state import manager as mgr_mod
+    from ephor.state import manager as mgr_mod
 
-    _write_state(tmp_path, "ghost", status=AgentStatus.WORKING, claude_pid=99999999)
+    _write_state(tmp_path, "ghost", status=AgentStatus.WORKING, agent_pid=99999999)
 
     # Simulate the pid being dead.
     monkeypatch.setattr(mgr_mod, "_is_pid_alive", lambda pid: False)
@@ -98,9 +98,9 @@ def test_scan_marks_dead_when_pid_not_running(
 
 
 def test_scan_keeps_status_when_pid_alive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from claude_orchestrator.state import manager as mgr_mod
+    from ephor.state import manager as mgr_mod
 
-    _write_state(tmp_path, "alive", status=AgentStatus.WORKING, claude_pid=42)
+    _write_state(tmp_path, "alive", status=AgentStatus.WORKING, agent_pid=42)
     monkeypatch.setattr(mgr_mod, "_is_pid_alive", lambda pid: True)
 
     agents = StateManager(tmp_path).scan()
@@ -108,8 +108,8 @@ def test_scan_keeps_status_when_pid_alive(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 def test_scan_keeps_status_when_pid_unknown(tmp_path: Path) -> None:
-    """No claude_pid recorded → can't tell, leave status as-is."""
-    _write_state(tmp_path, "noinfo", status=AgentStatus.WORKING)  # claude_pid None
+    """No agent_pid recorded → can't tell, leave status as-is."""
+    _write_state(tmp_path, "noinfo", status=AgentStatus.WORKING)  # agent_pid None
     agents = StateManager(tmp_path).scan()
     assert agents[0].status is AgentStatus.WORKING
 
@@ -118,20 +118,20 @@ def test_is_pid_alive_with_self() -> None:
     """Self-test: our own pid should always read as alive."""
     import os
 
-    from claude_orchestrator.state.manager import _is_pid_alive
+    from ephor.state.manager import _is_pid_alive
 
     assert _is_pid_alive(os.getpid()) is True
 
 
 def test_is_pid_alive_with_zero() -> None:
-    from claude_orchestrator.state.manager import _is_pid_alive
+    from ephor.state.manager import _is_pid_alive
 
     assert _is_pid_alive(0) is False
 
 
 def test_is_pid_alive_with_obviously_dead() -> None:
     """A reasonably-large pid that almost certainly doesn't exist."""
-    from claude_orchestrator.state.manager import _is_pid_alive
+    from ephor.state.manager import _is_pid_alive
 
     # 2^22 is below typical max_pid but generally unused.
     assert _is_pid_alive(4194301) is False
@@ -144,24 +144,24 @@ def test_scan_marks_older_sibling_dead_when_pids_collide(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Bug: claude --resume reuses the parent shell's PID, so the new
-    session_id and the old one both reference the same live claude_pid.
+    session_id and the old one both reference the same live agent_pid.
     Both render → duplicate rows in the dashboard. The newer sibling
     (latest last_event_time) wins; older siblings get DEAD so the TUI
     hides them."""
-    from claude_orchestrator.state import manager as mgr_mod
+    from ephor.state import manager as mgr_mod
 
     _write_state(
         tmp_path,
         "old-sid",
         status=AgentStatus.IDLE,
-        claude_pid=12345,
+        agent_pid=12345,
         last_event_time="2026-05-08T13:00:00Z",
     )
     _write_state(
         tmp_path,
         "new-sid",
         status=AgentStatus.WORKING,
-        claude_pid=12345,
+        agent_pid=12345,
         last_event_time="2026-05-08T14:00:00Z",
     )
     monkeypatch.setattr(mgr_mod, "_is_pid_alive", lambda pid: True)
@@ -177,10 +177,10 @@ def test_scan_keeps_distinct_pids_independent(
 ) -> None:
     """Two genuinely separate claude processes (different PIDs) must
     BOTH render — only collisions on the same PID are dedup'd."""
-    from claude_orchestrator.state import manager as mgr_mod
+    from ephor.state import manager as mgr_mod
 
-    _write_state(tmp_path, "a", status=AgentStatus.WORKING, claude_pid=1001)
-    _write_state(tmp_path, "b", status=AgentStatus.IDLE, claude_pid=1002)
+    _write_state(tmp_path, "a", status=AgentStatus.WORKING, agent_pid=1001)
+    _write_state(tmp_path, "b", status=AgentStatus.IDLE, agent_pid=1002)
     monkeypatch.setattr(mgr_mod, "_is_pid_alive", lambda pid: True)
 
     agents = StateManager(tmp_path).scan()
@@ -193,20 +193,20 @@ def test_scan_does_not_dedupe_when_pids_are_dead(
 ) -> None:
     """If the shared PID is dead, both are already DEAD via the existing
     liveness check — dedup logic must not double-process them."""
-    from claude_orchestrator.state import manager as mgr_mod
+    from ephor.state import manager as mgr_mod
 
     _write_state(
         tmp_path,
         "ghost-old",
         status=AgentStatus.IDLE,
-        claude_pid=99999,
+        agent_pid=99999,
         last_event_time="2026-05-08T13:00:00Z",
     )
     _write_state(
         tmp_path,
         "ghost-new",
         status=AgentStatus.IDLE,
-        claude_pid=99999,
+        agent_pid=99999,
         last_event_time="2026-05-08T14:00:00Z",
     )
     monkeypatch.setattr(mgr_mod, "_is_pid_alive", lambda pid: False)
@@ -220,11 +220,11 @@ def test_scan_dedup_handles_three_way_collision(
 ) -> None:
     """User who's resumed twice in the same shell could leave three
     state files for one PID. Only the most recent one survives."""
-    from claude_orchestrator.state import manager as mgr_mod
+    from ephor.state import manager as mgr_mod
 
-    _write_state(tmp_path, "v1", claude_pid=2001, last_event_time="2026-05-08T10:00:00Z")
-    _write_state(tmp_path, "v2", claude_pid=2001, last_event_time="2026-05-08T11:00:00Z")
-    _write_state(tmp_path, "v3", claude_pid=2001, last_event_time="2026-05-08T12:00:00Z")
+    _write_state(tmp_path, "v1", agent_pid=2001, last_event_time="2026-05-08T10:00:00Z")
+    _write_state(tmp_path, "v2", agent_pid=2001, last_event_time="2026-05-08T11:00:00Z")
+    _write_state(tmp_path, "v3", agent_pid=2001, last_event_time="2026-05-08T12:00:00Z")
     monkeypatch.setattr(mgr_mod, "_is_pid_alive", lambda pid: True)
 
     agents = StateManager(tmp_path).scan()

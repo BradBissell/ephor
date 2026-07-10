@@ -13,12 +13,12 @@ from typing import Any
 
 import pytest
 
-from claude_orchestrator.constants import AgentStatus
-from claude_orchestrator.state.manager import StateManager
-from claude_orchestrator.state.models import AgentState, StatusSummary
-from claude_orchestrator.tui.app import CcoApp
-from claude_orchestrator.tui.widgets.header_bar import format_header
-from claude_orchestrator.tui.widgets.session_row import (
+from ephor.constants import AgentStatus
+from ephor.state.manager import StateManager
+from ephor.state.models import AgentState, StatusSummary
+from ephor.tui.app import EphorApp
+from ephor.tui.widgets.header_bar import format_header
+from ephor.tui.widgets.session_row import (
     _SPARK_GLYPHS,
     _SPARK_WIDTH,
     render_sparkline,
@@ -75,7 +75,7 @@ def all_statuses_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """One state file per AgentStatus value."""
     sd = tmp_path / "sessions"
     sd.mkdir()
-    monkeypatch.setenv("CCO_STATE_DIR", str(sd))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
     for i, status in enumerate(AgentStatus):
         _write_state(sd, f"sid-{i}", status=status, project_name=f"proj-{status.value}")
     return sd
@@ -89,7 +89,7 @@ async def test_app_renders_every_status_without_crashing(all_statuses_dir: Path)
     DEAD sessions are hidden from the dashboard, so the rendered count is
     one less than the total number of statuses.
     """
-    app = CcoApp(manager=StateManager(all_statuses_dir))
+    app = EphorApp(manager=StateManager(all_statuses_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         assert len(app._sid_by_row) == len(list(AgentStatus)) - 1
@@ -134,9 +134,9 @@ def test_status_summary_from_agents_counts_buckets() -> None:
 def test_is_heartbeat_stale_flags_working_with_old_event() -> None:
     from datetime import UTC, datetime, timedelta
 
-    from claude_orchestrator.constants import AgentStatus
-    from claude_orchestrator.state.models import AgentState
-    from claude_orchestrator.tui.widgets.session_row import is_heartbeat_stale
+    from ephor.constants import AgentStatus
+    from ephor.state.models import AgentState
+    from ephor.tui.widgets.session_row import is_heartbeat_stale
 
     old = (datetime.now(UTC) - timedelta(seconds=600)).isoformat().replace("+00:00", "Z")
     fresh = (datetime.now(UTC) - timedelta(seconds=2)).isoformat().replace("+00:00", "Z")
@@ -157,9 +157,9 @@ def test_is_heartbeat_stale_flags_working_with_old_event() -> None:
 
 
 def test_is_heartbeat_stale_tolerates_garbage_timestamp() -> None:
-    from claude_orchestrator.constants import AgentStatus
-    from claude_orchestrator.state.models import AgentState
-    from claude_orchestrator.tui.widgets.session_row import is_heartbeat_stale
+    from ephor.constants import AgentStatus
+    from ephor.state.models import AgentState
+    from ephor.tui.widgets.session_row import is_heartbeat_stale
 
     a = AgentState(
         session_id="x",
@@ -191,7 +191,7 @@ def _agent_for_row(cwd: str = "/tmp/proj", *, sid: str = "abcdef1234") -> AgentS
 
 def test_session_row_drops_tool_and_error_columns(tmp_path: Path) -> None:
     """The T<n> and E<n> cells were removed in favor of the Jira column."""
-    from claude_orchestrator.tui.widgets.session_row import SessionRow
+    from ephor.tui.widgets.session_row import SessionRow
 
     row = SessionRow()
     agent = _agent_for_row(cwd=str(tmp_path))
@@ -205,7 +205,7 @@ def test_session_row_drops_tool_and_error_columns(tmp_path: Path) -> None:
 
 def test_session_row_renders_jira_ticket_when_present(tmp_path: Path) -> None:
     """The Jira cell replaces the session_id suffix when a key is inferable."""
-    from claude_orchestrator.tui.widgets.session_row import SessionRow
+    from ephor.tui.widgets.session_row import SessionRow
 
     worktree = tmp_path / "DR-4242"
     worktree.mkdir()
@@ -220,7 +220,7 @@ def test_session_row_renders_jira_ticket_when_present(tmp_path: Path) -> None:
 
 def test_session_row_uses_em_dash_when_no_ticket(tmp_path: Path) -> None:
     """A bare cwd with no Jira-shaped component renders a placeholder."""
-    from claude_orchestrator.tui.widgets.session_row import SessionRow
+    from ephor.tui.widgets.session_row import SessionRow
 
     row = SessionRow()
     agent = _agent_for_row(cwd=str(tmp_path))
@@ -233,7 +233,7 @@ def test_session_row_uses_em_dash_when_no_ticket(tmp_path: Path) -> None:
 def test_session_row_prefers_summary_prefix_over_cwd(tmp_path: Path) -> None:
     """When the LLM summary already begins with a Jira key, that wins
     over a cwd-derived key (summary is the freshest signal)."""
-    from claude_orchestrator.tui.widgets.session_row import SessionRow
+    from ephor.tui.widgets.session_row import SessionRow
 
     worktree = tmp_path / "DR-1111"
     worktree.mkdir()

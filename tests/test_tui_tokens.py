@@ -11,10 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator.constants import AgentStatus
-from claude_orchestrator.state.models import AgentState
-from claude_orchestrator.tui import tokens as tokens_module
-from claude_orchestrator.tui.tokens import (
+from ephor.constants import AgentStatus
+from ephor.state.models import AgentState
+from ephor.tui import tokens as tokens_module
+from ephor.tui.tokens import (
     TokenTracker,
     _sum_tokens_in_file,
     format_tokens,

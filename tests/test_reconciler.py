@@ -1,5 +1,5 @@
 """Tests for state.reconciler — sweeps orphaned state files and resets
-stuck WAITING_* statuses when claude_pid is dead."""
+stuck WAITING_* statuses when agent_pid is dead."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from claude_orchestrator.state import reconciler
+from ephor.state import reconciler
 
 
 def _write(path: Path, **fields: Any) -> None:
@@ -29,7 +29,7 @@ def _write(path: Path, **fields: Any) -> None:
         "tmux_session": None,
         "tmux_window": None,
         "tmux_pane": None,
-        "claude_pid": None,
+        "agent_pid": None,
         "notification": None,
         "last_summary": "",
     }
@@ -50,11 +50,11 @@ def test_returns_zero_counts_for_missing_dir(tmp_path: Path) -> None:
 
 
 def test_leaves_live_pid_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A session with a live claude_pid must never be deleted or reset."""
+    """A session with a live agent_pid must never be deleted or reset."""
     monkeypatch.setattr(reconciler, "_is_pid_alive", lambda pid: True)
     _write(
         tmp_path / "live.json",
-        claude_pid=999,
+        agent_pid=999,
         status="WAITING_PERMISSION",
         last_event_time=_iso_seconds_ago(3600),
     )
@@ -71,8 +71,8 @@ def test_deletes_dead_pid_files_past_threshold(
 ) -> None:
     """Dead pid + last event > threshold → unlink."""
     monkeypatch.setattr(reconciler, "_is_pid_alive", lambda pid: False)
-    _write(tmp_path / "old.json", claude_pid=42, last_event_time=_iso_seconds_ago(3600))
-    _write(tmp_path / "fresh.json", claude_pid=43, last_event_time=_iso_seconds_ago(5))
+    _write(tmp_path / "old.json", agent_pid=42, last_event_time=_iso_seconds_ago(3600))
+    _write(tmp_path / "fresh.json", agent_pid=43, last_event_time=_iso_seconds_ago(5))
 
     result = reconciler.reconcile(tmp_path, file_stale_sec=60)
     assert result.deleted == 1
@@ -90,7 +90,7 @@ def test_resets_stuck_waiting_permission_when_pid_dead(
     monkeypatch.setattr(reconciler, "_is_pid_alive", lambda pid: False)
     _write(
         tmp_path / "stuck.json",
-        claude_pid=42,
+        agent_pid=42,
         status="WAITING_PERMISSION",
         last_event_time=_iso_seconds_ago(5),  # inside grace window
         notification={"type": "permission", "tool": "Bash", "redacted_summary": None},
@@ -108,7 +108,7 @@ def test_resets_waiting_answer_too(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(reconciler, "_is_pid_alive", lambda pid: False)
     _write(
         tmp_path / "stuck.json",
-        claude_pid=42,
+        agent_pid=42,
         status="WAITING_ANSWER",
         last_event_time=_iso_seconds_ago(5),
     )
@@ -121,7 +121,7 @@ def test_does_not_reset_other_statuses(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setattr(reconciler, "_is_pid_alive", lambda pid: False)
     _write(
         tmp_path / "errored.json",
-        claude_pid=42,
+        agent_pid=42,
         status="ERROR",
         last_event_time=_iso_seconds_ago(5),
     )
@@ -132,12 +132,12 @@ def test_does_not_reset_other_statuses(tmp_path: Path, monkeypatch: pytest.Monke
 
 
 def test_skips_files_without_claude_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pre-pid state files (claude_pid is None) shouldn't be deleted —
-    they need a different recovery path (cco refresh-tmux)."""
+    """Pre-pid state files (agent_pid is None) shouldn't be deleted —
+    they need a different recovery path (ephor refresh-tmux)."""
     monkeypatch.setattr(reconciler, "_is_pid_alive", lambda pid: False)
     _write(
         tmp_path / "ancient.json",
-        claude_pid=None,
+        agent_pid=None,
         last_event_time=_iso_seconds_ago(86400),
     )
     result = reconciler.reconcile(tmp_path, file_stale_sec=60)
@@ -177,7 +177,7 @@ def test_falls_back_to_mtime_when_timestamp_unparseable(
 
     monkeypatch.setattr(reconciler, "_is_pid_alive", lambda pid: False)
     p = tmp_path / "garbage_ts.json"
-    _write(p, claude_pid=42, last_event_time="not-a-date")
+    _write(p, agent_pid=42, last_event_time="not-a-date")
     # Backdate mtime well past the threshold.
     old = _time.time() - 7200
     os.utime(p, (old, old))
@@ -197,8 +197,8 @@ def test_deletes_stale_resume_residue_when_pid_alive(
     monkeypatch.setattr(reconciler, "_is_pid_alive", lambda pid: True)
     new = tmp_path / "new.json"
     old = tmp_path / "old.json"
-    _write(new, claude_pid=12345, last_event_time=_iso_seconds_ago(5))  # fresh
-    _write(old, claude_pid=12345, last_event_time=_iso_seconds_ago(120))  # stale
+    _write(new, agent_pid=12345, last_event_time=_iso_seconds_ago(5))  # fresh
+    _write(old, agent_pid=12345, last_event_time=_iso_seconds_ago(120))  # stale
 
     result = reconciler.reconcile(tmp_path, file_stale_sec=60)
 
@@ -217,8 +217,8 @@ def test_keeps_recent_resume_siblings_until_grace_expires(
     monkeypatch.setattr(reconciler, "_is_pid_alive", lambda pid: True)
     new = tmp_path / "new.json"
     old = tmp_path / "old.json"
-    _write(new, claude_pid=12345, last_event_time=_iso_seconds_ago(5))
-    _write(old, claude_pid=12345, last_event_time=_iso_seconds_ago(20))  # not yet stale
+    _write(new, agent_pid=12345, last_event_time=_iso_seconds_ago(5))
+    _write(old, agent_pid=12345, last_event_time=_iso_seconds_ago(20))  # not yet stale
 
     result = reconciler.reconcile(tmp_path, file_stale_sec=60)
 
@@ -235,8 +235,8 @@ def test_distinct_live_pids_are_never_treated_as_residue(
     monkeypatch.setattr(reconciler, "_is_pid_alive", lambda pid: True)
     a = tmp_path / "a.json"
     b = tmp_path / "b.json"
-    _write(a, claude_pid=1001, last_event_time=_iso_seconds_ago(1000))  # very old
-    _write(b, claude_pid=1002, last_event_time=_iso_seconds_ago(1000))
+    _write(a, agent_pid=1001, last_event_time=_iso_seconds_ago(1000))  # very old
+    _write(b, agent_pid=1002, last_event_time=_iso_seconds_ago(1000))
 
     result = reconciler.reconcile(tmp_path, file_stale_sec=60)
 

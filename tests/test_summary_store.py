@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from claude_orchestrator.summary_store import SummaryStore
+from ephor.summary_store import SummaryStore
 
 
 def test_get_returns_none_for_unknown_session(tmp_path: Path) -> None:

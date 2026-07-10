@@ -13,14 +13,14 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator import speech_settings
-from claude_orchestrator.speech_settings import SettingsSource
+from ephor import speech_settings
+from ephor.speech_settings import SettingsSource
 
 
 @pytest.fixture
 def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Sandbox CCO_CONFIG_DIR + clear the env override."""
-    monkeypatch.setenv("CCO_CONFIG_DIR", str(tmp_path))
+    """Sandbox EPHOR_CONFIG_DIR + clear the env override."""
+    monkeypatch.setenv("EPHOR_CONFIG_DIR", str(tmp_path))
     monkeypatch.delenv(speech_settings.ENV_VAR, raising=False)
     return tmp_path / "speech.json"
 
@@ -31,7 +31,7 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_env_var_overrides_persisted_file(
     isolated_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Env wins over file. If we lose this, `CCO_TTS_ENABLED=0 cco tui`
+    """Env wins over file. If we lose this, `EPHOR_TTS_ENABLED=0 ephor tui`
     silently plays audio and that's a meeting-disrupting bug."""
     speech_settings.save(enabled=True)
     monkeypatch.setenv(speech_settings.ENV_VAR, "0")
@@ -52,7 +52,7 @@ def test_default_used_when_neither_env_nor_file_set(
 ) -> None:
     # Force kokoro_available to a known value so the test isn't dependent
     # on the host machine.
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     monkeypatch.setattr(sp, "kokoro_available", lambda: True)
     s = speech_settings.load()
@@ -64,7 +64,7 @@ def test_default_off_when_kokoro_missing(
     isolated_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A user without TTS installed should never get audio attempts."""
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     monkeypatch.setattr(sp, "kokoro_available", lambda: False)
     s = speech_settings.load()
@@ -141,7 +141,7 @@ def test_corrupt_file_falls_through_to_default(
     as 'no setting' and rely on the default — next save fixes the file."""
     isolated_config.parent.mkdir(parents=True, exist_ok=True)
     isolated_config.write_text("{ this is not valid json")
-    import claude_orchestrator.speech_player as sp
+    import ephor.speech_player as sp
 
     monkeypatch.setattr(sp, "kokoro_available", lambda: True)
     s = speech_settings.load()
@@ -152,16 +152,16 @@ def test_corrupt_file_falls_through_to_default(
 def test_settings_path_uses_xdg_config_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("CCO_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("EPHOR_CONFIG_DIR", raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     p = speech_settings.settings_path()
-    assert p == tmp_path / "claude-orchestrator" / "speech.json"
+    assert p == tmp_path / "ephor" / "speech.json"
 
 
 def test_settings_path_cco_config_dir_overrides_xdg(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("CCO_CONFIG_DIR", str(tmp_path / "custom"))
+    monkeypatch.setenv("EPHOR_CONFIG_DIR", str(tmp_path / "custom"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "should-not-be-used"))
     p = speech_settings.settings_path()
     assert p == tmp_path / "custom" / "speech.json"
@@ -273,7 +273,7 @@ def test_save_rejects_unknown_speak_mode(
 def test_unknown_env_value_falls_through_to_file_or_default(
     isolated_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A typo in CCO_TTS_MODE must not lock the user into a broken mode."""
+    """A typo in EPHOR_TTS_MODE must not lock the user into a broken mode."""
     speech_settings.save(speak_mode=speech_settings.SPEAK_MODE_SUMMARY)
     monkeypatch.setenv(speech_settings.MODE_ENV_VAR, "garbage")
     s = speech_settings.load()

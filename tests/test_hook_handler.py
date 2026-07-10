@@ -13,10 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator.config import hook_handler_path
+from ephor.config import hook_handler_path
 
 HANDLER = hook_handler_path()
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @pytest.fixture
@@ -29,10 +29,10 @@ def state_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]
     env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": str(tmp_path),
-        "CCO_STATE_DIR": str(state),
-        "CCO_PENDING_DIR": str(pending),
-        "CCO_LOCK_DIR": str(lock),
-        "CCO_SPEECH_LOG": str(speech_log),
+        "EPHOR_STATE_DIR": str(state),
+        "EPHOR_PENDING_DIR": str(pending),
+        "EPHOR_LOCK_DIR": str(lock),
+        "EPHOR_SPEECH_LOG": str(speech_log),
     }
     return env
 
@@ -52,7 +52,7 @@ def _fire_hook(
 
 
 def _state_file(env: dict[str, str], sid: str) -> Path:
-    return Path(env["CCO_STATE_DIR"]) / f"{sid}.json"
+    return Path(env["EPHOR_STATE_DIR"]) / f"{sid}.json"
 
 
 def _read_state(env: dict[str, str], sid: str) -> dict[str, object]:
@@ -155,7 +155,7 @@ def test_permission_request_emits_pending_decision(
     state_env: dict[str, str],
 ) -> None:
     sid = "test-session-5"
-    pending_file = Path(state_env["CCO_PENDING_DIR"]) / f"{sid}.json"
+    pending_file = Path(state_env["EPHOR_PENDING_DIR"]) / f"{sid}.json"
     pending_file.parent.mkdir(parents=True, exist_ok=True)
     pending_file.write_text(json.dumps({"hookSpecificOutput": {"decision": {"behavior": "allow"}}}))
     result = _fire_hook(
@@ -217,7 +217,7 @@ def test_handler_fails_open_on_missing_session_id(state_env: dict[str, str]) -> 
     )
     # Must not block claude — exit 0, no state file written.
     assert result.returncode == 0
-    sessions = list(Path(state_env["CCO_STATE_DIR"]).glob("*.json"))
+    sessions = list(Path(state_env["EPHOR_STATE_DIR"]).glob("*.json"))
     assert sessions == []
 
 
@@ -232,7 +232,7 @@ def test_handler_fails_open_on_invalid_session_id(state_env: dict[str, str]) -> 
     )
     assert result.returncode == 0
     # No file should be created with a path-traversal session_id.
-    sessions = list(Path(state_env["CCO_STATE_DIR"]).rglob("*.json"))
+    sessions = list(Path(state_env["EPHOR_STATE_DIR"]).rglob("*.json"))
     assert sessions == []
 
 
@@ -261,7 +261,7 @@ def test_state_file_permissions_are_0600(state_env: dict[str, str]) -> None:
 
 def test_cco_internal_env_skips_state_write(state_env: dict[str, str]) -> None:
     """When the summarizer subprocess fires `claude -p`, our hook handler
-    sees CCO_INTERNAL=1 in the inherited env and exits without writing a
+    sees EPHOR_INTERNAL=1 in the inherited env and exits without writing a
     state file. Without this guard, every summarization would create a
     ghost session in the dashboard."""
     sid = "test-session-internal"
@@ -271,7 +271,7 @@ def test_cco_internal_env_skips_state_write(state_env: dict[str, str]) -> None:
             "hook_event_name": "SessionStart",
             "cwd": "/tmp/myproject",
         },
-        {**state_env, "CCO_INTERNAL": "1"},
+        {**state_env, "EPHOR_INTERNAL": "1"},
     )
     assert result.returncode == 0
     # No state file written.
@@ -483,7 +483,7 @@ def test_stop_hook_appends_speech_start_event(state_env: dict[str, str], tmp_pat
     )
     assert result.returncode == 0, result.stderr
 
-    speech_log = Path(state_env["CCO_SPEECH_LOG"])
+    speech_log = Path(state_env["EPHOR_SPEECH_LOG"])
     records = _wait_for_speech_log(speech_log)
     starts = [r for r in records if r.get("event") == "start"]
     assert len(starts) >= 1
@@ -511,21 +511,21 @@ def test_user_prompt_submit_appends_speech_stop_event(
         },
         state_env,
     )
-    speech_log = Path(state_env["CCO_SPEECH_LOG"])
+    speech_log = Path(state_env["EPHOR_SPEECH_LOG"])
     assert speech_log.is_file(), "UPS must write the speech log inline"
     records = [json.loads(line) for line in speech_log.read_text().strip().splitlines()]
     assert any(r.get("event") == "stop" and r.get("session_id") == sid for r in records)
 
 
 def test_speech_max_chars_env_extends_cap(state_env: dict[str, str], tmp_path: Path) -> None:
-    """CCO_SPEECH_MAX_CHARS must override the default cap so users with
+    """EPHOR_SPEECH_MAX_CHARS must override the default cap so users with
     longer-form responses can have the full text mirrored on the bar."""
     long_text = "Sentence one. " + ("filler word " * 400) + "Done."  # ~5000 chars
     transcript = tmp_path / "transcript-long.jsonl"
     _write_transcript(transcript, long_text)
     sid = "speech-long"
     env = dict(state_env)
-    env["CCO_SPEECH_MAX_CHARS"] = "6000"
+    env["EPHOR_SPEECH_MAX_CHARS"] = "6000"
     _fire_hook(
         {
             "session_id": sid,
@@ -535,7 +535,7 @@ def test_speech_max_chars_env_extends_cap(state_env: dict[str, str], tmp_path: P
         },
         env,
     )
-    speech_log = Path(env["CCO_SPEECH_LOG"])
+    speech_log = Path(env["EPHOR_SPEECH_LOG"])
     records = _wait_for_speech_log(speech_log)
     starts = [r for r in records if r.get("event") == "start"]
     assert len(starts) >= 1
@@ -566,9 +566,103 @@ def test_stop_hook_skips_speech_event_when_transcript_missing(
     # no transcript_path it returns immediately, so the log file should
     # not be created at all.
     time.sleep(0.3)
-    speech_log = Path(state_env["CCO_SPEECH_LOG"])
+    speech_log = Path(state_env["EPHOR_SPEECH_LOG"])
     if speech_log.is_file():
         # If it does exist (e.g. from a prior fire in the same env), at
         # least confirm we didn't add a bogus start record.
         records = [json.loads(line) for line in speech_log.read_text().strip().splitlines()]
         assert not any(r.get("event") == "start" and r.get("session_id") == sid for r in records)
+
+
+# ---------------------------------------------------------------------------
+# multi-provider event-name / field-name dialects
+# ---------------------------------------------------------------------------
+
+
+def _fire_as(
+    provider: str, input_json: dict[str, object], env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Fire the handler tagged as a given provider (as the installer would)."""
+    return subprocess.run(
+        ["bash", str(HANDLER)],
+        input=json.dumps(input_json),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env={**env, "EPHOR_PROVIDER": provider},
+        check=False,
+    )
+
+
+def test_records_provider_from_env(state_env: dict[str, str]) -> None:
+    sid = "prov-1"
+    _fire_as(
+        "gemini", {"session_id": sid, "hook_event_name": "SessionStart", "cwd": "/p"}, state_env
+    )
+    assert _read_state(state_env, sid)["provider"] == "gemini"
+
+
+def test_gemini_before_tool_maps_to_working(state_env: dict[str, str]) -> None:
+    sid = "gem-tool"
+    _fire_as(
+        "gemini",
+        {
+            "session_id": sid,
+            "hook_event_name": "BeforeTool",
+            "cwd": "/p",
+            "tool_name": "write_file",
+        },
+        state_env,
+    )
+    state = _read_state(state_env, sid)
+    assert state["status"] == "WORKING"
+    assert state["tool_count"] == 1
+
+
+def test_gemini_after_agent_maps_to_idle(state_env: dict[str, str]) -> None:
+    sid = "gem-done"
+    _fire_as("gemini", {"session_id": sid, "hook_event_name": "BeforeTool", "cwd": "/p"}, state_env)
+    _fire_as("gemini", {"session_id": sid, "hook_event_name": "AfterAgent", "cwd": "/p"}, state_env)
+    assert _read_state(state_env, sid)["status"] == "IDLE"
+
+
+def test_gemini_tool_permission_notification_waits(state_env: dict[str, str]) -> None:
+    sid = "gem-perm"
+    _fire_as(
+        "gemini",
+        {
+            "session_id": sid,
+            "hook_event_name": "Notification",
+            "cwd": "/p",
+            "notification_type": "ToolPermission",
+            "message": "Allow write?",
+        },
+        state_env,
+    )
+    state = _read_state(state_env, sid)
+    assert state["status"] == "WAITING_PERMISSION"
+    assert state["notification"]["type"] == "permission"
+
+
+def test_grok_user_prompt_field_captured(state_env: dict[str, str]) -> None:
+    sid = "grok-prompt"
+    _fire_as(
+        "grok",
+        {
+            "session_id": sid,
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": "/p",
+            "user_prompt": "please refactor the parser",
+        },
+        state_env,
+    )
+    assert _read_state(state_env, sid)["last_summary"] == "please refactor the parser"
+
+
+def test_rejects_non_lowercase_provider(state_env: dict[str, str]) -> None:
+    """A junk EPHOR_PROVIDER is dropped rather than recorded verbatim."""
+    sid = "prov-junk"
+    _fire_as(
+        "../evil", {"session_id": sid, "hook_event_name": "SessionStart", "cwd": "/p"}, state_env
+    )
+    assert _read_state(state_env, sid)["provider"] == ""

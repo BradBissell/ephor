@@ -1,12 +1,31 @@
-# cco — Claude Code Orchestrator for Linux
+# ephor — coding-agent session orchestrator for Linux
 
 [![CI](https://github.com/BradBissell/claude-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/BradBissell/claude-orchestrator/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
-A Linux-native TUI that watches every Claude Code session you have
-running and tells you — at a glance — which ones need your attention,
-which are still working, and which went idle.
+A Linux-native TUI that watches every terminal coding-agent session you
+have running — **Claude Code, Gemini CLI, Codex CLI, and Grok CLI** — and
+tells you, at a glance, which ones need your attention, which are still
+working, and which went idle.
+
+> `ephor` (Greek *ἔφορος*, "overseer") began as `cco`, a Claude-Code-only
+> dashboard. It now speaks the hook protocol of four coding agents that
+> share Claude Code's stdin-JSON hook model.
+
+## Supported agents
+
+| Agent | Settings file | How ephor hooks in |
+|---|---|---|
+| **Claude Code** | `~/.claude/settings.json` | `hooks` object, command + stdin JSON |
+| **Gemini CLI** | `~/.gemini/settings.json` | same `hooks` shape (`Before*`/`After*` events) |
+| **Codex CLI** | `~/.codex/hooks.json` | dedicated hooks file, command + stdin JSON |
+| **Grok CLI** ([superagent-ai/grok-cli](https://github.com/superagent-ai/grok-cli)) | `~/.grok/user-settings.json` | same `hooks` shape |
+
+One shell handler serves all four — it understands each agent's event-name
+and field-name dialect and records which agent a session belongs to.
+OpenCode isn't supported yet (its plugins are JS/TS rather than shell
+hooks, so it needs a different bridge).
 
 <img width="2806" height="1972" alt="image" src="https://github.com/user-attachments/assets/50f4b678-2da8-4ee1-b52e-3d148ce4ae7c" />
 
@@ -17,57 +36,64 @@ Or use it side by side with the active tmux session:
 
 ## Why
 
-Running 10+ Claude Code sessions in parallel is normal now. tmux shows
-you all of them, but tmux can't tell you that session 7 is blocked on
-a permission prompt while the other nine are still working. `cco`
-solves exactly that — and presses Enter to jump to the right tmux
-window.
+Running 10+ coding-agent sessions in parallel is normal now — often a
+mix of Claude Code, Gemini, Codex, and Grok. tmux shows you all of them,
+but tmux can't tell you that session 7 is blocked on a permission prompt
+while the other nine are still working. `ephor` solves exactly that — and
+presses Enter to jump to the right tmux window.
 
 ## Install
 
 ```bash
-pipx install cco
-cco init           # installs the hooks into ~/.claude/settings.json
-cco                # launches the TUI dashboard (alias: cco tui)
+pipx install ephor-orchestrator
+ephor init --provider all   # installs hooks into every agent you use
+ephor                       # launches the TUI dashboard (alias: ephor tui)
 ```
 
-(Or use `pip install --user cco` / `uv tool install cco`.)
+(Or use `pip install --user ephor-orchestrator` / `uv tool install ephor-orchestrator`.)
 
 ## Quickstart
 
-1. **`cco init`** — adds Claude Code hooks to `~/.claude/settings.json`
-   so every session reports its state. The original settings file is
-   backed up; `cco uninstall` cleanly removes them.
-2. **`cco`** (or `cco tui`) — opens the TUI. Use `j`/`k` or arrow keys to navigate,
+1. **`ephor init [--provider <agent>|all]`** — registers ephor's hook in
+   the agent's settings file (`--provider` defaults to `claude`; pass
+   `gemini`, `codex`, `grok`, or `all`). The original settings file is
+   backed up; `ephor uninstall --provider <agent>` cleanly removes them.
+2. **`ephor`** (or `ephor tui`) — opens the TUI. Use `j`/`k` or arrow keys to navigate,
    `/` to filter, `Enter` to jump to a session's tmux pane, `x` to
    kill, `?` for the full keymap.
-3. **`cco list`** — script-friendly one-line-per-session status, for
+3. **`ephor list`** — script-friendly one-line-per-session status, for
    tmux status-right widgets or shell scripts.
+4. **`ephor doctor`** — checks dependencies and, per agent, whether its
+   CLI is installed and ephor's hooks are registered.
 
 See [`docs/getting-started.md`](docs/getting-started.md) for a longer
 walkthrough.
 
 ## Highlights
 
-- **Hook-driven, not scraped.** State comes from official Claude Code
+- **Hook-driven, not scraped.** State comes from each agent's official
   hook events — no terminal-output parsing, no AppleScript, no
   Wayland window-poking. Works the same in Ghostty, Alacritty, kitty,
   GNOME Terminal, or under `mosh`.
+- **One handler, four agents.** A single POSIX-shell handler normalizes
+  every agent's event vocabulary (e.g. Gemini's `BeforeTool`/`AfterAgent`,
+  Grok's `user_prompt`) into one on-disk state schema, tagged with the
+  `provider` that produced it.
 - **tmux-native navigation.** Every session is mapped to its tmux
-  pane on every event, so `claude --resume` after a closed window
-  self-heals. Pressing Enter does `tmux select-window -t <pane>`
-  against your current client.
-- **Per-session state on disk.** `$XDG_STATE_HOME/claude-orchestrator/`,
+  pane on every event, so resuming after a closed window self-heals.
+  Pressing Enter does `tmux select-window -t <pane>` against your
+  current client.
+- **Per-session state on disk.** `$XDG_STATE_HOME/ephor/`,
   mode 0600, atomic writes. Surviving a reboot is a feature.
-- **Per-account 5h / 7d usage strip.** Anchors against the official
-  `/api/oauth/usage` endpoint, then extrapolates with local ccusage
-  deltas — accurate without hammering the API.
+- **Per-account 5h / 7d usage strip.** (Claude Code) anchors against the
+  official `/api/oauth/usage` endpoint, then extrapolates with local
+  ccusage deltas — accurate without hammering the API.
 - **POSIX-shell hook handler** with `set -u`, sanitized PATH, jq
   `--arg` everywhere, per-session flock, and fail-OPEN error handling
-  (a buggy hook never blocks Claude).
+  (a buggy hook never blocks your agent).
 - **Auto-approve via hook return value**, not keystroke injection.
   Rules engine answers permission prompts before the dialog renders.
-- **Spoken one-line summaries.** When a session finishes, cco can read
+- **Spoken one-line summaries.** When a session finishes, ephor can read
   back a ≤70-char summary of what Claude just did — so you can keep your
   eyes on one window and still know the other nine are done. See
   [Speak-back](#speak-back-tts) below.
@@ -75,14 +101,14 @@ walkthrough.
 ## Speak-back (TTS)
 
 Running ten sessions in parallel, the bottleneck isn't compute — it's
-*you* noticing which one finished. cco can speak that for you.
+*you* noticing which one finished. ephor can speak that for you.
 
-On every `Stop` event, cco enqueues the session's reply to a single
+On every `Stop` event, ephor enqueues the session's reply to a single
 FIFO speech queue shared across **all** your sessions, and plays it
 through your local [kokoro](https://github.com/hexgrad/kokoro) TTS
 pipeline. Two modes:
 
-- **`summary` (recommended for parallel work).** cco shells out to
+- **`summary` (recommended for parallel work).** ephor shells out to
   `claude -p` to turn the reply into a **single ≤70-character
   sentence** — the same summary the dashboard column shows — and speaks
   only that. You hear *"DR-1423: added retry to the upload client"*
@@ -110,34 +136,34 @@ don't talk over each other:
 ### Quickstart
 
 ```bash
-# Let cco own playback (removes the tts-speak-response Stop hook so the
+# Let ephor own playback (removes the tts-speak-response Stop hook so the
 # FIFO queue is the single source of audio). Needs the kokoro pipeline.
-cco speech install
+ephor speech install
 
 # Speak a one-line summary instead of the whole reply.
-cco speech mode summary
+ephor speech mode summary
 
-cco                       # launch the TUI; replies now speak as they land
+ephor                       # launch the TUI; replies now speak as they land
 ```
 
 Controls:
 
 | Where | Action |
 |---|---|
-| `cco speech enable` / `disable` | Persistently turn audio on/off |
-| `cco speech mode full` / `summary` | Whole reply ↔ one-sentence brief |
-| `cco speech status` | Show on/off + mode and which layer decided |
-| `cco speech reset-calibration` | Forget the learned rate (after changing voice/speed) |
+| `ephor speech enable` / `disable` | Persistently turn audio on/off |
+| `ephor speech mode full` / `summary` | Whole reply ↔ one-sentence brief |
+| `ephor speech status` | Show on/off + mode and which layer decided |
+| `ephor speech reset-calibration` | Forget the learned rate (after changing voice/speed) |
 | TUI `m` | Mute / unmute (bar still shows speech, no audio) |
 | TUI `M` | Toggle full ↔ summary live |
 | TUI `t` | Jump to the session that's currently speaking |
 | TUI `s` | Summarize the selected session on demand |
 
 One-shot overrides (win over the saved settings, no disk write):
-`CCO_TTS_ENABLED=0 cco` to silence for one run, `CCO_TTS_MODE=summary`,
-or `CCO_TTS_COMMAND=<path>` to point at a non-default playback command.
+`EPHOR_TTS_ENABLED=0 ephor` to silence for one run, `EPHOR_TTS_MODE=summary`,
+or `EPHOR_TTS_COMMAND=<path>` to point at a non-default playback command.
 
-Requires a working kokoro TTS pipeline on disk (cco looks for
+Requires a working kokoro TTS pipeline on disk (ephor looks for
 `~/.local/share/kokoro-tts/play-ducked.sh`); without it, the speech bar
 still mirrors what *would* play but no audio is produced.
 
@@ -149,17 +175,19 @@ TUI reads it. There is no daemon.
 
 ## Privacy & security
 
-`cco` is a local tool. Nothing leaves your machine except for one
+`ephor` is a local tool. Nothing leaves your machine except for one
 authenticated call to `https://api.anthropic.com/api/oauth/usage` to
-compute per-account usage anchors. Full surface area in
-[`SECURITY.md`](SECURITY.md).
+compute per-account usage anchors (Claude Code only; skipped for other
+agents). Full surface area in [`SECURITY.md`](SECURITY.md).
 
 ## Requirements
 
 - Linux (any modern distro; tested on Ubuntu 24.04)
 - Python 3.11+
-- tmux 3.2+
-- Claude Code installed and at least one session run
+- `jq` and `flock` on PATH (used by the shell hook handler)
+- tmux 3.2+ (for jump-to-pane navigation)
+- At least one supported coding agent installed (Claude Code, Gemini CLI,
+  Codex CLI, or Grok CLI) with a session run after `ephor init`
 
 ## Contributing
 

@@ -6,7 +6,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from claude_orchestrator.account_usage import (
+from ephor.account_usage import (
     AccountAnchor,
     AccountFingerprint,
     AccountState,
@@ -249,7 +249,7 @@ def test_record_anchor_appends_for_existing_account() -> None:
 
 def test_record_anchor_prunes_history_at_limit() -> None:
     """Don't grow the file unboundedly across many anchors."""
-    from claude_orchestrator.account_usage import ANCHOR_HISTORY_LIMIT
+    from ephor.account_usage import ANCHOR_HISTORY_LIMIT
 
     store: dict[str, AccountState] = {}
     fp = _fp()

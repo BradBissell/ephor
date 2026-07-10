@@ -9,10 +9,10 @@ from typing import Any
 
 import pytest
 
-from claude_orchestrator.constants import AgentStatus
-from claude_orchestrator.state.models import AgentState
-from claude_orchestrator.tmux import navigator
-from claude_orchestrator.tmux.navigator import JumpResult, jump_to, kill_session
+from ephor.constants import AgentStatus
+from ephor.state.models import AgentState
+from ephor.tmux import navigator
+from ephor.tmux.navigator import JumpResult, jump_to, kill_session
 
 
 def _agent(**overrides: Any) -> AgentState:
@@ -161,7 +161,7 @@ def test_jump_fails_when_pane_no_longer_hosts_claude_pid(
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    outcome = jump_to(_agent(claude_pid=4242, tmux_pane="%9"))
+    outcome = jump_to(_agent(agent_pid=4242, tmux_pane="%9"))
 
     assert outcome.result is JumpResult.FAILED
     # Marker that triggers the rediscover path in _is_stale_tmux_ref.
@@ -180,7 +180,7 @@ def test_jump_proceeds_when_pane_hosts_claude_pid(
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    outcome = jump_to(_agent(claude_pid=4242, tmux_pane="%9"))
+    outcome = jump_to(_agent(agent_pid=4242, tmux_pane="%9"))
 
     assert outcome.ok
     assert any("select-window" in c and "%9" in c for c in calls)
@@ -189,11 +189,11 @@ def test_jump_proceeds_when_pane_hosts_claude_pid(
 def test_jump_skips_pane_validation_when_claude_pid_unknown(
     fake_tmux_present: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When state never recorded a claude_pid, fall back to trusting the
+    """When state never recorded a agent_pid, fall back to trusting the
     recorded pane_id (preserves prior behavior for pre-pid state files)."""
 
     def boom(*_: object) -> bool:
-        raise AssertionError("validation should be skipped without claude_pid")
+        raise AssertionError("validation should be skipped without agent_pid")
 
     monkeypatch.setattr(navigator, "_pane_hosts_pid", boom)
 
@@ -201,7 +201,7 @@ def test_jump_skips_pane_validation_when_claude_pid_unknown(
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    outcome = jump_to(_agent(claude_pid=None, tmux_pane="%9"))
+    outcome = jump_to(_agent(agent_pid=None, tmux_pane="%9"))
     assert outcome.ok
 
 
@@ -234,7 +234,7 @@ def test_kill_session_signals_pid_kills_window_unlinks_state(
 
     signaled: list[tuple[int, int]] = []
     monkeypatch.setattr(
-        "claude_orchestrator.tmux.navigator.os.kill",
+        "ephor.tmux.navigator.os.kill",
         lambda pid, sig: signaled.append((pid, sig)),
     )
 
@@ -246,7 +246,7 @@ def test_kill_session_signals_pid_kills_window_unlinks_state(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    agent = _agent(claude_pid=4242)
+    agent = _agent(agent_pid=4242)
     outcome = kill_session(agent, tmp_path)
 
     assert outcome.ok
@@ -268,14 +268,14 @@ def test_kill_session_tolerates_already_dead_pid(
     def raise_lookup(_pid: int, _sig: int) -> None:
         raise ProcessLookupError
 
-    monkeypatch.setattr("claude_orchestrator.tmux.navigator.os.kill", raise_lookup)
+    monkeypatch.setattr("ephor.tmux.navigator.os.kill", raise_lookup)
     monkeypatch.setattr(
         subprocess,
         "run",
         lambda *a, **kw: subprocess.CompletedProcess(a, 0, "", ""),
     )
 
-    outcome = kill_session(_agent(claude_pid=4242), tmp_path)
+    outcome = kill_session(_agent(agent_pid=4242), tmp_path)
     assert outcome.ok
 
 
@@ -285,13 +285,13 @@ def test_kill_session_treats_missing_tmux_window_as_success(
     tmp_path: Path,
 ) -> None:
     _write_state_file(tmp_path, "s1")
-    monkeypatch.setattr("claude_orchestrator.tmux.navigator.os.kill", lambda *a: None)
+    monkeypatch.setattr("ephor.tmux.navigator.os.kill", lambda *a: None)
 
     def fake_run(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args, 1, "", "can't find window: work:claude")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    outcome = kill_session(_agent(claude_pid=4242), tmp_path)
+    outcome = kill_session(_agent(agent_pid=4242), tmp_path)
     assert outcome.ok
 
 
@@ -301,7 +301,7 @@ def test_kill_session_no_pid_no_tmux_just_unlinks(
     """Sessions without a known pid or tmux info still get the state file removed."""
     state_file = _write_state_file(tmp_path, "s1")
     monkeypatch.setattr(navigator, "has_tmux", lambda: False)
-    agent = _agent(claude_pid=None, tmux_session=None, tmux_window=None, tmux_pane=None)
+    agent = _agent(agent_pid=None, tmux_session=None, tmux_window=None, tmux_pane=None)
     outcome = kill_session(agent, tmp_path)
     assert outcome.ok
     assert not state_file.exists()
@@ -336,12 +336,12 @@ def test_detect_focused_picks_most_recently_active_external_client(
         monkeypatch,
         list_clients=(
             # tty | focused | activity | session
-            "/dev/pts/0||1700000000|cco-session\n"  # us, older
+            "/dev/pts/0||1700000000|ephor-session\n"  # us, older
             "/dev/pts/1||1700000500|work-session\n"  # external, newer
         ),
         list_panes=(
             # session | pane_id | window_active | pane_active
-            "cco-session|%1|1|1\nwork-session|%5|1|1\nwork-session|%6|1|0\n"
+            "ephor-session|%1|1|1\nwork-session|%5|1|1\nwork-session|%6|1|0\n"
         ),
     )
     assert navigator.detect_focused_external_pane(self_pane="%1") == "%5"
@@ -355,11 +355,11 @@ def test_detect_focused_prefers_focused_over_recent_activity(
     _stub_tmux_responses(
         monkeypatch,
         list_clients=(
-            "/dev/pts/0||1700000000|cco-session\n"
+            "/dev/pts/0||1700000000|ephor-session\n"
             "/dev/pts/1|1|1700000100|work-session\n"  # focused but quieter
             "/dev/pts/2||1700000900|other-session\n"  # most recent activity
         ),
-        list_panes=("cco-session|%1|1|1\nwork-session|%5|1|1\nother-session|%9|1|1\n"),
+        list_panes=("ephor-session|%1|1|1\nwork-session|%5|1|1\nother-session|%9|1|1\n"),
     )
     assert navigator.detect_focused_external_pane(self_pane="%1") == "%5"
 
@@ -367,12 +367,12 @@ def test_detect_focused_prefers_focused_over_recent_activity(
 def test_detect_focused_returns_none_when_only_us(
     fake_tmux_present: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If the only attached client is the cco TUI itself, no external
+    """If the only attached client is the ephor TUI itself, no external
     target exists."""
     _stub_tmux_responses(
         monkeypatch,
-        list_clients="/dev/pts/0||1700000000|cco-session\n",
-        list_panes="cco-session|%1|1|1\n",
+        list_clients="/dev/pts/0||1700000000|ephor-session\n",
+        list_panes="ephor-session|%1|1|1\n",
     )
     assert navigator.detect_focused_external_pane(self_pane="%1") is None
 

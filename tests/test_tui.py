@@ -11,10 +11,10 @@ from typing import Any
 
 import pytest
 
-from claude_orchestrator.state.manager import StateManager
-from claude_orchestrator.state.models import AgentState
-from claude_orchestrator.tui import app as tui_app
-from claude_orchestrator.tui.app import CcoApp
+from ephor.state.manager import StateManager
+from ephor.state.models import AgentState
+from ephor.tui import app as tui_app
+from ephor.tui.app import EphorApp
 
 
 def _write_state(directory: Path, sid: str, **overrides: Any) -> None:
@@ -33,7 +33,7 @@ def _write_state(directory: Path, sid: str, **overrides: Any) -> None:
 def populated_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     sd = tmp_path / "sessions"
     sd.mkdir()
-    monkeypatch.setenv("CCO_STATE_DIR", str(sd))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
     _write_state(sd, "alpha-id", project_name="alpha", tool_count=5)
     _write_state(sd, "beta-id", project_name="beta", tool_count=2)
     _write_state(sd, "gamma-id", project_name="gamma", tool_count=0)
@@ -42,7 +42,7 @@ def populated_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.mark.asyncio
 async def test_app_populates_table_on_mount(populated_dir: Path) -> None:
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         # Three state files → three rows.
@@ -52,7 +52,7 @@ async def test_app_populates_table_on_mount(populated_dir: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_app_quits_on_q(populated_dir: Path) -> None:
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         await pilot.press("q")
@@ -62,7 +62,7 @@ async def test_app_quits_on_q(populated_dir: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_app_refresh_on_r(populated_dir: Path) -> None:
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         before_rows = len(app._sid_by_row)
@@ -78,7 +78,7 @@ async def test_jump_action_invokes_navigator(
     populated_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Pressing Enter should call jump_to() with the agent at the cursor."""
-    from claude_orchestrator.tmux import navigator
+    from ephor.tmux import navigator
 
     captured: list[AgentState] = []
 
@@ -94,7 +94,7 @@ async def test_jump_action_invokes_navigator(
 
     monkeypatch.setattr(tui_app, "jump_to", fake_jump)
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         # Directly invoke the action — testing the binding wiring is
@@ -115,7 +115,7 @@ async def test_enter_keybinding_invokes_jump(
     This is the regression test for the bug where DataTable swallowed Enter
     before our app-level binding fired.
     """
-    from claude_orchestrator.tmux import navigator
+    from ephor.tmux import navigator
 
     captured: list[AgentState] = []
 
@@ -131,7 +131,7 @@ async def test_enter_keybinding_invokes_jump(
 
     monkeypatch.setattr(tui_app, "jump_to", fake_jump)
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         await pilot.press("enter")
@@ -161,7 +161,7 @@ def test_human_age_handles_garbage() -> None:
 
 
 def test_jump_error_has_useful_message() -> None:
-    from claude_orchestrator.tmux.navigator import JumpResult
+    from ephor.tmux.navigator import JumpResult
 
     assert "tmux" in tui_app._jump_error(JumpResult.NO_TMUX_INFO, "")
     assert "tmux" in tui_app._jump_error(JumpResult.TMUX_MISSING, "")
@@ -170,7 +170,7 @@ def test_jump_error_has_useful_message() -> None:
 def test_is_stale_tmux_ref_classifies_recoverable_failures() -> None:
     """Re-discovery should retry on NO_TMUX_INFO and on FAILED-with-can't-find;
     not on TMUX_MISSING / SESSION_NOT_FOUND / unrelated FAILED reasons."""
-    from claude_orchestrator.tmux.navigator import JumpOutcome, JumpResult
+    from ephor.tmux.navigator import JumpOutcome, JumpResult
 
     assert tui_app._is_stale_tmux_ref(JumpOutcome(JumpResult.NO_TMUX_INFO, ""))
     assert tui_app._is_stale_tmux_ref(
@@ -194,11 +194,11 @@ def test_is_stale_tmux_ref_classifies_recoverable_failures() -> None:
 async def test_jump_retries_with_rediscovery_on_stale_pane(
     populated_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: when a state file's recorded pane is dead but claude_pid
+    """Regression: when a state file's recorded pane is dead but agent_pid
     is still alive in a new pane, action_jump should call enrich_state_files,
     re-read the state, and retry the jump — instead of just toasting the
     'can't find pane' error."""
-    from claude_orchestrator.tmux.navigator import JumpOutcome, JumpResult
+    from ephor.tmux.navigator import JumpOutcome, JumpResult
 
     jump_calls: list[AgentState] = []
     enrich_calls: list[Path] = []
@@ -221,7 +221,7 @@ async def test_jump_retries_with_rediscovery_on_stale_pane(
     monkeypatch.setattr(tui_app, "jump_to", fake_jump)
     monkeypatch.setattr(tui_app, "enrich_state_files", fake_enrich)
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         await app.action_jump()
@@ -237,7 +237,7 @@ async def test_jump_does_not_rediscover_on_unrecoverable_failures(
 ) -> None:
     """A FAILED outcome that isn't a 'can't find ...' tmux error must not
     trigger a re-discovery — that would just produce a noisy retry loop."""
-    from claude_orchestrator.tmux.navigator import JumpOutcome, JumpResult
+    from ephor.tmux.navigator import JumpOutcome, JumpResult
 
     jump_calls: list[AgentState] = []
     enrich_calls: list[Path] = []
@@ -253,7 +253,7 @@ async def test_jump_does_not_rediscover_on_unrecoverable_failures(
     monkeypatch.setattr(tui_app, "jump_to", fake_jump)
     monkeypatch.setattr(tui_app, "enrich_state_files", fake_enrich)
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         await app.action_jump()
@@ -269,18 +269,18 @@ async def test_summarize_action_writes_to_store_and_repaints(
 ) -> None:
     """Pressing `s` triggers a (mocked) summarizer and persists the result."""
     summary_dir = tmp_path / "summaries"
-    monkeypatch.setattr("claude_orchestrator.summary_store.summary_dir", lambda: summary_dir)
+    monkeypatch.setattr("ephor.summary_store.summary_dir", lambda: summary_dir)
     monkeypatch.setattr(
-        "claude_orchestrator.tui.app.summarize_transcript",
+        "ephor.tui.app.summarize_transcript",
         lambda _path, cwd=None: "stubbed summary",
     )
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
-        # Reset the store's directory: the populated_dir fixture set CCO_STATE_DIR,
+        # Reset the store's directory: the populated_dir fixture set EPHOR_STATE_DIR,
         # but SummaryStore was constructed before our monkeypatch took effect.
-        from claude_orchestrator.summary_store import SummaryStore
+        from ephor.summary_store import SummaryStore
 
         app._summaries = SummaryStore()
         app.action_summarize()
@@ -296,8 +296,8 @@ async def test_summarize_action_writes_to_store_and_repaints(
 async def test_summarize_action_with_no_selection_toasts(
     populated_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr("claude_orchestrator.summary_store.summary_dir", lambda: tmp_path / "s")
-    app = CcoApp(manager=StateManager(populated_dir))
+    monkeypatch.setattr("ephor.summary_store.summary_dir", lambda: tmp_path / "s")
+    app = EphorApp(manager=StateManager(populated_dir))
     captured: list[str] = []
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
@@ -321,7 +321,7 @@ async def test_session_order_is_stable_across_event_time_changes(
     every PreToolUse event reshuffle the list — visually disorienting,
     and the cause of the now-fixed Path-2 reorder flash.
     """
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         original_items = dict(app._items_by_sid)
@@ -353,7 +353,7 @@ async def test_new_session_appears_at_bottom_without_reordering(
 ) -> None:
     """Sort by started_at ascending means a newly-started session lands at
     the bottom of the list and doesn't push existing rows around."""
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         original_sids = list(app._sid_by_row)
@@ -376,15 +376,15 @@ async def test_new_session_appears_at_bottom_without_reordering(
 async def test_dead_sessions_are_hidden_from_dashboard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from claude_orchestrator.constants import AgentStatus
+    from ephor.constants import AgentStatus
 
     sd = tmp_path / "sessions"
     sd.mkdir()
-    monkeypatch.setenv("CCO_STATE_DIR", str(sd))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
     _write_state(sd, "live", project_name="live")
     _write_state(sd, "ghost", project_name="ghost", status=AgentStatus.DEAD)
 
-    app = CcoApp(manager=StateManager(sd))
+    app = EphorApp(manager=StateManager(sd))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         assert app._sid_by_row == ["live"]
@@ -395,18 +395,18 @@ async def test_dead_sessions_are_hidden_from_dashboard(
 async def test_next_attention_jumps_to_perm_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from claude_orchestrator.constants import AgentStatus
+    from ephor.constants import AgentStatus
 
     sd = tmp_path / "sessions"
     sd.mkdir()
-    monkeypatch.setenv("CCO_STATE_DIR", str(sd))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
     # 4 sessions; only the third needs attention.
     _write_state(sd, "a", project_name="a", status=AgentStatus.IDLE)
     _write_state(sd, "b", project_name="b", status=AgentStatus.WORKING)
     _write_state(sd, "c", project_name="c", status=AgentStatus.WAITING_PERMISSION)
     _write_state(sd, "d", project_name="d", status=AgentStatus.IDLE)
 
-    app = CcoApp(manager=StateManager(sd))
+    app = EphorApp(manager=StateManager(sd))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         from textual.widgets import ListView
@@ -424,15 +424,15 @@ async def test_next_attention_jumps_to_perm_row(
 async def test_next_attention_wraps_when_past_last(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from claude_orchestrator.constants import AgentStatus
+    from ephor.constants import AgentStatus
 
     sd = tmp_path / "sessions"
     sd.mkdir()
-    monkeypatch.setenv("CCO_STATE_DIR", str(sd))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
     _write_state(sd, "a", project_name="a", status=AgentStatus.WAITING_PERMISSION)
     _write_state(sd, "b", project_name="b", status=AgentStatus.IDLE)
 
-    app = CcoApp(manager=StateManager(sd))
+    app = EphorApp(manager=StateManager(sd))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         from textual.widgets import ListView
@@ -447,7 +447,7 @@ async def test_next_attention_wraps_when_past_last(
 
 
 def test_agent_matches_filter_substrings() -> None:
-    from claude_orchestrator.tui.app import _agent_matches_filter
+    from ephor.tui.app import _agent_matches_filter
 
     a = AgentState(
         session_id="abc-123",
@@ -464,7 +464,7 @@ def test_agent_matches_filter_substrings() -> None:
 
 @pytest.mark.asyncio
 async def test_filter_action_hides_non_matching_rows(populated_dir: Path) -> None:
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         assert len(app._sid_by_row) == 3
@@ -482,10 +482,10 @@ async def test_filter_action_hides_non_matching_rows(populated_dir: Path) -> Non
 
 def test_summary_line_shows_cap_when_configured() -> None:
     """When account.weekly_cap_tokens is set, summary line shows used/cap and %."""
-    from claude_orchestrator.state.models import StatusSummary
-    from claude_orchestrator.tui.activity import ActivitySampler
-    from claude_orchestrator.tui.app import _render_summary_line
-    from claude_orchestrator.tui.tokens import TokenTracker
+    from ephor.state.models import StatusSummary
+    from ephor.tui.activity import ActivitySampler
+    from ephor.tui.app import _render_summary_line
+    from ephor.tui.tokens import TokenTracker
 
     summary = StatusSummary(working=1)
     sampler = ActivitySampler()
@@ -497,8 +497,8 @@ def test_summary_line_shows_cap_when_configured() -> None:
 
 
 def test_summary_line_omits_cap_when_unset() -> None:
-    from claude_orchestrator.state.models import StatusSummary
-    from claude_orchestrator.tui.app import _render_summary_line
+    from ephor.state.models import StatusSummary
+    from ephor.tui.app import _render_summary_line
 
     line = _render_summary_line(StatusSummary(), [], None, None, weekly_cap=None)
     # No "/<cap>" suffix when cap unset; the "[/]" in markup is a closing tag
@@ -527,7 +527,7 @@ async def test_cold_path_refresh_keeps_dom_and_state_in_sync(
     """
     from textual.widgets import ListView
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         list_view = app.query_one(ListView)
@@ -584,7 +584,7 @@ async def test_enter_with_filter_focused_jumps_and_dismisses_input(
     """
     from textual.widgets import ListView
 
-    from claude_orchestrator.tmux import navigator
+    from ephor.tmux import navigator
 
     captured: list[AgentState] = []
 
@@ -600,7 +600,7 @@ async def test_enter_with_filter_focused_jumps_and_dismisses_input(
 
     monkeypatch.setattr(tui_app, "jump_to", fake_jump)
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         # Open the filter overlay and type something that matches.
@@ -640,7 +640,7 @@ async def test_concurrent_refresh_calls_do_not_corrupt_state(
 
     from textual.widgets import ListView
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
 
@@ -663,11 +663,11 @@ async def test_auto_follow_moves_cursor_to_externally_focused_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When the user switches to another tmux client (e.g. clicks a Ghostty
-    window hosting session beta), cco's cursor should move to beta on the
+    window hosting session beta), ephor's cursor should move to beta on the
     next refresh — without the user touching the dashboard."""
     sd = tmp_path / "sessions"
     sd.mkdir()
-    monkeypatch.setenv("CCO_STATE_DIR", str(sd))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
     _write_state(sd, "alpha-id", project_name="alpha", tmux_pane="%10")
     _write_state(sd, "beta-id", project_name="beta", tmux_pane="%20")
     _write_state(sd, "gamma-id", project_name="gamma", tmux_pane="%30")
@@ -682,7 +682,7 @@ async def test_auto_follow_moves_cursor_to_externally_focused_session(
 
     monkeypatch.setattr(tui_app, "detect_focused_external_pane", fake_detect)
 
-    app = CcoApp(manager=StateManager(sd))
+    app = EphorApp(manager=StateManager(sd))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         from textual.widgets import ListView
@@ -716,18 +716,18 @@ async def test_auto_follow_moves_cursor_to_externally_focused_session(
 async def test_auto_follow_ignores_panes_with_no_matching_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If the user focuses a tmux pane that isn't hosting any cco session
+    """If the user focuses a tmux pane that isn't hosting any ephor session
     (e.g. a plain shell), we should NOT clobber the cursor — and we should
     remember the pane so we don't re-evaluate it next tick."""
     sd = tmp_path / "sessions"
     sd.mkdir()
-    monkeypatch.setenv("CCO_STATE_DIR", str(sd))
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
     _write_state(sd, "alpha-id", project_name="alpha", tmux_pane="%10")
     _write_state(sd, "beta-id", project_name="beta", tmux_pane="%20")
 
     monkeypatch.setattr(tui_app, "detect_focused_external_pane", lambda _self_pane: "%999")
 
-    app = CcoApp(manager=StateManager(sd))
+    app = EphorApp(manager=StateManager(sd))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         from textual.widgets import ListView
@@ -754,7 +754,7 @@ async def test_auto_follow_silent_when_tmux_query_fails(
 
     monkeypatch.setattr(tui_app, "detect_focused_external_pane", boom)
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
         # If the exception leaked, we'd never have populated _sid_by_row.
@@ -768,7 +768,7 @@ async def test_enter_after_cold_path_rebuild_jumps_to_correct_session(
     """End-to-end: a cold-path rebuild + Enter keypress must jump to the
     sid that the cursor visually points at, not a stale or off-by-one one.
     """
-    from claude_orchestrator.tmux import navigator
+    from ephor.tmux import navigator
 
     captured: list[AgentState] = []
 
@@ -784,7 +784,7 @@ async def test_enter_after_cold_path_rebuild_jumps_to_correct_session(
 
     monkeypatch.setattr(tui_app, "jump_to", fake_jump)
 
-    app = CcoApp(manager=StateManager(populated_dir))
+    app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
 

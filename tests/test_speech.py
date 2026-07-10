@@ -12,13 +12,13 @@ from pathlib import Path
 
 import pytest
 
-from claude_orchestrator import speech
+from ephor import speech
 
 
 @pytest.fixture
 def speech_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     log = tmp_path / "speech.jsonl"
-    monkeypatch.setenv("CCO_SPEECH_LOG", str(log))
+    monkeypatch.setenv("EPHOR_SPEECH_LOG", str(log))
     return log
 
 
@@ -85,7 +85,7 @@ def test_newer_start_preempts_older_start(speech_log: Path) -> None:
 
 
 def test_state_auto_stops_after_estimated_duration(speech_log: Path) -> None:
-    """A missing UPS-stop record (e.g. user exits cco mid-playback) must not
+    """A missing UPS-stop record (e.g. user exits ephor mid-playback) must not
     keep the bar lit forever. Once estimated_end has passed, we mark the
     state stopped even though no explicit stop was logged."""
     speech.append_start("sess-A", "Tiny.")
@@ -101,7 +101,7 @@ def test_active_sentence_stays_at_zero_during_startup_grace(
 ) -> None:
     """Until kokoro produces sound, the karaoke must not advance — otherwise
     the bar runs ahead of the audio on every long response."""
-    monkeypatch.setenv("CCO_SPEECH_STARTUP_MS", "2000")
+    monkeypatch.setenv("EPHOR_SPEECH_STARTUP_MS", "2000")
     s1 = ("alpha " * 50).strip() + "."
     s2 = ("beta " * 50).strip() + "!"
     speech.append_start("sess-A", f"{s1} {s2}")
@@ -118,13 +118,13 @@ def test_inter_chunk_gap_delays_sentence_advance(
     s1 = ("alpha " * 50).strip() + "."
     s2 = ("beta " * 50).strip() + "!"
     s3 = ("gamma " * 50).strip() + "?"
-    monkeypatch.setenv("CCO_SPEECH_STARTUP_MS", "0")
-    monkeypatch.setenv("CCO_SPEECH_INTER_CHUNK_MS", "0")
+    monkeypatch.setenv("EPHOR_SPEECH_STARTUP_MS", "0")
+    monkeypatch.setenv("EPHOR_SPEECH_INTER_CHUNK_MS", "0")
     speech.append_start("sess-A", f"{s1} {s2} {s3}")
     state = speech.read_current()
     end_no_gap = state.estimated_end_ms()
 
-    monkeypatch.setenv("CCO_SPEECH_INTER_CHUNK_MS", "500")
+    monkeypatch.setenv("EPHOR_SPEECH_INTER_CHUNK_MS", "500")
     state2 = speech.read_current()
     end_with_gap = state2.estimated_end_ms()
     assert end_with_gap > end_no_gap
@@ -149,7 +149,7 @@ def test_active_sentence_advances_with_time(speech_log: Path) -> None:
 def test_read_current_when_log_missing_returns_null_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("CCO_SPEECH_LOG", str(tmp_path / "does-not-exist.jsonl"))
+    monkeypatch.setenv("EPHOR_SPEECH_LOG", str(tmp_path / "does-not-exist.jsonl"))
     state = speech.read_current()
     assert state.speaking is False
     assert state.session_id is None
@@ -202,15 +202,15 @@ def test_default_speed_falls_back_when_env_unparseable(
 
 def test_speech_log_path_uses_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "custom.jsonl"
-    monkeypatch.setenv("CCO_SPEECH_LOG", str(target))
+    monkeypatch.setenv("EPHOR_SPEECH_LOG", str(target))
     assert speech.speech_log_path() == target
 
 
 def test_speech_log_path_default_under_state_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("CCO_SPEECH_LOG", raising=False)
-    monkeypatch.setenv("CCO_STATE_DIR", str(tmp_path / "sessions"))
+    monkeypatch.delenv("EPHOR_SPEECH_LOG", raising=False)
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(tmp_path / "sessions"))
     p = speech.speech_log_path()
     assert p.name == "speech.jsonl"
     assert p.parent == tmp_path

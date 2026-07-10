@@ -1,11 +1,11 @@
-# claude-orchestrator tmux integration — copy what you want into ~/.tmux.conf
+# ephor tmux integration — copy what you want into ~/.tmux.conf
 
 # --- live status widget ---------------------------------------------------
 # Shows colored counts of WORKING / IDLE / WAITING_PERMISSION / etc., updated
-# every 2 seconds. The `cco tmux-widget` command emits tmux-format colour
+# every 2 seconds. The `ephor tmux-widget` command emits tmux-format colour
 # escapes so it integrates cleanly with status-right.
 set -g status-interval 2
-set -g status-right '#(cco tmux-widget) | %H:%M %d-%b'
+set -g status-right '#(ephor tmux-widget) | %H:%M %d-%b'
 
 # --- highlight active windows ---------------------------------------------
 # Make a tmux window pulse when its contents change so you can spot a

@@ -5,18 +5,18 @@ from __future__ import annotations
 import subprocess
 import sys
 
-import claude_orchestrator
-from claude_orchestrator.cli import main
+import ephor
+from ephor.cli import main
 
 
 def test_version_attribute() -> None:
-    assert claude_orchestrator.__version__ == "0.1.1"
+    assert ephor.__version__ == "0.2.0"
 
 
 def test_main_no_args_launches_tui(monkeypatch) -> None:
-    # Bare `cco` is the dashboard launcher. Stub the TUI runner so the test
+    # Bare `ephor` is the dashboard launcher. Stub the TUI runner so the test
     # doesn't start Textual; just assert main() dispatches to it.
-    import claude_orchestrator.cli as cli
+    import ephor.cli as cli
 
     called = {}
 
@@ -44,10 +44,10 @@ def test_unknown_subcommand_exits_two(capsys) -> None:
 def test_version_via_subprocess() -> None:
     """End-to-end: invoking the installed entrypoint prints the version."""
     result = subprocess.run(
-        [sys.executable, "-m", "claude_orchestrator", "--version"],
+        [sys.executable, "-m", "ephor", "--version"],
         capture_output=True,
         text=True,
         timeout=5,
         check=True,
     )
-    assert "cco 0.1.1" in result.stdout
+    assert "ephor 0.2.0" in result.stdout
