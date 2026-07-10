@@ -47,6 +47,41 @@ def test_transcript_path_encodes_cwd() -> None:
     assert p.parent.name == "-home-alice-work"
 
 
+def test_transcript_path_prefers_direct_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tokens_module, "_TRANSCRIPTS_ROOT", tmp_path)
+    sid = "5f3e-abc"
+    direct = tmp_path / "-home-alice-work" / f"{sid}.jsonl"
+    direct.parent.mkdir(parents=True)
+    direct.write_text("{}\n")
+    assert transcript_path("/home/alice/work", sid) == direct
+
+
+def test_transcript_path_falls_back_across_renamed_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session whose cwd was renamed after start still resolves by session id."""
+    monkeypatch.setattr(tokens_module, "_TRANSCRIPTS_ROOT", tmp_path)
+    sid = "2ba5a05c-dead-beef"
+    # Transcript sits under the OLD encoded dir…
+    old = tmp_path / "-home-brad-projects-claude-orchestrator" / f"{sid}.jsonl"
+    old.parent.mkdir(parents=True)
+    old.write_text("{}\n")
+    # …but the session's cwd is now the renamed dir (direct path won't exist).
+    resolved = transcript_path("/home/brad/projects/ephor", sid)
+    assert resolved == old
+
+
+def test_transcript_path_unsafe_sid_no_glob_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crafted session id with a path separator must not trigger a search."""
+    monkeypatch.setattr(tokens_module, "_TRANSCRIPTS_ROOT", tmp_path)
+    resolved = transcript_path("/x", "../../etc/passwd")
+    assert resolved == tmp_path / "-x" / "../../etc/passwd.jsonl"  # direct, unresolved
+
+
 # ---- _sum_tokens_in_file ---------------------------------------------------
 
 

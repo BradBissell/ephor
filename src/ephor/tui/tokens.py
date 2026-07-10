@@ -14,17 +14,36 @@ in a non-critical summary line.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from ephor.state.models import AgentState
 
 _TRANSCRIPTS_ROOT = Path.home() / ".claude" / "projects"
 
+# A session id safe to embed in a glob (UUID-shaped). Guards the fallback
+# search below against path-traversal / glob-metachar injection from a crafted
+# state file.
+_SAFE_SID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
 
 def transcript_path(cwd: str, session_id: str) -> Path:
-    """`/home/alice/x/y` + `sid` → ~/.claude/projects/-home-alice-x-y/sid.jsonl"""
+    """`/home/alice/x/y` + `sid` → ~/.claude/projects/-home-alice-x-y/sid.jsonl
+
+    Claude encodes the session's *start* cwd into the directory name. If that
+    cwd later changes (the dir was renamed, or the session moved to a git
+    worktree), the encoded path no longer exists — so when the direct path is
+    missing we fall back to locating the transcript by its (UUID) session id
+    anywhere under the projects root. The direct path is returned unchanged in
+    the common case, keeping the hot token-tracking path fast.
+    """
     encoded = cwd.replace("/", "-")
-    return _TRANSCRIPTS_ROOT / encoded / f"{session_id}.jsonl"
+    direct = _TRANSCRIPTS_ROOT / encoded / f"{session_id}.jsonl"
+    if direct.exists() or not _SAFE_SID.fullmatch(session_id):
+        return direct
+    for match in _TRANSCRIPTS_ROOT.glob(f"*/{session_id}.jsonl"):
+        return match
+    return direct
 
 
 def _sum_tokens_in_file(path: Path) -> int:
