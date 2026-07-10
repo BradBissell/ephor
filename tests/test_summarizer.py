@@ -412,6 +412,21 @@ def _stub_urlopen(
     monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", fake_urlopen)
 
 
+def _stub_urlopen_routed(
+    monkeypatch: pytest.MonkeyPatch, *, model_ids: list[str], completion: str
+) -> None:
+    """Route the probe's two calls: GET /models vs POST /chat/completions."""
+    models_body = json.dumps({"data": [{"id": m} for m in model_ids]})
+    chat_body = json.dumps({"choices": [{"message": {"content": completion}}]})
+
+    def fake_urlopen(req: Any, timeout: float | None = None) -> _FakeResponse:
+        if req.full_url.endswith("/models"):
+            return _FakeResponse(models_body)
+        return _FakeResponse(chat_body)
+
+    monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", fake_urlopen)
+
+
 def _openai_env(monkeypatch: pytest.MonkeyPatch, **extra: str) -> None:
     monkeypatch.setenv("EPHOR_SUMMARY_API_BASE", "http://localhost:8000/v1")
     monkeypatch.setenv("EPHOR_SUMMARY_MODEL", "qwen2.5-coder")
@@ -613,3 +628,75 @@ def test_openai_null_content_returns_empty(tmp_path: Path, monkeypatch: pytest.M
     p = tmp_path / "t.jsonl"
     _write_transcript(p)
     assert summarize_transcript(p) == ""
+
+
+# ---- unavailable_reason / probe_openai --------------------------------------
+
+
+def test_unavailable_reason_openai_missing_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EPHOR_SUMMARY_API_BASE", "http://localhost:8000/v1")
+    msg = summarizer_module.unavailable_reason()
+    assert "EPHOR_SUMMARY_MODEL" in msg
+
+
+def test_unavailable_reason_openai_mentions_thinking_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    _openai_env(monkeypatch)
+    msg = summarizer_module.unavailable_reason()
+    assert "EPHOR_SUMMARY_EXTRA_BODY" in msg and "enable_thinking" in msg
+
+
+def test_unavailable_reason_claude_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(summarizer_module, "_claude_binary", lambda: "/usr/bin/claude")
+    msg = summarizer_module.unavailable_reason()
+    assert "Claude Code" in msg and "EPHOR_SUMMARY_API_BASE" in msg
+
+
+def test_probe_openai_reports_model_missing_from_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _openai_env(monkeypatch)  # model qwen2.5-coder
+    body = json.dumps({"data": [{"id": "some-other-model"}]})
+
+    def fake_urlopen(req: Any, timeout: float | None = None) -> _FakeResponse:
+        assert req.full_url == "http://localhost:8000/v1/models"
+        return _FakeResponse(body)
+
+    monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", fake_urlopen)
+    ok, detail = summarizer_module.probe_openai()
+    assert ok is False
+    assert "not offered" in detail
+
+
+def test_probe_openai_ok_when_model_present_and_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _openai_env(monkeypatch)  # model qwen2.5-coder
+    _stub_urlopen_routed(monkeypatch, model_ids=["qwen2.5-coder"], completion="ready")
+    ok, detail = summarizer_module.probe_openai()
+    assert ok is True
+    assert "test summary" in detail
+
+
+def test_probe_openai_flags_empty_completion_as_reasoning_trap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Endpoint reachable + model offered, but a reasoning model returns empty
+    content → doctor must flag it and point at EPHOR_SUMMARY_EXTRA_BODY."""
+    _openai_env(monkeypatch)
+    _stub_urlopen_routed(monkeypatch, model_ids=["qwen2.5-coder"], completion="")
+    ok, detail = summarizer_module.probe_openai()
+    assert ok is False
+    assert "empty" in detail
+    assert "EPHOR_SUMMARY_EXTRA_BODY" in detail
+
+
+def test_probe_openai_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _openai_env(monkeypatch)
+
+    def boom(req: Any, timeout: float | None = None) -> None:
+        raise summarizer_module.urllib.error.URLError("refused")
+
+    monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", boom)
+    ok, detail = summarizer_module.probe_openai()
+    assert ok is False
+    assert "cannot reach" in detail

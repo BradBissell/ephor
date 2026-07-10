@@ -224,6 +224,89 @@ def _resolve_backend() -> str:
     return BACKEND_CLAUDE
 
 
+def unavailable_reason() -> str:
+    """A short, backend-aware explanation for why a summary came back empty,
+    suitable for a UI toast. Reflects the *currently configured* backend so the
+    message is actionable (and always points at the local-model option)."""
+    backend = _resolve_backend()
+    if backend == BACKEND_OPENAI:
+        base = (os.environ.get(ENV_API_BASE) or "").strip()
+        model = (os.environ.get(ENV_MODEL) or "").strip()
+        if not model:
+            return f"summary unavailable — set {ENV_MODEL} (endpoint {ENV_API_BASE} is set)"
+        return (
+            f"summary unavailable — check the model endpoint ({model} @ {base}); "
+            "run `ephor doctor`. Reasoning models need "
+            f'{ENV_EXTRA_BODY}=\'{{"chat_template_kwargs":{{"enable_thinking":false}}}}\''
+        )
+    if _claude_binary() is None:
+        return (
+            f"summary unavailable — `claude` not on PATH (or set {ENV_API_BASE} for a local model)"
+        )
+    return (
+        "summary unavailable — log in to Claude Code / set ANTHROPIC_API_KEY, "
+        f"or set {ENV_API_BASE} to use a local model"
+    )
+
+
+def probe_openai() -> tuple[bool, str]:
+    """End-to-end health check for the openai backend, for `ephor doctor`.
+
+    Returns (ok, detail). Three stages, each with an actionable message:
+      1. ``GET <base>/models`` — reachability + the configured model is offered
+         (lists what *is* offered on a mismatch).
+      2. a real minimal ``/chat/completions`` — because a reachable endpoint
+         with the right model can *still* yield empty summaries: a reasoning
+         model burns the token budget "thinking" and returns null content
+         unless EPHOR_SUMMARY_EXTRA_BODY disables it. Catching that here is the
+         whole point — the /models check alone gives false confidence.
+    """
+    base = (os.environ.get(ENV_API_BASE) or "").strip()
+    model = (os.environ.get(ENV_MODEL) or "").strip()
+    if not base:
+        return False, f"{ENV_API_BASE} not set"
+    if not model:
+        return False, f"{ENV_MODEL} not set"
+    url = base.rstrip("/") + "/models"
+    if not url.startswith(("http://", "https://")):
+        return False, f"{ENV_API_BASE} must be an http(s) URL"
+
+    headers = {}
+    key = (os.environ.get(ENV_API_KEY) or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return False, f"cannot reach {url}: {exc}"
+
+    try:
+        ids = [
+            str(m["id"])
+            for m in json.loads(body).get("data", [])
+            if isinstance(m, dict) and m.get("id")
+        ]
+    except (ValueError, TypeError):
+        ids = []
+    if ids and model not in ids:
+        offered = ", ".join(ids)[:120]
+        return False, f"reachable, but model {model!r} not offered (has: {offered})"
+
+    # Stage 2: a real (tiny) completion — the definitive "can this config
+    # actually produce a summary?" test.
+    sample = _summarize_via_openai("USER: Reply with the single word: ready.")
+    if sample:
+        return True, f"reachable; {model} produced a test summary"
+    return False, (
+        f"reachable and {model} is offered, but a test completion came back empty — "
+        f"if it's a reasoning model set {ENV_EXTRA_BODY}="
+        '\'{"chat_template_kwargs":{"enable_thinking":false}}\''
+        f" (or raise {ENV_MAX_TOKENS})"
+    )
+
+
 def _summarize_via_claude(prompt_text: str) -> str:
     """Raw summary text from `claude -p`, or "" on any failure."""
     binary = _claude_binary()
