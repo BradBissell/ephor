@@ -49,9 +49,9 @@ dev = [
 ephor = "ephor.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/BradBissell/claude-orchestrator"
-Issues = "https://github.com/BradBissell/claude-orchestrator/issues"
-Source = "https://github.com/BradBissell/claude-orchestrator"
+Homepage = "https://github.com/BradBissell/ephor"
+Issues = "https://github.com/BradBissell/ephor/issues"
+Source = "https://github.com/BradBissell/ephor"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ephor"]

@@ -12,7 +12,7 @@ GitHub issue**. Instead:
 You can expect an initial acknowledgement within 7 days. Once the issue
 is confirmed, we'll work on a fix and a coordinated disclosure window.
 
-[advisory]: https://github.com/BradBissell/claude-orchestrator/security/advisories/new
+[advisory]: https://github.com/BradBissell/ephor/security/advisories/new
 
 ## Supported Versions
 
