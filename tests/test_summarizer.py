@@ -412,6 +412,21 @@ def _stub_urlopen(
     monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", fake_urlopen)
 
 
+def _stub_urlopen_routed(
+    monkeypatch: pytest.MonkeyPatch, *, model_ids: list[str], completion: str
+) -> None:
+    """Route the probe's two calls: GET /models vs POST /chat/completions."""
+    models_body = json.dumps({"data": [{"id": m} for m in model_ids]})
+    chat_body = json.dumps({"choices": [{"message": {"content": completion}}]})
+
+    def fake_urlopen(req: Any, timeout: float | None = None) -> _FakeResponse:
+        if req.full_url.endswith("/models"):
+            return _FakeResponse(models_body)
+        return _FakeResponse(chat_body)
+
+    monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", fake_urlopen)
+
+
 def _openai_env(monkeypatch: pytest.MonkeyPatch, **extra: str) -> None:
     monkeypatch.setenv("EPHOR_SUMMARY_API_BASE", "http://localhost:8000/v1")
     monkeypatch.setenv("EPHOR_SUMMARY_MODEL", "qwen2.5-coder")
@@ -652,17 +667,27 @@ def test_probe_openai_reports_model_missing_from_endpoint(
     assert "not offered" in detail
 
 
-def test_probe_openai_ok_when_model_present(monkeypatch: pytest.MonkeyPatch) -> None:
-    _openai_env(monkeypatch)
-    body = json.dumps({"data": [{"id": "qwen2.5-coder"}]})
-    monkeypatch.setattr(
-        summarizer_module.urllib.request,
-        "urlopen",
-        lambda req, timeout=None: _FakeResponse(body),
-    )
+def test_probe_openai_ok_when_model_present_and_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _openai_env(monkeypatch)  # model qwen2.5-coder
+    _stub_urlopen_routed(monkeypatch, model_ids=["qwen2.5-coder"], completion="ready")
     ok, detail = summarizer_module.probe_openai()
     assert ok is True
-    assert "available" in detail
+    assert "test summary" in detail
+
+
+def test_probe_openai_flags_empty_completion_as_reasoning_trap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Endpoint reachable + model offered, but a reasoning model returns empty
+    content → doctor must flag it and point at EPHOR_SUMMARY_EXTRA_BODY."""
+    _openai_env(monkeypatch)
+    _stub_urlopen_routed(monkeypatch, model_ids=["qwen2.5-coder"], completion="")
+    ok, detail = summarizer_module.probe_openai()
+    assert ok is False
+    assert "empty" in detail
+    assert "EPHOR_SUMMARY_EXTRA_BODY" in detail
 
 
 def test_probe_openai_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:

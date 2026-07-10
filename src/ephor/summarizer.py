@@ -250,11 +250,16 @@ def unavailable_reason() -> str:
 
 
 def probe_openai() -> tuple[bool, str]:
-    """Best-effort connectivity check for the openai backend, for `ephor doctor`.
+    """End-to-end health check for the openai backend, for `ephor doctor`.
 
-    Returns (ok, detail). GETs ``<base>/models`` and confirms the configured
-    model is offered. Does NOT verify the model produces non-empty content —
-    reasoning models still need EPHOR_SUMMARY_EXTRA_BODY to disable thinking.
+    Returns (ok, detail). Three stages, each with an actionable message:
+      1. ``GET <base>/models`` — reachability + the configured model is offered
+         (lists what *is* offered on a mismatch).
+      2. a real minimal ``/chat/completions`` — because a reachable endpoint
+         with the right model can *still* yield empty summaries: a reasoning
+         model burns the token budget "thinking" and returns null content
+         unless EPHOR_SUMMARY_EXTRA_BODY disables it. Catching that here is the
+         whole point — the /models check alone gives false confidence.
     """
     base = (os.environ.get(ENV_API_BASE) or "").strip()
     model = (os.environ.get(ENV_MODEL) or "").strip()
@@ -288,7 +293,18 @@ def probe_openai() -> tuple[bool, str]:
     if ids and model not in ids:
         offered = ", ".join(ids)[:120]
         return False, f"reachable, but model {model!r} not offered (has: {offered})"
-    return True, f"reachable; model {model} available"
+
+    # Stage 2: a real (tiny) completion — the definitive "can this config
+    # actually produce a summary?" test.
+    sample = _summarize_via_openai("USER: Reply with the single word: ready.")
+    if sample:
+        return True, f"reachable; {model} produced a test summary"
+    return False, (
+        f"reachable and {model} is offered, but a test completion came back empty — "
+        f"if it's a reasoning model set {ENV_EXTRA_BODY}="
+        '\'{"chat_template_kwargs":{"enable_thinking":false}}\''
+        f" (or raise {ENV_MAX_TOKENS})"
+    )
 
 
 def _summarize_via_claude(prompt_text: str) -> str:
