@@ -87,7 +87,7 @@ ignore = [
 "tests/**" = ["S101", "S108", "S603", "S607"]
 "src/ephor/tmux/navigator.py" = ["S603", "S607"]
 "src/ephor/tmux/discover.py" = ["S603", "S607"]
-"src/ephor/summarizer.py" = ["S603"]
+"src/ephor/summarizer.py" = ["S603", "S310"]
 "src/ephor/hooks/installer.py" = ["S603"]
 
 [tool.mypy]

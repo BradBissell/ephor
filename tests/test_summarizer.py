@@ -22,6 +22,23 @@ from ephor.summarizer import (
     summarize_transcript,
 )
 
+_SUMMARY_ENV_VARS = (
+    "EPHOR_SUMMARY_BACKEND",
+    "EPHOR_SUMMARY_API_BASE",
+    "EPHOR_SUMMARY_MODEL",
+    "EPHOR_SUMMARY_API_KEY",
+    "EPHOR_SUMMARY_TIMEOUT",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_summary_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate every test from the developer's own EPHOR_SUMMARY_* exports so
+    backend selection is deterministic (defaults to the claude CLI)."""
+    for var in _SUMMARY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
 # ---- _extract_text ---------------------------------------------------------
 
 
@@ -341,3 +358,258 @@ def test_summarize_truncates_to_fit_with_prefix(
     assert out.startswith("DR-42: ")
     assert out.endswith("…")
     assert len(out) <= MAX_LENGTH + len("DR-42: ")
+
+
+# ---- backend resolution -----------------------------------------------------
+
+
+def test_backend_defaults_to_claude() -> None:
+    assert summarizer_module._resolve_backend() == "claude"
+
+
+def test_backend_switches_to_openai_when_api_base_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EPHOR_SUMMARY_API_BASE", "http://localhost:8000/v1")
+    assert summarizer_module._resolve_backend() == "openai"
+
+
+def test_explicit_backend_overrides_api_base(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EPHOR_SUMMARY_API_BASE", "http://localhost:8000/v1")
+    monkeypatch.setenv("EPHOR_SUMMARY_BACKEND", "claude")
+    assert summarizer_module._resolve_backend() == "claude"
+
+
+# ---- summarize_transcript via OpenAI-compatible endpoint --------------------
+
+
+class _FakeResponse:
+    def __init__(self, body: str) -> None:
+        self._body = body.encode()
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *a: object) -> None:
+        return None
+
+
+def _stub_urlopen(
+    monkeypatch: pytest.MonkeyPatch, *, content: str, capture: dict[str, Any] | None = None
+) -> None:
+    body = json.dumps({"choices": [{"message": {"content": content}}]})
+
+    def fake_urlopen(req: Any, timeout: float | None = None) -> _FakeResponse:
+        if capture is not None:
+            capture["url"] = req.full_url
+            capture["method"] = req.get_method()
+            capture["headers"] = dict(req.header_items())
+            capture["timeout"] = timeout
+            capture["payload"] = json.loads(req.data.decode())
+        return _FakeResponse(body)
+
+    monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", fake_urlopen)
+
+
+def _openai_env(monkeypatch: pytest.MonkeyPatch, **extra: str) -> None:
+    monkeypatch.setenv("EPHOR_SUMMARY_API_BASE", "http://localhost:8000/v1")
+    monkeypatch.setenv("EPHOR_SUMMARY_MODEL", "qwen2.5-coder")
+    for k, v in extra.items():
+        monkeypatch.setenv(k, v)
+
+
+def _write_transcript(p: Path) -> None:
+    p.write_text(
+        json.dumps({"message": {"role": "user", "content": "add retry to the uploader"}}) + "\n"
+    )
+
+
+def test_openai_backend_returns_parsed_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _openai_env(monkeypatch)
+    capture: dict[str, Any] = {}
+    _stub_urlopen(monkeypatch, content="Adding retry to the upload client", capture=capture)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+
+    out = summarize_transcript(p)
+    assert out == "Adding retry to the upload client"
+    # Hits the composed chat-completions endpoint with the configured model.
+    assert capture["url"] == "http://localhost:8000/v1/chat/completions"
+    assert capture["method"] == "POST"
+    assert capture["payload"]["model"] == "qwen2.5-coder"
+    assert capture["payload"]["messages"][-1]["content"].startswith("USER:")
+
+
+def test_openai_backend_sends_bearer_when_key_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _openai_env(monkeypatch, EPHOR_SUMMARY_API_KEY="secret-token")
+    capture: dict[str, Any] = {}
+    _stub_urlopen(monkeypatch, content="doing things", capture=capture)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+
+    summarize_transcript(p)
+    # header_items() title-cases header names.
+    assert capture["headers"].get("Authorization") == "Bearer secret-token"
+
+
+def test_openai_backend_no_auth_header_without_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _openai_env(monkeypatch)
+    capture: dict[str, Any] = {}
+    _stub_urlopen(monkeypatch, content="doing things", capture=capture)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+
+    summarize_transcript(p)
+    assert "Authorization" not in capture["headers"]
+
+
+def test_openai_backend_truncates_and_prefixes_ticket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _openai_env(monkeypatch)
+    _stub_urlopen(monkeypatch, content="x" * 200)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+    worktree = tmp_path / "DR-99-feature"
+    worktree.mkdir()
+
+    out = summarize_transcript(p, cwd=worktree)
+    assert out.startswith("DR-99: ")
+    assert out.endswith("…")
+
+
+def test_openai_backend_missing_model_returns_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EPHOR_SUMMARY_API_BASE", "http://localhost:8000/v1")
+    # no EPHOR_SUMMARY_MODEL
+    called = {"n": 0}
+
+    def fake_urlopen(*a: object, **k: object) -> None:
+        called["n"] += 1
+        raise AssertionError("should not be called without a model")
+
+    monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", fake_urlopen)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+
+    assert summarize_transcript(p) == ""
+    assert called["n"] == 0
+
+
+def test_openai_backend_request_failure_returns_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _openai_env(monkeypatch)
+
+    def boom(req: Any, timeout: float | None = None) -> None:
+        raise summarizer_module.urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", boom)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+
+    assert summarize_transcript(p) == ""
+
+
+def test_openai_backend_does_not_invoke_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the openai backend selected, the claude subprocess must never run."""
+    _openai_env(monkeypatch)
+    _stub_urlopen(monkeypatch, content="local model summary")
+
+    def fail_run(*a: object, **k: object) -> None:
+        raise AssertionError("subprocess.run must not be called for the openai backend")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+
+    assert summarize_transcript(p) == "local model summary"
+
+
+# ---- openai backend: max_tokens / extra_body / reasoning models -------------
+
+
+def test_openai_default_max_tokens_in_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _openai_env(monkeypatch)
+    capture: dict[str, Any] = {}
+    _stub_urlopen(monkeypatch, content="ok", capture=capture)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+    summarize_transcript(p)
+    assert capture["payload"]["max_tokens"] == summarizer_module.DEFAULT_MAX_TOKENS
+
+
+def test_openai_max_tokens_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _openai_env(monkeypatch, EPHOR_SUMMARY_MAX_TOKENS="777")
+    capture: dict[str, Any] = {}
+    _stub_urlopen(monkeypatch, content="ok", capture=capture)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+    summarize_transcript(p)
+    assert capture["payload"]["max_tokens"] == 777
+
+
+def test_openai_extra_body_merged_and_can_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _openai_env(
+        monkeypatch,
+        EPHOR_SUMMARY_EXTRA_BODY='{"chat_template_kwargs": {"enable_thinking": false}, "max_tokens": 5}',
+    )
+    capture: dict[str, Any] = {}
+    _stub_urlopen(monkeypatch, content="ok", capture=capture)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+    summarize_transcript(p)
+    body = capture["payload"]
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["max_tokens"] == 5  # extra_body overrides the default
+
+
+def test_openai_malformed_extra_body_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _openai_env(monkeypatch, EPHOR_SUMMARY_EXTRA_BODY="{not json")
+    capture: dict[str, Any] = {}
+    _stub_urlopen(monkeypatch, content="ok", capture=capture)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+    assert summarize_transcript(p) == "ok"  # request still made, extra ignored
+    assert "chat_template_kwargs" not in capture["payload"]
+
+
+def test_openai_strips_inline_think_block(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _openai_env(monkeypatch)
+    _stub_urlopen(
+        monkeypatch,
+        content="<think>let me reason\nabout this</think>Adding retry to the uploader",
+    )
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+    assert summarize_transcript(p) == "Adding retry to the uploader"
+
+
+def test_openai_null_content_returns_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reasoning model that spent its budget thinking → content:null → ''."""
+    _openai_env(monkeypatch)
+    body = json.dumps({"choices": [{"message": {"content": None}}]})
+
+    def fake_urlopen(req: Any, timeout: float | None = None) -> _FakeResponse:
+        return _FakeResponse(body)
+
+    monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", fake_urlopen)
+    p = tmp_path / "t.jsonl"
+    _write_transcript(p)
+    assert summarize_transcript(p) == ""
