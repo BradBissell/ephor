@@ -645,6 +645,27 @@ def _cmd_doctor(*, provider: str = "all") -> int:
         else:
             ok(f"{prov.display_name}: CLI not installed", "skipped")
 
+    # 6. Summary backend (drives summary-mode TTS + the dashboard summary column).
+    #    Reads the same EPHOR_SUMMARY_* env this shell exports, so it doubles as
+    #    a check that your config is actually visible to ephor.
+    from ephor import summarizer
+
+    if summarizer._resolve_backend() == "openai":
+        reachable, detail = summarizer.probe_openai()
+        label = "summary backend: OpenAI-compatible endpoint"
+        if reachable:
+            ok(label, detail)
+        else:
+            warn(label, detail)
+    elif shutil.which("claude"):
+        ok("summary backend: claude -p")
+    else:
+        warn(
+            "summary backend: claude -p",
+            "`claude` not on PATH — log in to Claude Code, or set "
+            "EPHOR_SUMMARY_API_BASE/MODEL to use a local model",
+        )
+
     # Render results.
     icons = {"ok": "[ ok ]", "warn": "[warn]", "fail": "[FAIL]"}
     fails = sum(1 for level, _, _ in checks if level == "fail")

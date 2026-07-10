@@ -65,7 +65,7 @@ from ephor.speech_settings import save as save_speech_settings
 from ephor.state.manager import StateManager
 from ephor.state.models import AgentState, StatusSummary
 from ephor.state.reconciler import reconcile
-from ephor.summarizer import summarize_transcript
+from ephor.summarizer import summarize_transcript, unavailable_reason
 from ephor.summary_store import SummaryStore
 from ephor.tmux.discover import enrich_state_files
 from ephor.tmux.navigator import (
@@ -1004,8 +1004,9 @@ class EphorApp(App[int]):
             if manual:
                 self._set_toast(f"summary updated for {sid[:8]}")
         elif manual:
-            # Manual press deserves an explanation when summarization failed.
-            self._set_toast("summary unavailable — log in to Claude Code or set ANTHROPIC_API_KEY")
+            # Manual press deserves an explanation when summarization failed —
+            # backend-aware so it's actionable for both claude and local models.
+            self._set_toast(unavailable_reason())
 
 
 # ---------------------------------------------------------------------------

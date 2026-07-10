@@ -613,3 +613,65 @@ def test_openai_null_content_returns_empty(tmp_path: Path, monkeypatch: pytest.M
     p = tmp_path / "t.jsonl"
     _write_transcript(p)
     assert summarize_transcript(p) == ""
+
+
+# ---- unavailable_reason / probe_openai --------------------------------------
+
+
+def test_unavailable_reason_openai_missing_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EPHOR_SUMMARY_API_BASE", "http://localhost:8000/v1")
+    msg = summarizer_module.unavailable_reason()
+    assert "EPHOR_SUMMARY_MODEL" in msg
+
+
+def test_unavailable_reason_openai_mentions_thinking_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    _openai_env(monkeypatch)
+    msg = summarizer_module.unavailable_reason()
+    assert "EPHOR_SUMMARY_EXTRA_BODY" in msg and "enable_thinking" in msg
+
+
+def test_unavailable_reason_claude_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(summarizer_module, "_claude_binary", lambda: "/usr/bin/claude")
+    msg = summarizer_module.unavailable_reason()
+    assert "Claude Code" in msg and "EPHOR_SUMMARY_API_BASE" in msg
+
+
+def test_probe_openai_reports_model_missing_from_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _openai_env(monkeypatch)  # model qwen2.5-coder
+    body = json.dumps({"data": [{"id": "some-other-model"}]})
+
+    def fake_urlopen(req: Any, timeout: float | None = None) -> _FakeResponse:
+        assert req.full_url == "http://localhost:8000/v1/models"
+        return _FakeResponse(body)
+
+    monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", fake_urlopen)
+    ok, detail = summarizer_module.probe_openai()
+    assert ok is False
+    assert "not offered" in detail
+
+
+def test_probe_openai_ok_when_model_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    _openai_env(monkeypatch)
+    body = json.dumps({"data": [{"id": "qwen2.5-coder"}]})
+    monkeypatch.setattr(
+        summarizer_module.urllib.request,
+        "urlopen",
+        lambda req, timeout=None: _FakeResponse(body),
+    )
+    ok, detail = summarizer_module.probe_openai()
+    assert ok is True
+    assert "available" in detail
+
+
+def test_probe_openai_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _openai_env(monkeypatch)
+
+    def boom(req: Any, timeout: float | None = None) -> None:
+        raise summarizer_module.urllib.error.URLError("refused")
+
+    monkeypatch.setattr(summarizer_module.urllib.request, "urlopen", boom)
+    ok, detail = summarizer_module.probe_openai()
+    assert ok is False
+    assert "cannot reach" in detail
