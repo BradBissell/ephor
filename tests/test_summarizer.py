@@ -700,3 +700,47 @@ def test_probe_openai_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
     ok, detail = summarizer_module.probe_openai()
     assert ok is False
     assert "cannot reach" in detail
+
+
+# ---- summarize_text (provider-agnostic reply summarization) -----------------
+
+
+def test_summarize_text_empty_returns_empty() -> None:
+    from ephor.summarizer import summarize_text
+
+    assert summarize_text("") == ""
+    assert summarize_text("   ") == ""
+
+
+def test_summarize_text_via_openai(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ephor.summarizer import summarize_text
+
+    _openai_env(monkeypatch)
+    capture: dict[str, Any] = {}
+    _stub_urlopen(monkeypatch, content="Refactored the uploader", capture=capture)
+    out = summarize_text("I refactored the upload client to add retries.")
+    assert out == "Refactored the uploader"
+    # The reply text is what gets sent to the model.
+    assert "refactored the upload client" in capture["payload"]["messages"][-1]["content"]
+
+
+def test_summarize_text_claude_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ephor.summarizer import summarize_text
+
+    _stub_claude_binary(monkeypatch)
+    _stub_subprocess_run(monkeypatch, stdout=json.dumps({"result": "Did the thing"}))
+    assert summarize_text("some reply text") == "Did the thing"
+
+
+def test_summarize_text_applies_ticket_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ephor.summarizer import summarize_text
+
+    _openai_env(monkeypatch)
+    _stub_urlopen(monkeypatch, content="x" * 200)
+    worktree = tmp_path / "DR-7-thing"
+    worktree.mkdir()
+    out = summarize_text("a long reply", cwd=worktree)
+    assert out.startswith("DR-7: ")
+    assert out.endswith("…")

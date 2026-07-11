@@ -13,7 +13,7 @@
 
 const HANDLER = "__EPHOR_HANDLER_PATH__";
 
-export const ephor = async ({ $, directory }) => {
+export const ephor = async ({ $, directory, client }) => {
   // Pipe one canonical event to event_handler.sh via Bun's shell. stdin carries
   // the JSON; EPHOR_PROVIDER selects the opencode dialect in the handler.
   const fire = async (payload) => {
@@ -32,6 +32,49 @@ export const ephor = async ({ $, directory }) => {
   const emit = (session_id, hook_event_name, extra = {}) =>
     fire({ session_id, hook_event_name, ...extra });
 
+  // Reply text for speak-back (full/summary TTS). Fetch the session's messages
+  // via the in-process SDK client (NOT `opencode export` — spawning that during
+  // an active session deadlocks) and pull the last assistant message's text
+  // parts. Best-effort — returns "" on any failure.
+  const lastAssistantText = async (sid) => {
+    if (!sid) return "";
+    try {
+      const res = await client.session.messages({ path: { id: sid } });
+      const msgs = res?.data ?? res ?? [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if ((m?.info?.role ?? m?.role) === "assistant") {
+          const txt = (m?.parts ?? [])
+            .filter((p) => p?.type === "text" && typeof p.text === "string")
+            .map((p) => p.text)
+            .join("")
+            .trim();
+          if (txt) return txt.slice(0, 4000);
+        }
+      }
+    } catch {
+      /* fail-open */
+    }
+    return "";
+  };
+
+  // Turn end can surface as both `session.idle` and `session.status:idle`.
+  // Fetch the reply (an `opencode export`) only once per idle transition; a
+  // repeat idle emits a plain Stop (no reply → no duplicate speak-back). The
+  // set is cleared whenever the session becomes active again.
+  const idled = new Set();
+  const onIdle = async (sid) => {
+    if (!sid) return;
+    if (idled.has(sid)) return emit(sid, "Stop");
+    idled.add(sid);
+    const reply = await lastAssistantText(sid);
+    return emit(sid, "Stop", reply ? { reply_text: reply } : {});
+  };
+  const onActive = (sid, hook_event_name, extra) => {
+    if (sid) idled.delete(sid);
+    return emit(sid, hook_event_name, extra);
+  };
+
   return {
     // Session lifecycle + permission prompts arrive on the event bus.
     event: async ({ event }) => {
@@ -41,17 +84,17 @@ export const ephor = async ({ $, directory }) => {
       const sid = p.sessionID ?? p.info?.id ?? p.session?.id;
       switch (event?.type) {
         case "session.created":
-          return emit(sid, "SessionStart");
+          return onActive(sid, "SessionStart");
         case "session.deleted":
           return emit(sid, "SessionEnd");
         case "session.idle":
-          return emit(sid, "Stop"); // turn finished → IDLE (+ speak-back)
+          return onIdle(sid);
         case "session.status": {
           const t = p.status?.type;
           // "busy"/"retry" → WORKING without bumping tool_count (PostToolUse is
-          // the handler's WORKING-no-increment event); "idle" → Stop.
-          if (t === "busy" || t === "retry") return emit(sid, "PostToolUse");
-          if (t === "idle") return emit(sid, "Stop");
+          // the handler's WORKING-no-increment event); "idle" → Stop (+ reply).
+          if (t === "busy" || t === "retry") return onActive(sid, "PostToolUse");
+          if (t === "idle") return onIdle(sid);
           return;
         }
         case "session.error":
@@ -73,7 +116,7 @@ export const ephor = async ({ $, directory }) => {
     // Tool execution uses the first-class hooks (documented input shape) so
     // tool_count increments exactly once per tool call.
     "tool.execute.before": async (input) =>
-      emit(input?.sessionID, "PreToolUse", { tool_name: input?.tool }),
+      onActive(input?.sessionID, "PreToolUse", { tool_name: input?.tool }),
     "tool.execute.after": async (input) =>
       emit(input?.sessionID, "PostToolUse", { tool_name: input?.tool }),
   };

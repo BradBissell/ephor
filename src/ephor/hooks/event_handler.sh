@@ -311,34 +311,43 @@ emit_speech_start_event() {
   # than relying on the parent's top-level vars, since the parent may have
   # exited by the time we get here.
   local hook_json="$1"
-  local sid transcript cwd
+  local sid transcript cwd text
   sid="$(printf '%s' "$hook_json" | jq -r '.session_id // empty' 2>/dev/null)"
   transcript="$(printf '%s' "$hook_json" | jq -r '.transcript_path // empty' 2>/dev/null)"
   cwd="$(printf '%s' "$hook_json" | jq -r '.cwd // empty' 2>/dev/null)"
   [ -z "$sid" ] && return 0
-  [ -z "$transcript" ] && return 0
-  [ ! -f "$transcript" ] && return 0
 
-  # Wait up to ~3s for the assistant message to flush to the transcript.
-  # Mirrors tts-speak-response's polling so we capture the same text the
-  # user actually hears.
-  local prev_size=-1 size
-  for _ in 1 2 3 4 5 6; do
-    size="$(stat -c %s "$transcript" 2>/dev/null || echo 0)"
-    if [ "$size" = "$prev_size" ] && [ "$size" -gt 0 ]; then
-      break
-    fi
-    prev_size="$size"
-    sleep 0.5
-  done
+  # Provider-agnostic reply capture. Prefer the reply text delivered directly
+  # in the event payload — no transcript parsing needed:
+  #   .reply_text            generic (the opencode plugin sends this)
+  #   .prompt_response       gemini (AfterAgent)
+  #   .last_assistant_message / .["last-assistant-message"]  codex
+  # Only claude (and any agent that just gives a transcript path) falls through
+  # to the Claude-format transcript poll below.
+  text="$(printf '%s' "$hook_json" | jq -r '
+    .reply_text // .prompt_response // .last_assistant_message
+      // .["last-assistant-message"] // empty' 2>/dev/null)"
 
-  local text
-  text="$(jq -rs '
-    [.[] | select(.type == "assistant")
-         | .message.content[]?
-         | select(.type == "text")
-         | .text] | last // empty
-  ' "$transcript" 2>/dev/null)"
+  if [ -z "$text" ]; then
+    [ -z "$transcript" ] && return 0
+    [ ! -f "$transcript" ] && return 0
+    # Wait up to ~3s for the assistant message to flush to the transcript.
+    local prev_size=-1 size
+    for _ in 1 2 3 4 5 6; do
+      size="$(stat -c %s "$transcript" 2>/dev/null || echo 0)"
+      if [ "$size" = "$prev_size" ] && [ "$size" -gt 0 ]; then
+        break
+      fi
+      prev_size="$size"
+      sleep 0.5
+    done
+    text="$(jq -rs '
+      [.[] | select(.type == "assistant")
+           | .message.content[]?
+           | select(.type == "text")
+           | .text] | last // empty
+    ' "$transcript" 2>/dev/null)"
+  fi
   [ -z "$text" ] && return 0
 
   # Markdown cleanup + sentence split. Done in Python because the regex
