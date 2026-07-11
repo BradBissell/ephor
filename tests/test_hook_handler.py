@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -730,3 +731,76 @@ def test_grok_build_stop_maps_to_idle(state_env: dict[str, str]) -> None:
     assert state["last_event"] == "Stop"
     assert state["status"] == "IDLE"
     assert state["provider"] == "grok"
+
+
+def test_grok_build_acp_transcript_reply_captured(
+    state_env: dict[str, str], tmp_path: Path
+) -> None:
+    """Grok Build's `stop` carries a transcriptPath to an ACP session/update
+    stream; the handler extracts the last completed turn's agent text for TTS."""
+    acp = tmp_path / "updates.jsonl"
+    acp.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                {
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "content": {"type": "text", "text": "hi"},
+                        }
+                    },
+                },
+                {
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "A semaphore "},
+                        }
+                    },
+                },
+                {
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "limits concurrency."},
+                        }
+                    },
+                },
+                {
+                    "method": "session/update",
+                    "params": {"update": {"sessionUpdate": "turn_completed"}},
+                },
+            ]
+        )
+        + "\n"
+    )
+    sid = "019f4f08-8935-7abc-def0-112233445566"
+    subprocess.run(
+        ["bash", str(HANDLER)],
+        input=json.dumps(
+            {"hookEventName": "stop", "sessionId": sid, "cwd": "/p", "transcriptPath": str(acp)}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=8,
+        env={**state_env, "GROK_SESSION_ID": sid, "GROK_HOOK_EVENT": "stop"},
+        check=False,
+    )
+    # emit_speech_start_event is backgrounded; wait briefly for the record.
+    speech_log = Path(state_env["EPHOR_SPEECH_LOG"])
+    text = ""
+    for _ in range(20):
+        if speech_log.exists():
+            for line in speech_log.read_text().splitlines():
+                ev = json.loads(line)
+                if ev.get("event") == "start":
+                    text = ev.get("text", "")
+        if text:
+            break
+        time.sleep(0.2)
+    assert "semaphore" in text.lower()
+    assert "limits concurrency" in text

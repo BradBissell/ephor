@@ -328,8 +328,9 @@ emit_speech_start_event() {
   # exited by the time we get here.
   local hook_json="$1"
   local sid transcript cwd text
-  sid="$(printf '%s' "$hook_json" | jq -r '.session_id // empty' 2>/dev/null)"
-  transcript="$(printf '%s' "$hook_json" | jq -r '.transcript_path // empty' 2>/dev/null)"
+  sid="$(printf '%s' "$hook_json" | jq -r '.session_id // .sessionId // empty' 2>/dev/null)"
+  # transcript path: `.transcript_path` (claude/gemini) or `.transcriptPath` (grok build)
+  transcript="$(printf '%s' "$hook_json" | jq -r '.transcript_path // .transcriptPath // empty' 2>/dev/null)"
   cwd="$(printf '%s' "$hook_json" | jq -r '.cwd // empty' 2>/dev/null)"
   [ -z "$sid" ] && return 0
 
@@ -338,8 +339,7 @@ emit_speech_start_event() {
   #   .reply_text            generic (the opencode plugin sends this)
   #   .prompt_response       gemini (AfterAgent)
   #   .last_assistant_message / .["last-assistant-message"]  codex
-  # Only claude (and any agent that just gives a transcript path) falls through
-  # to the Claude-format transcript poll below.
+  # Otherwise fall through to the transcript below (claude JSONL or grok ACP).
   text="$(printf '%s' "$hook_json" | jq -r '
     .reply_text // .prompt_response // .last_assistant_message
       // .["last-assistant-message"] // empty' 2>/dev/null)"
@@ -357,12 +357,28 @@ emit_speech_start_event() {
       prev_size="$size"
       sleep 0.5
     done
+    # Claude Code transcript format (JSONL of {type, message:{content:[...]}}).
     text="$(jq -rs '
       [.[] | select(.type == "assistant")
            | .message.content[]?
            | select(.type == "text")
            | .text] | last // empty
     ' "$transcript" 2>/dev/null)"
+    # Grok Build transcript (ACP session/update stream): concatenate the last
+    # completed turn's agent_message_chunk text. Tried only if the Claude-format
+    # parse above found nothing, so the two formats coexist without a flag.
+    if [ -z "$text" ]; then
+      text="$(jq -rs '
+        reduce .[] as $r ({buf:"", last:""};
+          ($r.params.update) as $u
+          | if ($u.sessionUpdate // "") == "agent_message_chunk"
+              then .buf += ($u.content.text // "")
+            elif ($u.sessionUpdate // "") == "turn_completed"
+              then {buf:"", last:.buf}
+            else . end)
+        | if (.buf|length) > 0 then .buf else .last end
+      ' "$transcript" 2>/dev/null)"
+    fi
   fi
   [ -z "$text" ] && return 0
 

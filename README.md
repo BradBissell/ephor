@@ -109,10 +109,10 @@ Running ten sessions in parallel, the bottleneck isn't compute — it's
 When a session's turn ends, ephor enqueues its reply to a single FIFO
 speech queue shared across **all** your sessions, and plays it through
 your local [kokoro](https://github.com/hexgrad/kokoro) TTS pipeline. This
-works for **Claude Code, Gemini, Codex, and OpenCode** — the reply text is
-captured at turn-end from each agent (an event-payload field, or, for
-OpenCode, the plugin's SDK). Grok is status-only for now (its reply isn't
-exposed at turn-end without parsing its SQLite store). Two modes:
+works for **all five agents** — the reply text is captured at turn-end from
+each: an event-payload field (Gemini, Codex), the plugin's SDK (OpenCode), or
+the session transcript (Claude's JSONL, Grok Build's ACP `session/update`
+stream). Two modes:
 
 - **`summary` (recommended for parallel work).** ephor shells out to
   `claude -p` to turn the reply into a **single ≤70-character
