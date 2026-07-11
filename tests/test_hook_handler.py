@@ -804,3 +804,51 @@ def test_grok_build_acp_transcript_reply_captured(
         time.sleep(0.2)
     assert "semaphore" in text.lower()
     assert "limits concurrency" in text
+
+
+def test_grok_stop_persists_last_reply_to_state(state_env: dict[str, str], tmp_path: Path) -> None:
+    """store_last_reply writes the captured reply into the state file so the
+    dashboard summary column can condense non-Claude sessions."""
+    acp = tmp_path / "updates.jsonl"
+    acp.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                {
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "A deadlock is mutual waiting."},
+                        }
+                    },
+                },
+                {
+                    "method": "session/update",
+                    "params": {"update": {"sessionUpdate": "turn_completed"}},
+                },
+            ]
+        )
+        + "\n"
+    )
+    sid = "019f4f0a-aaaa-bbbb-cccc-ddddeeeeffff"
+    subprocess.run(
+        ["bash", str(HANDLER)],
+        input=json.dumps(
+            {"hookEventName": "stop", "sessionId": sid, "cwd": "/p", "transcriptPath": str(acp)}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=8,
+        env={**state_env, "GROK_SESSION_ID": sid, "GROK_HOOK_EVENT": "stop"},
+        check=False,
+    )
+    reply = ""
+    for _ in range(20):
+        st = _state_file(state_env, sid)
+        if st.exists():
+            reply = json.loads(st.read_text()).get("last_reply", "")
+        if reply:
+            break
+        time.sleep(0.2)
+    assert reply == "A deadlock is mutual waiting."

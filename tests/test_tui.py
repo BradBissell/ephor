@@ -803,3 +803,39 @@ async def test_enter_after_cold_path_rebuild_jumps_to_correct_session(
 
         assert len(captured) >= 1
         assert captured[-1].session_id == expected_sid
+
+
+@pytest.mark.asyncio
+async def test_summarize_falls_back_to_last_reply_for_non_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-Claude session (no Claude transcript) summarizes its captured
+    last_reply via summarize_text, not the empty transcript summarizer."""
+    sd = tmp_path / "sessions"
+    sd.mkdir()
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
+    _write_state(sd, "grok-sid", provider="grok", last_reply="A deadlock is mutual waiting.")
+    monkeypatch.setattr("ephor.summary_store.summary_dir", lambda: tmp_path / "summaries")
+    # No Claude transcript → transcript summarizer yields "".
+    monkeypatch.setattr("ephor.tui.app.summarize_transcript", lambda _p, cwd=None: "")
+    seen: dict[str, str] = {}
+
+    def fake_text(text: str, cwd: object = None) -> str:
+        seen["text"] = text
+        return "condensed reply"
+
+    monkeypatch.setattr("ephor.summarizer.summarize_text", fake_text)
+
+    app = EphorApp(manager=StateManager(sd))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        await pilot.pause()
+        from ephor.summary_store import SummaryStore
+
+        app._summaries = SummaryStore()
+        app.action_summarize()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    assert seen["text"] == "A deadlock is mutual waiting."
+    saved = (tmp_path / "summaries" / "grok-sid.json").read_text()
+    assert "condensed reply" in saved

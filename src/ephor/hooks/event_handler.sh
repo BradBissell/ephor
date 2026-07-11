@@ -322,6 +322,31 @@ emit_speech_stop_event() {
   speech_append_locked "$record"
 }
 
+store_last_reply() {
+  # Merge the latest assistant reply into the session state file (field
+  # `last_reply`, capped) so the dashboard summary column can condense
+  # non-Claude sessions, which have no Claude-format transcript to walk.
+  #
+  # No flock here on purpose: this runs from the backgrounded speech emitter,
+  # which inherited (and still holds) the main handler's per-session lock on
+  # fd 9 — so we're already inside the critical section. Re-locking the same
+  # file via a new descriptor would self-deadlock (advisory locks conflict
+  # across open descriptions even within one process). The mktemp+rename keeps
+  # the write atomic regardless. Best-effort; never blocks.
+  local sid="$1" reply="$2"
+  [ -z "$sid" ] && return 0
+  local sf="$STATE_DIR/$sid.json"
+  [ -f "$sf" ] || return 0
+  reply="$(printf '%s' "$reply" | head -c 2000)"
+  local merged tmp
+  merged="$(jq -c --arg r "$reply" '. + {last_reply: $r}' "$sf" 2>/dev/null)" || return 0
+  [ -z "$merged" ] && return 0
+  tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXX")" || return 0
+  printf '%s\n' "$merged" >"$tmp"
+  chmod 0600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$sf" 2>/dev/null || rm -f "$tmp"
+}
+
 emit_speech_start_event() {
   # Runs in a backgrounded subshell. Re-parses the hook JSON ($1) rather
   # than relying on the parent's top-level vars, since the parent may have
@@ -381,6 +406,10 @@ emit_speech_start_event() {
     fi
   fi
   [ -z "$text" ] && return 0
+
+  # Persist the reply into the session state file so the dashboard summary
+  # column can summarize non-Claude sessions (which have no Claude transcript).
+  store_last_reply "$sid" "$text"
 
   # Markdown cleanup + sentence split. Done in Python because the regex
   # surface is annoying in pure jq/awk and tts-speak-response already

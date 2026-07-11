@@ -45,6 +45,7 @@ class AgentState:
     notification: Notification | None = None
     last_summary: str = ""  # v2: latest user prompt, truncated to 70 chars
     provider: str = ""  # v3: coding-agent CLI that wrote this file (claude/gemini/codex/grok)
+    last_reply: str = ""  # v3: latest assistant reply captured at turn-end (non-Claude summaries)
     schema_version: int = SCHEMA_VERSION
 
     def to_json(self) -> str:
@@ -99,6 +100,7 @@ class AgentState:
             notification=notif,
             last_summary=data.get("last_summary", ""),
             provider=data.get("provider", ""),
+            last_reply=data.get("last_reply", ""),
             schema_version=version,
         )
 
