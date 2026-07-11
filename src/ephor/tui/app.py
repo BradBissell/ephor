@@ -989,16 +989,19 @@ class EphorApp(App[int]):
             # (non-Claude), so try it first (rich for Claude) then fall back to
             # condensing the captured reply.
             path = transcript_path(cwd, sid)
+            had_material = path.exists() or bool(last_reply)
             text = summarize_transcript(path, cwd=cwd)
             if not text and last_reply:
                 from ephor.summarizer import summarize_text
 
                 text = summarize_text(last_reply, cwd=cwd)
-            self.call_from_thread(self._on_summary_done, sid, text, manual)
+            self.call_from_thread(self._on_summary_done, sid, text, manual, had_material)
         finally:
             self._summarizing.discard(sid)
 
-    def _on_summary_done(self, sid: str, text: str, manual: bool) -> None:
+    def _on_summary_done(
+        self, sid: str, text: str, manual: bool, had_material: bool = True
+    ) -> None:
         """Main-thread callback: persist the result and repaint the row."""
         if text:
             self._summaries.set(sid, text)
@@ -1018,9 +1021,17 @@ class EphorApp(App[int]):
             if manual:
                 self._set_toast(f"summary updated for {sid[:8]}")
         elif manual:
-            # Manual press deserves an explanation when summarization failed —
-            # backend-aware so it's actionable for both claude and local models.
-            self._set_toast(unavailable_reason())
+            # Manual press deserves an accurate explanation. Distinguish "there
+            # was nothing to summarize yet" (a new/mid-turn non-Claude session
+            # whose reply hasn't been captured) from a real backend failure —
+            # the latter is what unavailable_reason() addresses.
+            if not had_material:
+                self._set_toast(
+                    f"no summary yet for {sid[:8]} — waiting for the session's "
+                    "first completed reply"
+                )
+            else:
+                self._set_toast(unavailable_reason())
 
 
 # ---------------------------------------------------------------------------
