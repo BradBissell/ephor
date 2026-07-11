@@ -618,7 +618,7 @@ def test_summary_mode_replaces_text_with_summarizer_output(
 
 
 def test_summary_mode_falls_back_to_truncated_text_when_summarizer_returns_empty(
-    proc_log: list[FakeProc], tmp_path: Path
+    proc_log: list[FakeProc], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import ephor.speech_player as sp
 
@@ -626,6 +626,10 @@ def test_summary_mode_falls_back_to_truncated_text_when_summarizer_returns_empty
 
     def empty_summarizer(_p: Path, _cwd: str | None) -> str:
         return ""
+
+    # Both the transcript summarizer and the text summarizer return "" so the
+    # worker exhausts its options and falls back to the raw reply.
+    monkeypatch.setattr("ephor.summarizer.summarize_text", lambda _t, _cwd=None: "")
 
     player = SpeechPlayer(
         spawner=lambda _i: proc_log.append(FakeProc()) or proc_log[-1],  # type: ignore[return-value]
@@ -645,26 +649,32 @@ def test_summary_mode_falls_back_to_truncated_text_when_summarizer_returns_empty
     assert player.now_playing.text == full_text
 
 
-def test_summary_mode_without_transcript_path_falls_back_to_full(
-    proc_log: list[FakeProc],
+def test_summary_mode_without_transcript_summarizes_carried_text(
+    proc_log: list[FakeProc], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A start event missing transcript_path can't be summarized — play
-    the full text rather than dropping the notification entirely."""
+    """No transcript path (gemini/codex/opencode) → summarize the reply text
+    captured at turn-end via summarize_text, not the transcript summarizer."""
     import ephor.speech_player as sp
 
     sp.os.killpg = lambda *_a, **_k: None  # type: ignore[assignment]
 
     def panic_summarizer(_p: Path, _cwd: str | None) -> str:
-        raise AssertionError("summarizer should not be called without transcript_path")
+        raise AssertionError("transcript summarizer must not run without a transcript_path")
+
+    monkeypatch.setattr(
+        "ephor.summarizer.summarize_text", lambda text, _cwd=None: "brief from reply text"
+    )
 
     player = SpeechPlayer(
         spawner=lambda _i: proc_log.append(FakeProc()) or proc_log[-1],  # type: ignore[return-value]
         speak_mode=sp.SPEAK_MODE_SUMMARY,
         summarizer=panic_summarizer,
     )
-    player._route_event(_start_event("s1", "fallback content"))
+    player._route_event(_start_event("s1", "the full opencode reply text"))
+    _wait_for_pending(player)
+    player.tick()
     assert player.now_playing is not None
-    assert player.now_playing.text == "fallback content"
+    assert player.now_playing.text == "brief from reply text"
 
 
 def test_set_speak_mode_runtime_switch() -> None:

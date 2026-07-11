@@ -307,13 +307,13 @@ class SpeechPlayer:
             )
             transcript_raw = ev.get("transcript_path")
             cwd_raw = ev.get("cwd")
-            if (
-                self._speak_mode == SPEAK_MODE_SUMMARY
-                and isinstance(transcript_raw, str)
-                and transcript_raw
-            ):
+            transcript = transcript_raw if isinstance(transcript_raw, str) else ""
+            # Summarize in summary mode whenever there's material to condense —
+            # a Claude-format transcript (richer) OR the reply text captured at
+            # turn-end for any other provider (gemini/codex/opencode).
+            if self._speak_mode == SPEAK_MODE_SUMMARY and (transcript or item.text):
                 cwd = cwd_raw if isinstance(cwd_raw, str) and cwd_raw else None
-                self._spawn_summary_worker(item, transcript_raw, cwd)
+                self._spawn_summary_worker(item, transcript, cwd)
             else:
                 self.enqueue(item)
         elif kind == "stop":
@@ -323,28 +323,31 @@ class SpeechPlayer:
         """Run the summarizer in a daemon thread and post the resulting
         QueueItem back via ``self._pending``.
 
-        The summarizer shells out to ``claude -p`` (subscription auth —
-        no API key needed), which can take 2-3 seconds. Doing this on
-        the main tick would freeze the TUI; doing it sync would also
-        break the FIFO ordering of fast-following responses.
+        Summarizing can take 2-3 seconds (an LLM call — ``claude -p`` or a
+        configured HTTP endpoint). Doing it on the main tick would freeze the
+        TUI; doing it sync would break the FIFO ordering of fast-following
+        responses.
 
-        On any failure (timeout, missing binary, empty result) we fall
-        back to a truncated version of the original assistant text so
-        the user still gets *some* audible signal that a response
-        arrived. That's the whole point of summary mode: notification.
+        Two input sources: a Claude-format transcript (``transcript_path``,
+        richer recent-turn context) when available, else the reply text already
+        captured at turn-end (``item.text``) for other providers. On any failure
+        (timeout, missing binary, empty result) we fall back to a truncated
+        version of the original reply so the user still gets *some* audible
+        signal that a response arrived — the whole point of summary mode.
         """
 
         def worker() -> None:
             summary = ""
             try:
-                if self._summarizer is not None:
-                    summary = self._summarizer(Path(transcript_path), cwd)
-                else:
-                    # Lazy import: pulling summarizer eagerly would drag
-                    # subprocess+json into every ephor process at startup.
-                    from ephor.summarizer import summarize_transcript
+                # Lazy import: pulling summarizer eagerly would drag
+                # subprocess+json into every ephor process at startup.
+                from ephor.summarizer import summarize_text, summarize_transcript
 
-                    summary = summarize_transcript(Path(transcript_path), cwd=cwd)
+                if transcript_path:
+                    fn = self._summarizer or summarize_transcript
+                    summary = fn(Path(transcript_path), cwd)
+                if not summary and item.text:
+                    summary = summarize_text(item.text, cwd)
             except Exception:  # noqa: BLE001 - background work must not crash the TUI
                 log.debug("summary worker failed", exc_info=True)
                 summary = ""

@@ -11,11 +11,11 @@ from ephor import providers
 
 def test_all_providers_present_and_ordered() -> None:
     names = [p.name for p in providers.all_providers()]
-    assert names == ["claude", "gemini", "codex", "grok"]
-    assert providers.PROVIDER_ORDER == ("claude", "gemini", "codex", "grok")
+    assert names == ["claude", "gemini", "codex", "grok", "opencode"]
+    assert providers.PROVIDER_ORDER == ("claude", "gemini", "codex", "grok", "opencode")
 
 
-@pytest.mark.parametrize("name", ["claude", "gemini", "codex", "grok"])
+@pytest.mark.parametrize("name", ["claude", "gemini", "codex", "grok", "opencode"])
 def test_provider_is_well_formed(name: str) -> None:
     p = providers.get_provider(name)
     assert p.name == name
@@ -44,11 +44,11 @@ def test_resolve_providers_single() -> None:
 
 
 def test_known_binaries_match_providers() -> None:
-    assert providers.KNOWN_BINARIES == ("claude", "gemini", "codex", "grok")
+    assert providers.KNOWN_BINARIES == ("claude", "gemini", "codex", "grok", "opencode")
 
 
 def test_settings_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GROK_SETTINGS_PATH", "/tmp/custom/grok.json")
+    monkeypatch.setenv("GROK_HOOKS_PATH", "/tmp/custom/grok.json")
     assert providers.get_provider("grok").settings_path() == Path("/tmp/custom/grok.json")
 
 
@@ -67,4 +67,4 @@ def test_gemini_uses_before_after_event_dialect() -> None:
 
 
 def test_grok_carries_resume_flags() -> None:
-    assert providers.get_provider("grok").resume_flags == ("-s", "--session")
+    assert providers.get_provider("grok").resume_flags == ("--resume", "-r")

@@ -501,7 +501,12 @@ class EphorApp(App[int]):
                 continue
             if self._summaries.has(sid):
                 continue
-            self._summarize(sid, agent.cwd, manual=False)
+            # Skip until there's material to summarize — a Claude transcript
+            # or a captured reply — so content-less sessions don't trigger an
+            # LLM call on every refresh (empty results aren't cached).
+            if not agent.last_reply and not transcript_path(agent.cwd, sid).exists():
+                continue
+            self._summarize(sid, agent.cwd, manual=False, last_reply=agent.last_reply)
 
     def _update_chrome(self, agents: list[AgentState]) -> None:
         """Refresh the parts outside the session list (header / summary / title).
@@ -695,7 +700,7 @@ class EphorApp(App[int]):
         if sid in self._summarizing:
             self._set_toast("already summarizing…")
             return
-        self._summarize(sid, agent.cwd, manual=True)
+        self._summarize(sid, agent.cwd, manual=True, last_reply=agent.last_reply)
 
     async def action_jump(self) -> None:
         list_view = self.query_one(ListView)
@@ -963,13 +968,15 @@ class EphorApp(App[int]):
         self._account_usage = account_usage
 
     @work(thread=True, exit_on_error=False, group="summarize")
-    def _summarize(self, sid: str, cwd: str, manual: bool) -> None:
-        """Background-thread worker: read transcript, ask Haiku, store result.
+    def _summarize(self, sid: str, cwd: str, manual: bool, last_reply: str = "") -> None:
+        """Background-thread worker: summarize the session, store the result.
 
-        Lazy-once policy: caller (refresh path) only schedules when there's
-        no cached summary; manual=True force-refreshes via the `s` action.
-        Either way we de-dupe via `self._summarizing` so simultaneous calls
-        for the same sid collapse.
+        Claude sessions summarize their transcript (rich, recent-turn context).
+        Other agents have no Claude-format transcript, so we fall back to
+        condensing the assistant reply captured at turn-end (``last_reply``,
+        written to the state file by the hook handler). Lazy-once policy: the
+        refresh path only schedules when there's no cached summary; manual=True
+        force-refreshes via `s`. De-duped via ``self._summarizing``.
         """
         if sid in self._summarizing:
             return
@@ -978,13 +985,23 @@ class EphorApp(App[int]):
             if manual:
                 # Show progress toast on the UI thread.
                 self.call_from_thread(self._set_toast, f"summarizing {sid[:8]}…")
+            # summarize_transcript returns "" for a missing/foreign transcript
+            # (non-Claude), so try it first (rich for Claude) then fall back to
+            # condensing the captured reply.
             path = transcript_path(cwd, sid)
+            had_material = path.exists() or bool(last_reply)
             text = summarize_transcript(path, cwd=cwd)
-            self.call_from_thread(self._on_summary_done, sid, text, manual)
+            if not text and last_reply:
+                from ephor.summarizer import summarize_text
+
+                text = summarize_text(last_reply, cwd=cwd)
+            self.call_from_thread(self._on_summary_done, sid, text, manual, had_material)
         finally:
             self._summarizing.discard(sid)
 
-    def _on_summary_done(self, sid: str, text: str, manual: bool) -> None:
+    def _on_summary_done(
+        self, sid: str, text: str, manual: bool, had_material: bool = True
+    ) -> None:
         """Main-thread callback: persist the result and repaint the row."""
         if text:
             self._summaries.set(sid, text)
@@ -1004,9 +1021,17 @@ class EphorApp(App[int]):
             if manual:
                 self._set_toast(f"summary updated for {sid[:8]}")
         elif manual:
-            # Manual press deserves an explanation when summarization failed —
-            # backend-aware so it's actionable for both claude and local models.
-            self._set_toast(unavailable_reason())
+            # Manual press deserves an accurate explanation. Distinguish "there
+            # was nothing to summarize yet" (a new/mid-turn non-Claude session
+            # whose reply hasn't been captured) from a real backend failure —
+            # the latter is what unavailable_reason() addresses.
+            if not had_material:
+                self._set_toast(
+                    f"no summary yet for {sid[:8]} — waiting for the session's "
+                    "first completed reply"
+                )
+            else:
+                self._set_toast(unavailable_reason())
 
 
 # ---------------------------------------------------------------------------

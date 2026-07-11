@@ -395,7 +395,7 @@ def provider_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str,
     monkeypatch.setattr(installer, "claude_settings_path", lambda: paths["claude"])
     monkeypatch.setenv("GEMINI_SETTINGS_PATH", str(paths["gemini"]))
     monkeypatch.setenv("CODEX_HOOKS_PATH", str(paths["codex"]))
-    monkeypatch.setenv("GROK_SETTINGS_PATH", str(paths["grok"]))
+    monkeypatch.setenv("GROK_HOOKS_PATH", str(paths["grok"]))
     return paths
 
 
@@ -446,3 +446,64 @@ def test_codex_writes_dedicated_hooks_json(provider_paths: dict[str, Path]) -> N
     # Codex keeps hooks in its own file, not ~/.claude/settings.json.
     assert provider_paths["codex"].exists()
     assert not provider_paths["claude"].exists()
+
+
+# ---------------------------------------------------------------------------
+# opencode plugin strategy
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def opencode_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Fake handler (with the real template beside it) + tmp plugin path."""
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    handler = hooks_dir / "event_handler.sh"
+    handler.write_text("#!/bin/sh\nexit 0\n")
+    handler.chmod(0o755)
+    # The installer reads opencode_plugin.js next to the handler.
+    (hooks_dir / "opencode_plugin.js").write_text(
+        'const HANDLER = "__EPHOR_HANDLER_PATH__";\nexport const ephor = async () => ({});\n'
+    )
+    monkeypatch.setattr(installer, "hook_handler_path", lambda: handler)
+    plugin = tmp_path / "opencode" / "plugins" / "ephor.js"
+    monkeypatch.setenv("EPHOR_OPENCODE_PLUGIN", str(plugin))
+    return plugin
+
+
+def test_opencode_install_writes_plugin_with_handler_path(opencode_paths: Path) -> None:
+    plan = installer.install("opencode")
+    assert plan.events_to_add  # something to do on a fresh install
+    assert opencode_paths.exists()
+    content = opencode_paths.read_text()
+    # Placeholder replaced with the (fake) handler's absolute path.
+    assert "__EPHOR_HANDLER_PATH__" not in content
+    assert "event_handler.sh" in content
+
+
+def test_opencode_install_is_idempotent(opencode_paths: Path) -> None:
+    installer.install("opencode")
+    plan = installer.install("opencode")  # already current
+    assert plan.events_to_add == []
+    assert plan.events_already_installed
+
+
+def test_opencode_install_rewrites_stale_plugin(opencode_paths: Path) -> None:
+    opencode_paths.parent.mkdir(parents=True, exist_ok=True)
+    opencode_paths.write_text('const HANDLER = "/old/stale/path";\n')  # pretend prior install
+    plan = installer.install("opencode")
+    assert plan.events_to_add  # detected stale → rewrites
+    assert "/old/stale/path" not in opencode_paths.read_text()
+
+
+def test_opencode_uninstall_removes_plugin(opencode_paths: Path) -> None:
+    installer.install("opencode")
+    assert opencode_paths.exists()
+    plan = installer.uninstall("opencode")
+    assert plan.events_with_ephor_hook
+    assert not opencode_paths.exists()
+
+
+def test_opencode_uninstall_noop_when_absent(opencode_paths: Path) -> None:
+    plan = installer.uninstall("opencode")
+    assert plan.events_with_ephor_hook == []

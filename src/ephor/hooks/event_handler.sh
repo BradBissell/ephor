@@ -61,6 +61,14 @@ PROVIDER="${EPHOR_PROVIDER:-}"
 case "$PROVIDER" in
   *[!a-z]*) PROVIDER="" ;;  # canonical names are lowercase ascii; reject anything else
 esac
+# Grok Build (xAI's official CLI) reads Claude-compatible hooks from
+# ~/.claude/settings.json too, so ephor's claude hook fires inside grok
+# sessions carrying EPHOR_PROVIDER=claude. Grok Build sets GROK_SESSION_ID /
+# GROK_HOOK_EVENT on every hook process (Claude Code never does), so detect it
+# and correct the provider label.
+if [ -n "${GROK_HOOK_EVENT:-}${GROK_SESSION_ID:-}" ]; then
+  PROVIDER="grok"
+fi
 
 mkdir -p "$STATE_DIR" "$PENDING_DIR" "$LOCK_DIR" 2>/dev/null || ephor_exit_open
 chmod 0700 "$STATE_DIR" "$PENDING_DIR" "$LOCK_DIR" 2>/dev/null || true
@@ -72,7 +80,8 @@ INPUT_JSON="$(cat)"
 # Probe for jq early — if missing, fail open silently.
 command -v jq >/dev/null 2>&1 || ephor_exit_open
 
-SESSION_ID="$(printf '%s' "$INPUT_JSON" | jq -r '.session_id // empty')"
+# session id: `.session_id` (claude/gemini/codex) or `.sessionId` (grok build / cursor)
+SESSION_ID="$(printf '%s' "$INPUT_JSON" | jq -r '.session_id // .sessionId // empty')"
 [ -z "$SESSION_ID" ] && ephor_exit_open
 
 # Defensive: anchor session_id to safe characters before path use.
@@ -80,7 +89,14 @@ case "$SESSION_ID" in
   *[!a-zA-Z0-9_-]*) ephor_exit_open ;;
 esac
 
-EVENT_NAME="$(printf '%s' "$INPUT_JSON" | jq -r '.hook_event_name // empty')"
+# event name: `.hook_event_name` or grok build / cursor `.hookEventName`. Grok
+# Build's values are snake_case (`session_start`, `pre_tool_use`, `stop`), so
+# normalize any snake_case/lowercase name to PascalCase — idempotent for the
+# PascalCase names the other agents already send.
+EVENT_NAME="$(printf '%s' "$INPUT_JSON" | jq -r '.hook_event_name // .hookEventName // empty')"
+[ -z "$EVENT_NAME" ] && ephor_exit_open
+EVENT_NAME="$(printf '%s' "$EVENT_NAME" | awk -F_ \
+  '{o=""; for (i=1;i<=NF;i++) o=o toupper(substr($i,1,1)) substr($i,2); print o}')"
 [ -z "$EVENT_NAME" ] && ephor_exit_open
 
 CWD="$(printf '%s' "$INPUT_JSON" | jq -r '.cwd // empty')"
@@ -306,40 +322,94 @@ emit_speech_stop_event() {
   speech_append_locked "$record"
 }
 
+store_last_reply() {
+  # Merge the latest assistant reply into the session state file (field
+  # `last_reply`, capped) so the dashboard summary column can condense
+  # non-Claude sessions, which have no Claude-format transcript to walk.
+  #
+  # No flock here on purpose: this runs from the backgrounded speech emitter,
+  # which inherited (and still holds) the main handler's per-session lock on
+  # fd 9 — so we're already inside the critical section. Re-locking the same
+  # file via a new descriptor would self-deadlock (advisory locks conflict
+  # across open descriptions even within one process). The mktemp+rename keeps
+  # the write atomic regardless. Best-effort; never blocks.
+  local sid="$1" reply="$2"
+  [ -z "$sid" ] && return 0
+  local sf="$STATE_DIR/$sid.json"
+  [ -f "$sf" ] || return 0
+  reply="$(printf '%s' "$reply" | head -c 2000)"
+  local merged tmp
+  merged="$(jq -c --arg r "$reply" '. + {last_reply: $r}' "$sf" 2>/dev/null)" || return 0
+  [ -z "$merged" ] && return 0
+  tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXX")" || return 0
+  printf '%s\n' "$merged" >"$tmp"
+  chmod 0600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$sf" 2>/dev/null || rm -f "$tmp"
+}
+
 emit_speech_start_event() {
   # Runs in a backgrounded subshell. Re-parses the hook JSON ($1) rather
   # than relying on the parent's top-level vars, since the parent may have
   # exited by the time we get here.
   local hook_json="$1"
-  local sid transcript cwd
-  sid="$(printf '%s' "$hook_json" | jq -r '.session_id // empty' 2>/dev/null)"
-  transcript="$(printf '%s' "$hook_json" | jq -r '.transcript_path // empty' 2>/dev/null)"
+  local sid transcript cwd text
+  sid="$(printf '%s' "$hook_json" | jq -r '.session_id // .sessionId // empty' 2>/dev/null)"
+  # transcript path: `.transcript_path` (claude/gemini) or `.transcriptPath` (grok build)
+  transcript="$(printf '%s' "$hook_json" | jq -r '.transcript_path // .transcriptPath // empty' 2>/dev/null)"
   cwd="$(printf '%s' "$hook_json" | jq -r '.cwd // empty' 2>/dev/null)"
   [ -z "$sid" ] && return 0
-  [ -z "$transcript" ] && return 0
-  [ ! -f "$transcript" ] && return 0
 
-  # Wait up to ~3s for the assistant message to flush to the transcript.
-  # Mirrors tts-speak-response's polling so we capture the same text the
-  # user actually hears.
-  local prev_size=-1 size
-  for _ in 1 2 3 4 5 6; do
-    size="$(stat -c %s "$transcript" 2>/dev/null || echo 0)"
-    if [ "$size" = "$prev_size" ] && [ "$size" -gt 0 ]; then
-      break
+  # Provider-agnostic reply capture. Prefer the reply text delivered directly
+  # in the event payload — no transcript parsing needed:
+  #   .reply_text            generic (the opencode plugin sends this)
+  #   .prompt_response       gemini (AfterAgent)
+  #   .last_assistant_message / .["last-assistant-message"]  codex
+  # Otherwise fall through to the transcript below (claude JSONL or grok ACP).
+  text="$(printf '%s' "$hook_json" | jq -r '
+    .reply_text // .prompt_response // .last_assistant_message
+      // .["last-assistant-message"] // empty' 2>/dev/null)"
+
+  if [ -z "$text" ]; then
+    [ -z "$transcript" ] && return 0
+    [ ! -f "$transcript" ] && return 0
+    # Wait up to ~3s for the assistant message to flush to the transcript.
+    local prev_size=-1 size
+    for _ in 1 2 3 4 5 6; do
+      size="$(stat -c %s "$transcript" 2>/dev/null || echo 0)"
+      if [ "$size" = "$prev_size" ] && [ "$size" -gt 0 ]; then
+        break
+      fi
+      prev_size="$size"
+      sleep 0.5
+    done
+    # Claude Code transcript format (JSONL of {type, message:{content:[...]}}).
+    text="$(jq -rs '
+      [.[] | select(.type == "assistant")
+           | .message.content[]?
+           | select(.type == "text")
+           | .text] | last // empty
+    ' "$transcript" 2>/dev/null)"
+    # Grok Build transcript (ACP session/update stream): concatenate the last
+    # completed turn's agent_message_chunk text. Tried only if the Claude-format
+    # parse above found nothing, so the two formats coexist without a flag.
+    if [ -z "$text" ]; then
+      text="$(jq -rs '
+        reduce .[] as $r ({buf:"", last:""};
+          ($r.params.update) as $u
+          | if ($u.sessionUpdate // "") == "agent_message_chunk"
+              then .buf += ($u.content.text // "")
+            elif ($u.sessionUpdate // "") == "turn_completed"
+              then {buf:"", last:.buf}
+            else . end)
+        | if (.buf|length) > 0 then .buf else .last end
+      ' "$transcript" 2>/dev/null)"
     fi
-    prev_size="$size"
-    sleep 0.5
-  done
-
-  local text
-  text="$(jq -rs '
-    [.[] | select(.type == "assistant")
-         | .message.content[]?
-         | select(.type == "text")
-         | .text] | last // empty
-  ' "$transcript" 2>/dev/null)"
+  fi
   [ -z "$text" ] && return 0
+
+  # Persist the reply into the session state file so the dashboard summary
+  # column can summarize non-Claude sessions (which have no Claude transcript).
+  store_last_reply "$sid" "$text"
 
   # Markdown cleanup + sentence split. Done in Python because the regex
   # surface is annoying in pure jq/awk and tts-speak-response already
@@ -492,7 +562,7 @@ case "$EVENT_NAME" in
     ;;
 
   PermissionRequest)
-    TOOL_NAME="$(printf '%s' "$INPUT_JSON" | jq -r '.tool_name // "unknown"')"
+    TOOL_NAME="$(printf '%s' "$INPUT_JSON" | jq -r '.tool_name // .toolName // "unknown"')"
     base_state \
       | jq -c \
           --arg tool "$TOOL_NAME" \

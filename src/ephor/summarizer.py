@@ -197,17 +197,30 @@ def summarize_transcript(path: Path, cwd: str | Path | None = None) -> str:
     messages = _extract_messages(path)
     if not messages:
         return ""
+    raw = _run_backend(_format_for_prompt(messages))
+    return _postprocess(raw, cwd) if raw else ""
 
-    prompt_text = _format_for_prompt(messages)
 
-    if _resolve_backend() == BACKEND_OPENAI:
-        raw = _summarize_via_openai(prompt_text)
-    else:
-        raw = _summarize_via_claude(prompt_text)
+def summarize_text(text: str, cwd: str | Path | None = None) -> str:
+    """Condense already-extracted reply text into one ≤70-char line.
 
-    if not raw:
+    Provider-agnostic counterpart to summarize_transcript: used by summary-mode
+    TTS for agents whose reply text is captured at turn-end (from an event
+    payload field or a plugin) rather than a Claude-format transcript file.
+    Same backend + ticket-prefix + truncation rules. "" on empty/failure.
+    """
+    text = (text or "").strip()
+    if not text:
         return ""
-    return _postprocess(raw, cwd)
+    raw = _run_backend(f"ASSISTANT: {text}")
+    return _postprocess(raw, cwd) if raw else ""
+
+
+def _run_backend(prompt_text: str) -> str:
+    """Send `prompt_text` to the configured backend; raw reply or "" on failure."""
+    if _resolve_backend() == BACKEND_OPENAI:
+        return _summarize_via_openai(prompt_text)
+    return _summarize_via_claude(prompt_text)
 
 
 def _resolve_backend() -> str:

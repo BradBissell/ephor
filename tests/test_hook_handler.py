@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -666,3 +667,188 @@ def test_rejects_non_lowercase_provider(state_env: dict[str, str]) -> None:
         "../evil", {"session_id": sid, "hook_event_name": "SessionStart", "cwd": "/p"}, state_env
     )
     assert _read_state(state_env, sid)["provider"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Grok Build dialect (camelCase keys, snake_case event values, env detection)
+# ---------------------------------------------------------------------------
+
+
+def _fire_grok(
+    event_value: str, input_json: dict[str, object], env: dict[str, str], sid: str
+) -> subprocess.CompletedProcess[str]:
+    """Fire as xAI Grok Build would: EPHOR_PROVIDER=claude (via ~/.claude compat)
+    but GROK_* env set, and a camelCase payload."""
+    return subprocess.run(
+        ["bash", str(HANDLER)],
+        input=json.dumps(input_json),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env={
+            **env,
+            "EPHOR_PROVIDER": "claude",
+            "GROK_SESSION_ID": sid,
+            "GROK_HOOK_EVENT": event_value,
+        },
+        check=False,
+    )
+
+
+def test_grok_build_dialect_is_parsed_and_labeled(state_env: dict[str, str]) -> None:
+    sid = "019f4f01-8ec5-77c2-8ecb-a85fbb656d44"
+    # snake_case hookEventName + camelCase sessionId, as Grok Build sends.
+    _fire_grok(
+        "pre_tool_use",
+        {
+            "hookEventName": "pre_tool_use",
+            "sessionId": sid,
+            "cwd": "/proj",
+            "toolName": "run_terminal_command",
+        },
+        state_env,
+        sid,
+    )
+    state = _read_state(state_env, sid)
+    # session id came from .sessionId; snake_case event normalized to PascalCase.
+    assert state["last_event"] == "PreToolUse"
+    assert state["status"] == "WORKING"
+    assert state["tool_count"] == 1
+    # provider corrected to grok via the GROK_* env, despite EPHOR_PROVIDER=claude.
+    assert state["provider"] == "grok"
+
+
+def test_grok_build_stop_maps_to_idle(state_env: dict[str, str]) -> None:
+    sid = "019f4f01-dead-beef-cafe-000000000000"
+    _fire_grok(
+        "session_start",
+        {"hookEventName": "session_start", "sessionId": sid, "cwd": "/p"},
+        state_env,
+        sid,
+    )
+    _fire_grok("stop", {"hookEventName": "stop", "sessionId": sid, "cwd": "/p"}, state_env, sid)
+    state = _read_state(state_env, sid)
+    assert state["last_event"] == "Stop"
+    assert state["status"] == "IDLE"
+    assert state["provider"] == "grok"
+
+
+def test_grok_build_acp_transcript_reply_captured(
+    state_env: dict[str, str], tmp_path: Path
+) -> None:
+    """Grok Build's `stop` carries a transcriptPath to an ACP session/update
+    stream; the handler extracts the last completed turn's agent text for TTS."""
+    acp = tmp_path / "updates.jsonl"
+    acp.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                {
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "content": {"type": "text", "text": "hi"},
+                        }
+                    },
+                },
+                {
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "A semaphore "},
+                        }
+                    },
+                },
+                {
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "limits concurrency."},
+                        }
+                    },
+                },
+                {
+                    "method": "session/update",
+                    "params": {"update": {"sessionUpdate": "turn_completed"}},
+                },
+            ]
+        )
+        + "\n"
+    )
+    sid = "019f4f08-8935-7abc-def0-112233445566"
+    subprocess.run(
+        ["bash", str(HANDLER)],
+        input=json.dumps(
+            {"hookEventName": "stop", "sessionId": sid, "cwd": "/p", "transcriptPath": str(acp)}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=8,
+        env={**state_env, "GROK_SESSION_ID": sid, "GROK_HOOK_EVENT": "stop"},
+        check=False,
+    )
+    # emit_speech_start_event is backgrounded; wait briefly for the record.
+    speech_log = Path(state_env["EPHOR_SPEECH_LOG"])
+    text = ""
+    for _ in range(20):
+        if speech_log.exists():
+            for line in speech_log.read_text().splitlines():
+                ev = json.loads(line)
+                if ev.get("event") == "start":
+                    text = ev.get("text", "")
+        if text:
+            break
+        time.sleep(0.2)
+    assert "semaphore" in text.lower()
+    assert "limits concurrency" in text
+
+
+def test_grok_stop_persists_last_reply_to_state(state_env: dict[str, str], tmp_path: Path) -> None:
+    """store_last_reply writes the captured reply into the state file so the
+    dashboard summary column can condense non-Claude sessions."""
+    acp = tmp_path / "updates.jsonl"
+    acp.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                {
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "A deadlock is mutual waiting."},
+                        }
+                    },
+                },
+                {
+                    "method": "session/update",
+                    "params": {"update": {"sessionUpdate": "turn_completed"}},
+                },
+            ]
+        )
+        + "\n"
+    )
+    sid = "019f4f0a-aaaa-bbbb-cccc-ddddeeeeffff"
+    subprocess.run(
+        ["bash", str(HANDLER)],
+        input=json.dumps(
+            {"hookEventName": "stop", "sessionId": sid, "cwd": "/p", "transcriptPath": str(acp)}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=8,
+        env={**state_env, "GROK_SESSION_ID": sid, "GROK_HOOK_EVENT": "stop"},
+        check=False,
+    )
+    reply = ""
+    for _ in range(20):
+        st = _state_file(state_env, sid)
+        if st.exists():
+            reply = json.loads(st.read_text()).get("last_reply", "")
+        if reply:
+            break
+        time.sleep(0.2)
+    assert reply == "A deadlock is mutual waiting."

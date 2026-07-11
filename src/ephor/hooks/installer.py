@@ -20,7 +20,11 @@ from pathlib import Path
 from typing import Any
 
 from ephor.config import claude_settings_path, hook_handler_path
-from ephor.providers import Provider, get_provider
+from ephor.providers import OPENCODE_PLUGIN, Provider, get_provider
+
+# Placeholder in opencode_plugin.js that the installer replaces with the
+# absolute event_handler.sh path at install time.
+_PLUGIN_HANDLER_PLACEHOLDER = "__EPHOR_HANDLER_PATH__"
 
 # Default provider when a caller doesn't specify one — preserves ephor's
 # original Claude-Code-only behaviour.
@@ -224,9 +228,88 @@ def _build_hook_entry(handler_path: Path, provider_name: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# opencode plugin strategy (no shell hooks — a generated JS plugin file)
+# ---------------------------------------------------------------------------
+
+
+def _opencode_plugin_source() -> str:
+    """The plugin JS with the absolute handler path injected."""
+    template = hook_handler_path().parent / "opencode_plugin.js"
+    return template.read_text().replace(_PLUGIN_HANDLER_PLACEHOLDER, str(hook_handler_path()))
+
+
+def _plan_install_plugin(prov: Provider) -> InstallPlan:
+    path = _settings_path_for(prov)
+    handler = hook_handler_path()
+    try:
+        current: str | None = path.read_text()
+    except OSError:
+        current = None
+    # Compare against the desired content so a stale plugin (e.g. handler path
+    # changed after a move/reinstall) is treated as "to install" and rewritten.
+    up_to_date = current == _opencode_plugin_source()
+    return InstallPlan(
+        settings_path=path,
+        handler_path=handler,
+        events_to_add=[] if up_to_date else list(prov.events),
+        events_already_installed=list(prov.events) if up_to_date else [],
+        backup_path=None,
+    )
+
+
+def _install_plugin(prov: Provider, *, dry_run: bool) -> InstallPlan:
+    plan = _plan_install_plugin(prov)
+    if dry_run or not plan.events_to_add:
+        return plan
+    backup = _make_backup(plan.settings_path)
+    _atomic_write(plan.settings_path, _opencode_plugin_source(), mode=0o600)
+    return InstallPlan(
+        settings_path=plan.settings_path,
+        handler_path=plan.handler_path,
+        events_to_add=plan.events_to_add,
+        events_already_installed=plan.events_already_installed,
+        backup_path=backup,
+    )
+
+
+def _plan_uninstall_plugin(prov: Provider) -> UninstallPlan:
+    path = _settings_path_for(prov)
+    # We own the file at this path (plugins/ephor.js), so its presence == installed.
+    installed = list(prov.events) if path.is_file() else []
+    return UninstallPlan(
+        settings_path=path,
+        handler_path=hook_handler_path(),
+        events_with_ephor_hook=installed,
+        backup_path=None,
+    )
+
+
+def _uninstall_plugin(prov: Provider, *, dry_run: bool) -> UninstallPlan:
+    plan = _plan_uninstall_plugin(prov)
+    if dry_run or not plan.events_with_ephor_hook:
+        return plan
+    backup = _make_backup(plan.settings_path)
+    with _suppress_oserror():
+        plan.settings_path.unlink()
+    return UninstallPlan(
+        settings_path=plan.settings_path,
+        handler_path=plan.handler_path,
+        events_with_ephor_hook=plan.events_with_ephor_hook,
+        backup_path=backup,
+    )
+
+
+# ---------------------------------------------------------------------------
+# public install / uninstall (dispatch on the provider's strategy)
+# ---------------------------------------------------------------------------
+
+
 def plan_install(provider: Provider | str | None = None) -> InstallPlan:
     """Compute (without applying) what `ephor init` would do for `provider`."""
     prov = _resolve_provider(provider)
+    if prov.install_kind == OPENCODE_PLUGIN:
+        return _plan_install_plugin(prov)
     settings_path = _settings_path_for(prov)
     handler = hook_handler_path()
     settings = _load_settings(settings_path)
@@ -253,6 +336,8 @@ def plan_install(provider: Provider | str | None = None) -> InstallPlan:
 def install(provider: Provider | str | None = None, *, dry_run: bool = False) -> InstallPlan:
     """Add ephor's hook entries to `provider`'s settings file. Returns the plan."""
     prov = _resolve_provider(provider)
+    if prov.install_kind == OPENCODE_PLUGIN:
+        return _install_plugin(prov, dry_run=dry_run)
     plan = plan_install(prov)
     if dry_run or not plan.events_to_add:
         return plan
@@ -285,6 +370,8 @@ def install(provider: Provider | str | None = None, *, dry_run: bool = False) ->
 def plan_uninstall(provider: Provider | str | None = None) -> UninstallPlan:
     """Compute (without applying) what `ephor uninstall` would do for `provider`."""
     prov = _resolve_provider(provider)
+    if prov.install_kind == OPENCODE_PLUGIN:
+        return _plan_uninstall_plugin(prov)
     settings_path = _settings_path_for(prov)
     handler = hook_handler_path()
     settings = _load_settings(settings_path)
@@ -308,6 +395,8 @@ def plan_uninstall(provider: Provider | str | None = None) -> UninstallPlan:
 def uninstall(provider: Provider | str | None = None, *, dry_run: bool = False) -> UninstallPlan:
     """Remove ephor's hook entries from `provider`'s settings file."""
     prov = _resolve_provider(provider)
+    if prov.install_kind == OPENCODE_PLUGIN:
+        return _uninstall_plugin(prov, dry_run=dry_run)
     plan = plan_uninstall(prov)
     if dry_run or not plan.events_with_ephor_hook:
         return plan
