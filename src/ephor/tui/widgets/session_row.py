@@ -1,7 +1,11 @@
 """2-row session card.
 
-Row 1: status icon + label / project / summary / tokens / sparkline / Jira
+Row 1: provider / project (colored by status) / summary / tokens / sparkline / Jira
 Row 2: dim italic conversation summary (last_summary, truncated)
+
+Status is conveyed by the *color* of the project name (green = working,
+grey = idle, red = waiting on permission, etc. — see STATUS_DISPLAY) rather
+than a leading icon/label cell.
 
 Sparkline data comes from `activity_samples`; if empty, render a dim placeholder
 so the column doesn't shift width when samples land later.
@@ -102,7 +106,9 @@ class SessionRow(Static):
         tokens: int | None = None,
         speaking: bool = False,
     ) -> None:
-        symbol, label, color = STATUS_DISPLAY[agent.status]
+        # Status is shown purely by color now (no icon/label cell); the color
+        # tints the project name below.
+        color = STATUS_DISPLAY[agent.status][2]
         spark = render_sparkline(samples or [])
         # WORKING + no recent hook = process is alive but stalled (model
         # timeout, network hang). Render a STALE marker that takes the place
@@ -137,10 +143,14 @@ class SessionRow(Static):
         # changes. Subtler than an emoji and matches the native TUI feel.
         speak_prefix = "[bold #00ffff]▌[/] " if speaking else "  "
 
+        # Provider column: which coding agent this session belongs to. Muted so
+        # the status color (on the project name) stays the primary signal.
+        provider_cell = f"[#8b949e]{(agent.provider or '—'):<8}[/]"
+
         primary = (
             f"{speak_prefix}"
-            f"[{color}]{symbol} {label:<4}[/] "
-            f"[bold]{agent.project_name or '—':<20}[/] "
+            f"{provider_cell} "
+            f"[bold {color}]{agent.project_name or '—':<20}[/] "
             f"{summary_cell} "
             f"{stale_badge}  "
             f"{tok_cell}  "

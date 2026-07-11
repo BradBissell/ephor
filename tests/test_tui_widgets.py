@@ -243,3 +243,42 @@ def test_session_row_prefers_summary_prefix_over_cwd(tmp_path: Path) -> None:
     rendered = str(row.render())
     assert "DR-2222" in rendered
     assert "DR-1111" not in rendered
+
+
+def test_session_row_shows_provider_column(tmp_path: Path) -> None:
+    """The provider (claude/grok/opencode/…) appears as its own cell."""
+    from ephor.tui.widgets.session_row import SessionRow
+
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(tmp_path))
+    agent.provider = "opencode"
+    row.update_agent(agent, summary="x")
+    rendered = str(row.render())
+    assert "opencode" in rendered
+
+
+def test_session_row_uses_color_not_icon_for_status(tmp_path: Path) -> None:
+    """Status is conveyed by the project-name color, not a leading icon/label
+    cell. render() resolves markup to plain text, so we assert the removal
+    contract there; that the status color markup is well-formed is covered by
+    test_app_renders_every_status_without_crashing."""
+    from ephor.tui.widgets.session_row import SessionRow
+
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(tmp_path))  # WORKING
+    agent.provider = "grok"
+    row.update_agent(agent, summary="x")
+    rendered = str(row.render())
+    for gone in ("WORK", "IDLE", ">>>", "---", "[!]", "[?]"):
+        assert gone not in rendered, gone
+    assert "proj" in rendered  # project name still shown (tinted by status color)
+
+
+def test_session_row_provider_placeholder_when_unknown(tmp_path: Path) -> None:
+    from ephor.tui.widgets.session_row import SessionRow
+
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(tmp_path))  # provider defaults to ""
+    row.update_agent(agent, summary="x")
+    rendered = str(row.render())
+    assert "—" in rendered
