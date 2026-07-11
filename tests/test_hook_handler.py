@@ -666,3 +666,67 @@ def test_rejects_non_lowercase_provider(state_env: dict[str, str]) -> None:
         "../evil", {"session_id": sid, "hook_event_name": "SessionStart", "cwd": "/p"}, state_env
     )
     assert _read_state(state_env, sid)["provider"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Grok Build dialect (camelCase keys, snake_case event values, env detection)
+# ---------------------------------------------------------------------------
+
+
+def _fire_grok(
+    event_value: str, input_json: dict[str, object], env: dict[str, str], sid: str
+) -> subprocess.CompletedProcess[str]:
+    """Fire as xAI Grok Build would: EPHOR_PROVIDER=claude (via ~/.claude compat)
+    but GROK_* env set, and a camelCase payload."""
+    return subprocess.run(
+        ["bash", str(HANDLER)],
+        input=json.dumps(input_json),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env={
+            **env,
+            "EPHOR_PROVIDER": "claude",
+            "GROK_SESSION_ID": sid,
+            "GROK_HOOK_EVENT": event_value,
+        },
+        check=False,
+    )
+
+
+def test_grok_build_dialect_is_parsed_and_labeled(state_env: dict[str, str]) -> None:
+    sid = "019f4f01-8ec5-77c2-8ecb-a85fbb656d44"
+    # snake_case hookEventName + camelCase sessionId, as Grok Build sends.
+    _fire_grok(
+        "pre_tool_use",
+        {
+            "hookEventName": "pre_tool_use",
+            "sessionId": sid,
+            "cwd": "/proj",
+            "toolName": "run_terminal_command",
+        },
+        state_env,
+        sid,
+    )
+    state = _read_state(state_env, sid)
+    # session id came from .sessionId; snake_case event normalized to PascalCase.
+    assert state["last_event"] == "PreToolUse"
+    assert state["status"] == "WORKING"
+    assert state["tool_count"] == 1
+    # provider corrected to grok via the GROK_* env, despite EPHOR_PROVIDER=claude.
+    assert state["provider"] == "grok"
+
+
+def test_grok_build_stop_maps_to_idle(state_env: dict[str, str]) -> None:
+    sid = "019f4f01-dead-beef-cafe-000000000000"
+    _fire_grok(
+        "session_start",
+        {"hookEventName": "session_start", "sessionId": sid, "cwd": "/p"},
+        state_env,
+        sid,
+    )
+    _fire_grok("stop", {"hookEventName": "stop", "sessionId": sid, "cwd": "/p"}, state_env, sid)
+    state = _read_state(state_env, sid)
+    assert state["last_event"] == "Stop"
+    assert state["status"] == "IDLE"
+    assert state["provider"] == "grok"

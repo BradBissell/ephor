@@ -395,7 +395,7 @@ def provider_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str,
     monkeypatch.setattr(installer, "claude_settings_path", lambda: paths["claude"])
     monkeypatch.setenv("GEMINI_SETTINGS_PATH", str(paths["gemini"]))
     monkeypatch.setenv("CODEX_HOOKS_PATH", str(paths["codex"]))
-    monkeypatch.setenv("GROK_SETTINGS_PATH", str(paths["grok"]))
+    monkeypatch.setenv("GROK_HOOKS_PATH", str(paths["grok"]))
     return paths
 
 

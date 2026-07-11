@@ -48,7 +48,7 @@ def test_known_binaries_match_providers() -> None:
 
 
 def test_settings_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GROK_SETTINGS_PATH", "/tmp/custom/grok.json")
+    monkeypatch.setenv("GROK_HOOKS_PATH", "/tmp/custom/grok.json")
     assert providers.get_provider("grok").settings_path() == Path("/tmp/custom/grok.json")
 
 
@@ -67,4 +67,4 @@ def test_gemini_uses_before_after_event_dialect() -> None:
 
 
 def test_grok_carries_resume_flags() -> None:
-    assert providers.get_provider("grok").resume_flags == ("-s", "--session")
+    assert providers.get_provider("grok").resume_flags == ("--resume", "-r")

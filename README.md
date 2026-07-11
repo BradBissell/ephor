@@ -20,7 +20,7 @@ which are still working, and which went idle.
 | **Claude Code** | `~/.claude/settings.json` | `hooks` object, command + stdin JSON |
 | **Gemini CLI** | `~/.gemini/settings.json` | same `hooks` shape (`Before*`/`After*` events) |
 | **Codex CLI** | `~/.codex/hooks.json` | dedicated hooks file, command + stdin JSON |
-| **Grok CLI** ([superagent-ai/grok-cli](https://github.com/superagent-ai/grok-cli)) | `~/.grok/user-settings.json` | same `hooks` shape |
+| **Grok** (xAI Grok Build) | `~/.grok/hooks/ephor.json` | JSON hooks file; camelCase/snake_case dialect |
 | **OpenCode** | `~/.config/opencode/plugins/ephor.js` | bundled JS plugin → shells out to the handler |
 
 The first four share the stdin-JSON hook model, so one shell handler serves

@@ -61,6 +61,14 @@ PROVIDER="${EPHOR_PROVIDER:-}"
 case "$PROVIDER" in
   *[!a-z]*) PROVIDER="" ;;  # canonical names are lowercase ascii; reject anything else
 esac
+# Grok Build (xAI's official CLI) reads Claude-compatible hooks from
+# ~/.claude/settings.json too, so ephor's claude hook fires inside grok
+# sessions carrying EPHOR_PROVIDER=claude. Grok Build sets GROK_SESSION_ID /
+# GROK_HOOK_EVENT on every hook process (Claude Code never does), so detect it
+# and correct the provider label.
+if [ -n "${GROK_HOOK_EVENT:-}${GROK_SESSION_ID:-}" ]; then
+  PROVIDER="grok"
+fi
 
 mkdir -p "$STATE_DIR" "$PENDING_DIR" "$LOCK_DIR" 2>/dev/null || ephor_exit_open
 chmod 0700 "$STATE_DIR" "$PENDING_DIR" "$LOCK_DIR" 2>/dev/null || true
@@ -72,7 +80,8 @@ INPUT_JSON="$(cat)"
 # Probe for jq early — if missing, fail open silently.
 command -v jq >/dev/null 2>&1 || ephor_exit_open
 
-SESSION_ID="$(printf '%s' "$INPUT_JSON" | jq -r '.session_id // empty')"
+# session id: `.session_id` (claude/gemini/codex) or `.sessionId` (grok build / cursor)
+SESSION_ID="$(printf '%s' "$INPUT_JSON" | jq -r '.session_id // .sessionId // empty')"
 [ -z "$SESSION_ID" ] && ephor_exit_open
 
 # Defensive: anchor session_id to safe characters before path use.
@@ -80,7 +89,14 @@ case "$SESSION_ID" in
   *[!a-zA-Z0-9_-]*) ephor_exit_open ;;
 esac
 
-EVENT_NAME="$(printf '%s' "$INPUT_JSON" | jq -r '.hook_event_name // empty')"
+# event name: `.hook_event_name` or grok build / cursor `.hookEventName`. Grok
+# Build's values are snake_case (`session_start`, `pre_tool_use`, `stop`), so
+# normalize any snake_case/lowercase name to PascalCase — idempotent for the
+# PascalCase names the other agents already send.
+EVENT_NAME="$(printf '%s' "$INPUT_JSON" | jq -r '.hook_event_name // .hookEventName // empty')"
+[ -z "$EVENT_NAME" ] && ephor_exit_open
+EVENT_NAME="$(printf '%s' "$EVENT_NAME" | awk -F_ \
+  '{o=""; for (i=1;i<=NF;i++) o=o toupper(substr($i,1,1)) substr($i,2); print o}')"
 [ -z "$EVENT_NAME" ] && ephor_exit_open
 
 CWD="$(printf '%s' "$INPUT_JSON" | jq -r '.cwd // empty')"
@@ -501,7 +517,7 @@ case "$EVENT_NAME" in
     ;;
 
   PermissionRequest)
-    TOOL_NAME="$(printf '%s' "$INPUT_JSON" | jq -r '.tool_name // "unknown"')"
+    TOOL_NAME="$(printf '%s' "$INPUT_JSON" | jq -r '.tool_name // .toolName // "unknown"')"
     base_state \
       | jq -c \
           --arg tool "$TOOL_NAME" \

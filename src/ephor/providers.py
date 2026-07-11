@@ -178,13 +178,18 @@ PROVIDERS: dict[str, Provider] = {
     ),
     "grok": Provider(
         name="grok",
-        display_name="Grok CLI",
+        display_name="Grok (Build) CLI",
         binary="grok",
         install_kind=SETTINGS_JSON_HOOKS,
         events=_GROK_EVENTS,
-        _settings="~/.grok/user-settings.json",
-        settings_env="GROK_SETTINGS_PATH",
-        resume_flags=("-s", "--session"),
+        # xAI's Grok Build reads hook JSON files from ~/.grok/hooks/ (its native
+        # location) — NOT ~/.grok/user-settings.json. It also scans
+        # ~/.claude/settings.json by default (Claude compat), and sends a
+        # camelCase/snake_case payload the handler normalizes; grok sessions are
+        # detected at runtime via the GROK_SESSION_ID env var it sets.
+        _settings="~/.grok/hooks/ephor.json",
+        settings_env="GROK_HOOKS_PATH",
+        resume_flags=("--resume", "-r"),
         summarize_cmd=None,
     ),
     "opencode": Provider(
