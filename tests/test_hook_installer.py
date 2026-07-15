@@ -448,6 +448,66 @@ def test_codex_writes_dedicated_hooks_json(provider_paths: dict[str, Path]) -> N
     assert not provider_paths["claude"].exists()
 
 
+def test_codex_entries_omit_async(provider_paths: dict[str, Path]) -> None:
+    """Regression: codex silently skips hooks carrying `async` ("async hooks
+    are not supported yet"), so ephor's codex entries must NOT set it — a
+    synchronous entry with a timeout guard instead."""
+    from ephor.providers import get_provider
+
+    installer.install("codex")
+    data = json.loads(provider_paths["codex"].read_text())
+    for event in get_provider("codex").events:
+        inner = data["hooks"][event][0]["hooks"][0]
+        assert "async" not in inner, f"{event}: codex entry must not carry async"
+        assert inner["timeout"] == 30
+
+
+def test_claude_entries_keep_async(provider_paths: dict[str, Path]) -> None:
+    """Claude-shaped agents still mark hooks async (non-blocking)."""
+    installer.install("claude")
+    data = json.loads(provider_paths["claude"].read_text())
+    inner = data["hooks"]["SessionStart"][0]["hooks"][0]
+    assert inner.get("async") is True
+    assert "timeout" not in inner
+
+
+def test_reinstall_rewrites_stale_async_codex_entry(provider_paths: dict[str, Path]) -> None:
+    """Regression: upgrading and re-running `ephor init --provider codex` must
+    REPLACE a pre-fix `async: true` entry (which codex silently skips), not
+    treat it as already-installed and no-op."""
+    handler = installer.hook_handler_path()
+    # Seed the exact buggy shape ephor used to write before the async fix.
+    stale = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f'EPHOR_PROVIDER=codex "{handler}"',
+                            "async": True,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    provider_paths["codex"].write_text(json.dumps(stale))
+
+    # The stale entry must be seen as needing reinstall, not already-installed.
+    plan = installer.plan_install("codex")
+    assert "SessionStart" in plan.events_to_add
+
+    installer.install("codex")
+    entries = json.loads(provider_paths["codex"].read_text())["hooks"]["SessionStart"]
+    ephor = [e for e in entries if str(handler) in e["hooks"][0]["command"]]
+    assert len(ephor) == 1, "stale entry must be replaced in place, not duplicated"
+    inner = ephor[0]["hooks"][0]
+    assert "async" not in inner, "async must be gone after reinstall"
+    assert inner["timeout"] == 30
+
+
 # ---------------------------------------------------------------------------
 # opencode plugin strategy
 # ---------------------------------------------------------------------------

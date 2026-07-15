@@ -63,6 +63,13 @@ class Provider:
     # Command prefix used by summary-mode TTS to condense a reply, e.g.
     # ("claude", "-p"). None → summary mode falls back to the full reply.
     summarize_cmd: tuple[str, ...] | None = None
+    # Extra key/value pairs added to each inner hook object. Claude (and the
+    # agents that inherit its `hooks` shape) mark the hook non-blocking with
+    # `async: true`. Codex, despite sharing the JSON shape, does NOT support
+    # async hooks — it *silently skips* any entry carrying `async`, so ephor's
+    # hooks never run. Codex therefore overrides this to drop `async` (a
+    # `timeout` guard instead).
+    hook_entry_extra: tuple[tuple[str, object], ...] = (("async", True),)
 
     def settings_path(self) -> Path:
         """Resolve the config file the installer reads/writes for this provider."""
@@ -175,6 +182,10 @@ PROVIDERS: dict[str, Provider] = {
         settings_env="CODEX_HOOKS_PATH",
         resume_flags=(),
         summarize_cmd=("codex", "exec"),
+        # Codex skips async hooks ("async hooks are not supported yet"), so use
+        # a plain synchronous entry with a timeout guard. The handler is <15ms
+        # and fails open, so running synchronously is safe.
+        hook_entry_extra=(("timeout", 30),),
     ),
     "grok": Provider(
         name="grok",

@@ -208,21 +208,31 @@ def _is_ephor_entry(entry: dict[str, Any], handler_path: Path) -> bool:
     return False
 
 
-def _build_hook_entry(handler_path: Path, provider_name: str) -> dict[str, Any]:
+def _build_hook_entry(handler_path: Path, prov: Provider) -> dict[str, Any]:
     """Build the hooks-array entry inserted under each event.
 
     The command tags the handler with EPHOR_PROVIDER so the shell handler knows
     which agent fired it (for the recorded ``provider`` field and event-name
     dialect handling). The event name itself travels in the stdin JSON, so we
     don't need it on the command line.
+
+    The inner hook object carries the provider's ``hook_entry_extra`` — ``async:
+    true`` for Claude-shaped agents, but a ``timeout`` (no async) for Codex,
+    which silently skips async hooks.
     """
+    extra = dict(prov.hook_entry_extra)
+    # hook_entry_extra is provider-authored; never let it silently clobber the
+    # fixed fields (a stray "command" key would hijack the hook).
+    assert not (extra.keys() & {"type", "command"}), (
+        f"{prov.name}: hook_entry_extra must not override type/command"
+    )
     return {
         "matcher": "",
         "hooks": [
             {
                 "type": "command",
-                "command": (f'EPHOR_PROVIDER={provider_name} "{handler_path}"'),
-                "async": True,
+                "command": (f'EPHOR_PROVIDER={prov.name} "{handler_path}"'),
+                **extra,
             }
         ],
     }
@@ -315,14 +325,21 @@ def plan_install(provider: Provider | str | None = None) -> InstallPlan:
     settings = _load_settings(settings_path)
     hooks_root = settings.get("hooks") or {}
 
+    # An event is "already installed" only if OUR entry matches the current
+    # desired shape. A stale ephor entry (e.g. a pre-fix codex hook still
+    # carrying `async: true`, which codex silently skips) counts as needing
+    # reinstall — otherwise re-running `ephor init` after an upgrade is a no-op
+    # and the fix never lands.
+    desired = _build_hook_entry(handler, prov)
     already: list[str] = []
     to_add: list[str] = []
     for event in prov.events:
         entries = hooks_root.get(event) or []
-        if any(_is_ephor_entry(e, handler) for e in entries):
+        ephor_entries = [e for e in entries if _is_ephor_entry(e, handler)]
+        if ephor_entries and all(e == desired for e in ephor_entries):
             already.append(event)
         else:
-            to_add.append(event)
+            to_add.append(event)  # absent OR stale
 
     return InstallPlan(
         settings_path=settings_path,
@@ -348,9 +365,16 @@ def install(provider: Provider | str | None = None, *, dry_run: bool = False) ->
     backup = _make_backup(settings_path)
     settings = _load_settings(settings_path)
     hooks_root = settings.setdefault("hooks", {})
+    desired = _build_hook_entry(handler, prov)
     for event in plan.events_to_add:
         entries = hooks_root.setdefault(event, [])
-        entries.append(_build_hook_entry(handler, prov.name))
+        # Drop any pre-existing ephor entries (possibly stale, e.g. old
+        # async:true) before appending the current desired one, so re-running
+        # init self-heals in place instead of leaving the stale entry or
+        # duplicating. Non-ephor entries are preserved untouched.
+        kept = [e for e in entries if not _is_ephor_entry(e, handler)]
+        kept.append(desired)
+        hooks_root[event] = kept
 
     _atomic_write(
         settings_path,
