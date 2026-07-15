@@ -4,10 +4,10 @@
 # Receives event JSON on stdin from a coding-agent CLI's hooks and writes
 # per-session state files to $EPHOR_STATE_DIR (default:
 # $XDG_STATE_HOME/ephor/sessions/). One handler serves every supported agent —
-# Claude Code, Gemini CLI, Codex CLI and Grok CLI — because they all deliver
-# {session_id, cwd, hook_event_name, ...} on stdin. The installer tells us which
-# one fired via EPHOR_PROVIDER; we also accept each agent's event-name and
-# field-name dialect (see the event branches below).
+# Claude Code, Gemini CLI, Codex CLI, Grok CLI and Google Antigravity (agy) —
+# because they all deliver {session_id, cwd, hook_event_name, ...} on stdin. The
+# installer tells us which one fired via EPHOR_PROVIDER; we also accept each
+# agent's event-name and field-name dialect (see the event branches below).
 #
 # Design contract:
 #   * Fail OPEN. ANY failure → exit 0, no output, no error to the agent.
@@ -20,7 +20,8 @@
 #
 # Canonical events handled (+ per-provider aliases in the case statement):
 #   SessionStart, SessionEnd, UserPromptSubmit (BeforeAgent)
-#   PreToolUse (BeforeTool), PostToolUse (AfterTool), PostToolUseFailure
+#   PreInvocation (agy: model call starting), PreToolUse (BeforeTool),
+#   PostToolUse (AfterTool), PostToolUseFailure
 #   Notification, PermissionRequest, PermissionDenied
 #   Stop / StopFailure / AfterAgent, SubagentStart, SubagentStop
 #
@@ -54,10 +55,13 @@ PENDING_DIR="${EPHOR_PENDING_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ephor/pe
 LOCK_DIR="${EPHOR_LOCK_DIR:-${XDG_RUNTIME_DIR:-/tmp}/ephor/locks}"
 SCHEMA_VERSION=3
 
-# Which coding-agent CLI fired this hook. Set by the installer in the
-# registered command (EPHOR_PROVIDER=<name>). Empty when the handler is invoked
-# directly (tests, manual runs) — recorded verbatim, never trusted for paths.
-PROVIDER="${EPHOR_PROVIDER:-}"
+# Which coding-agent CLI fired this hook. Most agents set it via a shell
+# env-prefix in the registered command (EPHOR_PROVIDER=<name>). Google
+# Antigravity (agy) can't do that — it shlex-splits + execs directly, no shell —
+# so its installer passes the provider as the FIRST positional argument instead
+# (`bash <handler> agy <event>`). Prefer the env; fall back to $1. Empty when
+# invoked bare (tests) — recorded verbatim, never trusted for paths.
+PROVIDER="${EPHOR_PROVIDER:-${1:-}}"
 case "$PROVIDER" in
   *[!a-z]*) PROVIDER="" ;;  # canonical names are lowercase ascii; reject anything else
 esac
@@ -80,8 +84,9 @@ INPUT_JSON="$(cat)"
 # Probe for jq early — if missing, fail open silently.
 command -v jq >/dev/null 2>&1 || ephor_exit_open
 
-# session id: `.session_id` (claude/gemini/codex) or `.sessionId` (grok build / cursor)
-SESSION_ID="$(printf '%s' "$INPUT_JSON" | jq -r '.session_id // .sessionId // empty')"
+# session id: `.session_id` (claude/gemini/codex), `.sessionId` (grok build /
+# cursor), or `.conversationId` (Google Antigravity / agy).
+SESSION_ID="$(printf '%s' "$INPUT_JSON" | jq -r '.session_id // .sessionId // .conversationId // empty')"
 [ -z "$SESSION_ID" ] && ephor_exit_open
 
 # Defensive: anchor session_id to safe characters before path use.
@@ -93,13 +98,22 @@ esac
 # Build's values are snake_case (`session_start`, `pre_tool_use`, `stop`), so
 # normalize any snake_case/lowercase name to PascalCase — idempotent for the
 # PascalCase names the other agents already send.
+#
+# Google Antigravity (agy) does NOT put the event name in the payload at all.
+# Since agy execs the command directly (no shell), its installer passes the
+# event as the SECOND positional argument (`bash <handler> agy <event>`); fall
+# back to it — or to EPHOR_EVENT if some caller set it — when stdin carries no
+# event name. It's our own trusted value.
 EVENT_NAME="$(printf '%s' "$INPUT_JSON" | jq -r '.hook_event_name // .hookEventName // empty')"
+[ -z "$EVENT_NAME" ] && EVENT_NAME="${EPHOR_EVENT:-${2:-}}"
 [ -z "$EVENT_NAME" ] && ephor_exit_open
 EVENT_NAME="$(printf '%s' "$EVENT_NAME" | awk -F_ \
   '{o=""; for (i=1;i<=NF;i++) o=o toupper(substr($i,1,1)) substr($i,2); print o}')"
 [ -z "$EVENT_NAME" ] && ephor_exit_open
 
-CWD="$(printf '%s' "$INPUT_JSON" | jq -r '.cwd // empty')"
+# cwd: `.cwd` (most agents) or agy's `.workspacePaths[0]` (it sends an array of
+# mounted workspace dirs and no scalar cwd).
+CWD="$(printf '%s' "$INPUT_JSON" | jq -r '.cwd // (.workspacePaths[0]?) // empty')"
 [ -z "$CWD" ] && CWD="$PWD"
 PROJECT_NAME="$(basename -- "$CWD")"
 
@@ -335,6 +349,13 @@ store_last_reply() {
   # the write atomic regardless. Best-effort; never blocks.
   local sid="$1" reply="$2"
   [ -z "$sid" ] && return 0
+  # Defense-in-depth: this runs in a backgrounded subshell that re-parses the
+  # session id from the hook JSON, so re-anchor to safe chars here rather than
+  # trusting the top-level gate — keeps the path construction below locally safe
+  # even if a future call site skips the main handler's SESSION_ID check.
+  case "$sid" in
+    *[!a-zA-Z0-9_-]*) return 0 ;;
+  esac
   local sf="$STATE_DIR/$sid.json"
   [ -f "$sf" ] || return 0
   reply="$(printf '%s' "$reply" | head -c 2000)"
@@ -353,10 +374,11 @@ emit_speech_start_event() {
   # exited by the time we get here.
   local hook_json="$1"
   local sid transcript cwd text
-  sid="$(printf '%s' "$hook_json" | jq -r '.session_id // .sessionId // empty' 2>/dev/null)"
-  # transcript path: `.transcript_path` (claude/gemini) or `.transcriptPath` (grok build)
+  sid="$(printf '%s' "$hook_json" | jq -r '.session_id // .sessionId // .conversationId // empty' 2>/dev/null)"
+  # transcript path: `.transcript_path` (claude/gemini), `.transcriptPath` (grok
+  # build / agy)
   transcript="$(printf '%s' "$hook_json" | jq -r '.transcript_path // .transcriptPath // empty' 2>/dev/null)"
-  cwd="$(printf '%s' "$hook_json" | jq -r '.cwd // empty' 2>/dev/null)"
+  cwd="$(printf '%s' "$hook_json" | jq -r '.cwd // (.workspacePaths[0]?) // empty' 2>/dev/null)"
   [ -z "$sid" ] && return 0
 
   # Provider-agnostic reply capture. Prefer the reply text delivered directly
@@ -519,6 +541,14 @@ case "$EVENT_NAME" in
 
   # Tool finished → still WORKING. claude/codex/grok: PostToolUse · gemini: AfterTool
   PostToolUse | AfterTool)
+    base_state | jq -c '. + {status: "WORKING", notification: null}' | write_state
+    ;;
+
+  # Model invocation starting (agy: PreInvocation) → WORKING. Marks the session
+  # busy the moment the model is called, so a tool-free turn (a plain answer
+  # that never fires PreToolUse) still shows activity instead of staying IDLE
+  # until Stop.
+  PreInvocation)
     base_state | jq -c '. + {status: "WORKING", notification: null}' | write_state
     ;;
 

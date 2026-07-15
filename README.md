@@ -5,13 +5,13 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
 A Linux-native TUI that watches every terminal coding-agent session you
-have running — **Claude Code, Gemini CLI, Codex CLI, Grok CLI, and
-OpenCode** — and tells you, at a glance, which ones need your attention,
-which are still working, and which went idle.
+have running — **Claude Code, Gemini CLI, Antigravity CLI, Codex CLI, Grok
+CLI, and OpenCode** — and tells you, at a glance, which ones need your
+attention, which are still working, and which went idle.
 
 > `ephor` (Greek *ἔφορος*, "overseer") began as `cco`, a Claude-Code-only
-> dashboard. It now speaks the hook protocol of four coding agents that
-> share Claude Code's stdin-JSON hook model.
+> dashboard. It now speaks the hook protocol of five coding agents that
+> share Claude Code's stdin-JSON hook model, plus OpenCode via a plugin.
 
 ## Supported agents
 
@@ -19,16 +19,20 @@ which are still working, and which went idle.
 |---|---|---|
 | **Claude Code** | `~/.claude/settings.json` | `hooks` object, command + stdin JSON |
 | **Gemini CLI** | `~/.gemini/settings.json` | same `hooks` shape (`Before*`/`After*` events) |
+| **Antigravity CLI** (Google `agy`) | `~/.gemini/antigravity-cli/hooks.json` | dedicated hooks file keyed by a named hook group; `PreInvocation`/`PreToolUse`/`PostToolUse`/`Stop` events |
 | **Codex CLI** | `~/.codex/hooks.json` | dedicated hooks file, command + stdin JSON |
 | **Grok** (xAI Grok Build) | `~/.grok/hooks/ephor.json` | JSON hooks file; camelCase/snake_case dialect |
 | **OpenCode** | `~/.config/opencode/plugins/ephor.js` | bundled JS plugin → shells out to the handler |
 
-The first four share the stdin-JSON hook model, so one shell handler serves
+The first five share the stdin-JSON hook model, so one shell handler serves
 them all — it understands each agent's event-name and field-name dialect and
-records which agent a session belongs to. OpenCode has no shell hooks, so
-`ephor init --provider opencode` installs a tiny JS **plugin** that translates
-OpenCode's bus events and pipes them into the *same* handler — so every agent
-funnels through one state writer.
+records which agent a session belongs to. Antigravity (the Gemini CLI
+successor; its binary is `agy`, not `antigravity`) uses the same stdin JSON but
+keys its hooks file by a named group rather than a top-level `hooks` object, so
+its config lands at `~/.gemini/antigravity-cli/hooks.json`. OpenCode has no
+shell hooks, so `ephor init --provider opencode` installs a tiny JS **plugin**
+that translates OpenCode's bus events and pipes them into the *same* handler —
+so every agent funnels through one state writer.
 
 <img width="2806" height="1972" alt="image" src="https://github.com/user-attachments/assets/50f4b678-2da8-4ee1-b52e-3d148ce4ae7c" />
 

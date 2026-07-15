@@ -20,7 +20,14 @@ from pathlib import Path
 from typing import Any
 
 from ephor.config import claude_settings_path, hook_handler_path
-from ephor.providers import OPENCODE_PLUGIN, Provider, get_provider
+from ephor.providers import (
+    AGY_DIRECT_EVENTS,
+    AGY_HOOK_GROUP,
+    AGY_HOOKS_JSON,
+    OPENCODE_PLUGIN,
+    Provider,
+    get_provider,
+)
 
 # Placeholder in opencode_plugin.js that the installer replaces with the
 # absolute event_handler.sh path at install time.
@@ -311,6 +318,121 @@ def _uninstall_plugin(prov: Provider, *, dry_run: bool) -> UninstallPlan:
 
 
 # ---------------------------------------------------------------------------
+# antigravity (agy) strategy — a dedicated hooks.json keyed by a named group
+# ---------------------------------------------------------------------------
+#
+# agy's hooks.json maps a *named hook group* → {event: config}. ephor owns one
+# group (AGY_HOOK_GROUP); we write it wholesale and delete it on uninstall, so
+# any groups the user authored are never touched. Two quirks vs the other
+# agents: (1) PreInvocation/PostInvocation/Stop take a *direct* handler list
+# while PreToolUse/PostToolUse use the `{matcher, hooks: [...]}` wrapper, and
+# (2) the stdin payload has no event-name field, so each command is tagged with
+# EPHOR_EVENT=<name> (the handler falls back to it).
+
+
+def _agy_handler_obj(handler_path: Path, event: str) -> dict[str, Any]:
+    """One command-handler object for an agy event.
+
+    CRITICAL — agy does NOT run the command through a shell. It tokenizes the
+    string with a shell-lexer (shlex) and execs argv directly. So the
+    ``VAR=value cmd`` shell env-prefix the other agents use does NOT work here:
+    agy would try to exec a program literally named ``EPHOR_PROVIDER=agy``. We
+    therefore invoke ``bash`` explicitly and pass provider + event as positional
+    ARGUMENTS (agy sends no event name in the payload). ``bash`` also frees us
+    from the handler needing an executable bit / resolvable shebang under direct
+    exec. The handler reads ``$1``/``$2`` as the provider/event fallback.
+    """
+    return {
+        "type": "command",
+        "command": f'bash "{handler_path}" agy {event}',
+        "timeout": 30,
+    }
+
+
+def _agy_group_value(handler_path: Path, events: tuple[str, ...]) -> dict[str, Any]:
+    """Build the full {event: config} object for ephor's named hook group,
+    using each event family's required nesting."""
+    group: dict[str, Any] = {}
+    for event in events:
+        obj = _agy_handler_obj(handler_path, event)
+        if event in AGY_DIRECT_EVENTS:
+            group[event] = [obj]  # direct handler list; matcher ignored
+        else:
+            group[event] = [{"matcher": "", "hooks": [obj]}]
+    return group
+
+
+def _plan_install_agy(prov: Provider) -> InstallPlan:
+    path = _settings_path_for(prov)
+    handler = hook_handler_path()
+    settings = _load_settings(path)
+    desired = _agy_group_value(handler, prov.events)
+    # Compare against desired so a stale group (handler moved, schema changed)
+    # is treated as "to install" and rewritten.
+    up_to_date = settings.get(AGY_HOOK_GROUP) == desired
+    return InstallPlan(
+        settings_path=path,
+        handler_path=handler,
+        events_to_add=[] if up_to_date else list(prov.events),
+        events_already_installed=list(prov.events) if up_to_date else [],
+        backup_path=None,
+    )
+
+
+def _install_agy(prov: Provider, *, dry_run: bool) -> InstallPlan:
+    plan = _plan_install_agy(prov)
+    if dry_run or not plan.events_to_add:
+        return plan
+    backup = _make_backup(plan.settings_path)
+    settings = _load_settings(plan.settings_path)
+    settings[AGY_HOOK_GROUP] = _agy_group_value(plan.handler_path, prov.events)
+    _atomic_write(
+        plan.settings_path,
+        json.dumps(settings, indent=2, sort_keys=False) + "\n",
+        mode=0o600,
+    )
+    return InstallPlan(
+        settings_path=plan.settings_path,
+        handler_path=plan.handler_path,
+        events_to_add=plan.events_to_add,
+        events_already_installed=plan.events_already_installed,
+        backup_path=backup,
+    )
+
+
+def _plan_uninstall_agy(prov: Provider) -> UninstallPlan:
+    path = _settings_path_for(prov)
+    settings = _load_settings(path)
+    installed = list(prov.events) if AGY_HOOK_GROUP in settings else []
+    return UninstallPlan(
+        settings_path=path,
+        handler_path=hook_handler_path(),
+        events_with_ephor_hook=installed,
+        backup_path=None,
+    )
+
+
+def _uninstall_agy(prov: Provider, *, dry_run: bool) -> UninstallPlan:
+    plan = _plan_uninstall_agy(prov)
+    if dry_run or not plan.events_with_ephor_hook:
+        return plan
+    backup = _make_backup(plan.settings_path)
+    settings = _load_settings(plan.settings_path)
+    settings.pop(AGY_HOOK_GROUP, None)
+    _atomic_write(
+        plan.settings_path,
+        json.dumps(settings, indent=2, sort_keys=False) + "\n",
+        mode=0o600,
+    )
+    return UninstallPlan(
+        settings_path=plan.settings_path,
+        handler_path=plan.handler_path,
+        events_with_ephor_hook=plan.events_with_ephor_hook,
+        backup_path=backup,
+    )
+
+
+# ---------------------------------------------------------------------------
 # public install / uninstall (dispatch on the provider's strategy)
 # ---------------------------------------------------------------------------
 
@@ -320,6 +442,8 @@ def plan_install(provider: Provider | str | None = None) -> InstallPlan:
     prov = _resolve_provider(provider)
     if prov.install_kind == OPENCODE_PLUGIN:
         return _plan_install_plugin(prov)
+    if prov.install_kind == AGY_HOOKS_JSON:
+        return _plan_install_agy(prov)
     settings_path = _settings_path_for(prov)
     handler = hook_handler_path()
     settings = _load_settings(settings_path)
@@ -329,7 +453,8 @@ def plan_install(provider: Provider | str | None = None) -> InstallPlan:
     # desired shape. A stale ephor entry (e.g. a pre-fix codex hook still
     # carrying `async: true`, which codex silently skips) counts as needing
     # reinstall — otherwise re-running `ephor init` after an upgrade is a no-op
-    # and the fix never lands.
+    # and the fix never lands. Mirrors the desired-content check the opencode
+    # and agy strategies already do.
     desired = _build_hook_entry(handler, prov)
     already: list[str] = []
     to_add: list[str] = []
@@ -355,6 +480,8 @@ def install(provider: Provider | str | None = None, *, dry_run: bool = False) ->
     prov = _resolve_provider(provider)
     if prov.install_kind == OPENCODE_PLUGIN:
         return _install_plugin(prov, dry_run=dry_run)
+    if prov.install_kind == AGY_HOOKS_JSON:
+        return _install_agy(prov, dry_run=dry_run)
     plan = plan_install(prov)
     if dry_run or not plan.events_to_add:
         return plan
@@ -396,6 +523,8 @@ def plan_uninstall(provider: Provider | str | None = None) -> UninstallPlan:
     prov = _resolve_provider(provider)
     if prov.install_kind == OPENCODE_PLUGIN:
         return _plan_uninstall_plugin(prov)
+    if prov.install_kind == AGY_HOOKS_JSON:
+        return _plan_uninstall_agy(prov)
     settings_path = _settings_path_for(prov)
     handler = hook_handler_path()
     settings = _load_settings(settings_path)
@@ -421,6 +550,8 @@ def uninstall(provider: Provider | str | None = None, *, dry_run: bool = False) 
     prov = _resolve_provider(provider)
     if prov.install_kind == OPENCODE_PLUGIN:
         return _uninstall_plugin(prov, dry_run=dry_run)
+    if prov.install_kind == AGY_HOOKS_JSON:
+        return _uninstall_agy(prov, dry_run=dry_run)
     plan = plan_uninstall(prov)
     if dry_run or not plan.events_with_ephor_hook:
         return plan

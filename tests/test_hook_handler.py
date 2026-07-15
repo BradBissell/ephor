@@ -627,6 +627,110 @@ def test_gemini_after_agent_maps_to_idle(state_env: dict[str, str]) -> None:
     assert _read_state(state_env, sid)["status"] == "IDLE"
 
 
+def _fire_agy(
+    event: str, input_json: dict[str, object], env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Fire the handler exactly as the agy installer registers it: agy execs
+    `bash <handler> agy <event>` directly (no shell), passing provider + event
+    as positional args — NOT env vars — because agy sends no event name in the
+    payload and doesn't honour shell env-prefixes."""
+    return subprocess.run(
+        ["bash", str(HANDLER), "agy", event],
+        input=json.dumps(input_json),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env=env,  # deliberately NO EPHOR_PROVIDER / EPHOR_EVENT
+        check=False,
+    )
+
+
+def test_agy_dialect_conversation_id_and_event_env(state_env: dict[str, str]) -> None:
+    """agy identifies the session by conversationId, carries cwd in
+    workspacePaths[], and sends NO event name — the handler must derive it all."""
+    sid = "ec33ebf9-0cba-4100-8142-c61503f6c587"
+    # PreInvocation fires before the model runs; a tool-free turn (a plain
+    # answer) must still show WORKING and the session must appear at all.
+    r = _fire_agy(
+        "PreInvocation",
+        {
+            "conversationId": sid,
+            "invocationNum": 0,
+            "workspacePaths": ["/home/brad/projects/scratch"],
+            "transcriptPath": "/tmp/t.jsonl",
+        },
+        state_env,
+    )
+    assert r.returncode == 0, r.stderr
+    # The hook must emit NOTHING on stdout — agy reads stdout as a control
+    # decision, and a stray object would hijack the agent loop.
+    assert r.stdout.strip() == "", f"unexpected stdout: {r.stdout!r}"
+    state = _read_state(state_env, sid)
+    assert state["session_id"] == sid
+    assert state["status"] == "WORKING"
+    assert state["provider"] == "agy"
+    assert state["project_name"] == "scratch"  # basename of workspacePaths[0]
+    assert state["tool_count"] == 0  # PreInvocation is not a tool
+
+
+def test_agy_tool_free_turn_working_then_idle(state_env: dict[str, str]) -> None:
+    sid = "agy-conv-2"
+    ws = {"conversationId": sid, "workspacePaths": ["/p"]}
+    _fire_agy("PreInvocation", ws, state_env)
+    assert _read_state(state_env, sid)["status"] == "WORKING"
+    _fire_agy("Stop", {**ws, "terminationReason": "model_stop", "fullyIdle": True}, state_env)
+    assert _read_state(state_env, sid)["status"] == "IDLE"
+
+
+def test_agy_installer_command_runs_end_to_end(state_env: dict[str, str]) -> None:
+    """Close the loop between installer and handler: take the EXACT command the
+    agy installer writes into hooks.json, tokenize it the way agy does (shlex),
+    execute it, and confirm it drives the handler. Guards against the installer
+    and handler drifting out of sync (e.g. a change to arg order)."""
+    import shlex
+
+    from ephor.hooks import installer
+
+    sid = "019f5abc-e2e0-7abc-9def-0123456789ab"
+    obj = installer._agy_handler_obj(HANDLER, "PreInvocation")
+    argv = shlex.split(obj["command"])
+    assert argv[0] == "bash" and argv[1] == str(HANDLER)
+
+    r = subprocess.run(
+        argv,
+        input=json.dumps({"conversationId": sid, "workspacePaths": ["/p"]}),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env=state_env,  # no EPHOR_* — provider/event come purely from argv
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == ""
+    state = _read_state(state_env, sid)
+    assert state["status"] == "WORKING"
+    assert state["provider"] == "agy"
+
+
+def test_agy_pre_tool_use_counts_and_stays_working(state_env: dict[str, str]) -> None:
+    sid = "agy-conv-3"
+    r = _fire_agy(
+        "PreToolUse",
+        {
+            "conversationId": sid,
+            "workspacePaths": ["/p"],
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "ls"}},
+            "stepIdx": 2,
+        },
+        state_env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == ""
+    state = _read_state(state_env, sid)
+    assert state["status"] == "WORKING"
+    assert state["tool_count"] == 1
+
+
 def test_gemini_tool_permission_notification_waits(state_env: dict[str, str]) -> None:
     sid = "gem-perm"
     _fire_as(

@@ -56,7 +56,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="ephor",
         description=(
             "ephor — Linux-native dashboard for coding-agent CLI sessions "
-            "(Claude Code, Gemini CLI, Codex CLI, Grok CLI)."
+            "(Claude Code, Gemini CLI, Antigravity CLI, Codex CLI, Grok CLI, OpenCode)."
         ),
     )
     parser.add_argument(
