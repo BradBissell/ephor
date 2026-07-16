@@ -814,17 +814,24 @@ async def test_summarize_falls_back_to_last_reply_for_non_claude(
     sd = tmp_path / "sessions"
     sd.mkdir()
     monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
-    _write_state(sd, "grok-sid", provider="grok", last_reply="A deadlock is mutual waiting.")
+    _write_state(
+        sd,
+        "grok-sid",
+        provider="grok",
+        last_reply="A deadlock is mutual waiting.",
+        last_summary="explain what a deadlock is",
+    )
     monkeypatch.setattr("ephor.summary_store.summary_dir", lambda: tmp_path / "summaries")
     # No Claude transcript → transcript summarizer yields "".
     monkeypatch.setattr("ephor.tui.app.summarize_transcript", lambda _p, cwd=None: "")
-    seen: dict[str, str] = {}
+    seen: dict[str, object] = {}
 
-    def fake_text(text: str, cwd: object = None) -> str:
+    def fake_text(text: str, cwd: object = None, *, prompt: str = "") -> str:
         seen["text"] = text
+        seen["prompt"] = prompt
         return "condensed reply"
 
-    monkeypatch.setattr("ephor.summarizer.summarize_text", fake_text)
+    monkeypatch.setattr("ephor.tui.app.summarize_text", fake_text)
 
     app = EphorApp(manager=StateManager(sd))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
@@ -837,5 +844,49 @@ async def test_summarize_falls_back_to_last_reply_for_non_claude(
         await pilot.pause()
 
     assert seen["text"] == "A deadlock is mutual waiting."
+    # The latest user prompt (last_summary) is passed through as task context.
+    assert seen["prompt"] == "explain what a deadlock is"
     saved = (tmp_path / "summaries" / "grok-sid.json").read_text()
     assert "condensed reply" in saved
+
+
+@pytest.mark.asyncio
+async def test_summarize_agy_reads_brain_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agy session summarizes via summarize_agy (its brain transcript,
+    keyed by session id) rather than the Claude-convention transcript path —
+    agy hands the hook no transcript path and captures no last_reply."""
+    sd = tmp_path / "sessions"
+    sd.mkdir()
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
+    # No last_reply, no last_summary — exactly the empty-capture case agy hits.
+    _write_state(sd, "agy-sid", provider="agy", last_reply="", last_summary="")
+    monkeypatch.setattr("ephor.summary_store.summary_dir", lambda: tmp_path / "summaries")
+    # If it wrongly took the Claude path this would win; it must not be called.
+    monkeypatch.setattr(
+        "ephor.tui.app.summarize_transcript",
+        lambda _p, cwd=None: "WRONG-claude-path",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_agy(sid: str, cwd: object = None) -> str:
+        seen["sid"] = sid
+        return "Review GCP deployment config"
+
+    monkeypatch.setattr("ephor.tui.app.summarize_agy", fake_agy)
+
+    app = EphorApp(manager=StateManager(sd))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        await pilot.pause()
+        from ephor.summary_store import SummaryStore
+
+        app._summaries = SummaryStore()
+        app.action_summarize()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    assert seen["sid"] == "agy-sid"
+    saved = (tmp_path / "summaries" / "agy-sid.json").read_text()
+    assert "Review GCP deployment config" in saved
+    assert "WRONG-claude-path" not in saved

@@ -65,7 +65,12 @@ from ephor.speech_settings import save as save_speech_settings
 from ephor.state.manager import StateManager
 from ephor.state.models import AgentState, StatusSummary
 from ephor.state.reconciler import reconcile
-from ephor.summarizer import summarize_transcript, unavailable_reason
+from ephor.summarizer import (
+    summarize_agy,
+    summarize_text,
+    summarize_transcript,
+    unavailable_reason,
+)
 from ephor.summary_store import SummaryStore
 from ephor.tmux.discover import enrich_state_files
 from ephor.tmux.navigator import (
@@ -501,12 +506,27 @@ class EphorApp(App[int]):
                 continue
             if self._summaries.has(sid):
                 continue
-            # Skip until there's material to summarize — a Claude transcript
-            # or a captured reply — so content-less sessions don't trigger an
-            # LLM call on every refresh (empty results aren't cached).
-            if not agent.last_reply and not transcript_path(agent.cwd, sid).exists():
+            # Skip until there's material to summarize — a captured reply, a
+            # user prompt, or a transcript — so content-less sessions don't
+            # trigger an LLM call on every refresh (empty results aren't
+            # cached). agy has an out-of-band transcript (read by session id),
+            # so it's never gated on the Claude-convention transcript path.
+            has_material = (
+                agent.provider == "agy"
+                or agent.last_reply
+                or agent.last_summary
+                or transcript_path(agent.cwd, sid).exists()
+            )
+            if not has_material:
                 continue
-            self._summarize(sid, agent.cwd, manual=False, last_reply=agent.last_reply)
+            self._summarize(
+                sid,
+                agent.cwd,
+                manual=False,
+                last_reply=agent.last_reply,
+                provider=agent.provider,
+                prompt=agent.last_summary,
+            )
 
     def _update_chrome(self, agents: list[AgentState]) -> None:
         """Refresh the parts outside the session list (header / summary / title).
@@ -700,7 +720,14 @@ class EphorApp(App[int]):
         if sid in self._summarizing:
             self._set_toast("already summarizing…")
             return
-        self._summarize(sid, agent.cwd, manual=True, last_reply=agent.last_reply)
+        self._summarize(
+            sid,
+            agent.cwd,
+            manual=True,
+            last_reply=agent.last_reply,
+            provider=agent.provider,
+            prompt=agent.last_summary,
+        )
 
     async def action_jump(self) -> None:
         list_view = self.query_one(ListView)
@@ -968,15 +995,29 @@ class EphorApp(App[int]):
         self._account_usage = account_usage
 
     @work(thread=True, exit_on_error=False, group="summarize")
-    def _summarize(self, sid: str, cwd: str, manual: bool, last_reply: str = "") -> None:
+    def _summarize(
+        self,
+        sid: str,
+        cwd: str,
+        manual: bool,
+        last_reply: str = "",
+        provider: str = "",
+        prompt: str = "",
+    ) -> None:
         """Background-thread worker: summarize the session, store the result.
 
-        Claude sessions summarize their transcript (rich, recent-turn context).
-        Other agents have no Claude-format transcript, so we fall back to
-        condensing the assistant reply captured at turn-end (``last_reply``,
-        written to the state file by the hook handler). Lazy-once policy: the
-        refresh path only schedules when there's no cached summary; manual=True
-        force-refreshes via `s`. De-duped via ``self._summarizing``.
+        Each agent is summarized from the richest source it offers:
+        - Claude reads its Claude-format transcript (multi-turn context).
+        - Antigravity (agy) has no hook-supplied transcript path, so
+          ``summarize_agy`` locates its brain transcript by session id.
+        - Every other agent falls back to the reply captured at turn-end
+          (``last_reply``), paired with the latest user prompt (``prompt``,
+          the session's ``last_summary``) so the model has task context rather
+          than a lone stray sentence.
+
+        Lazy-once policy: the refresh path only schedules when there's no cached
+        summary; manual=True force-refreshes via `s`. De-duped via
+        ``self._summarizing``.
         """
         if sid in self._summarizing:
             return
@@ -985,16 +1026,19 @@ class EphorApp(App[int]):
             if manual:
                 # Show progress toast on the UI thread.
                 self.call_from_thread(self._set_toast, f"summarizing {sid[:8]}…")
-            # summarize_transcript returns "" for a missing/foreign transcript
-            # (non-Claude), so try it first (rich for Claude) then fall back to
-            # condensing the captured reply.
-            path = transcript_path(cwd, sid)
-            had_material = path.exists() or bool(last_reply)
-            text = summarize_transcript(path, cwd=cwd)
-            if not text and last_reply:
-                from ephor.summarizer import summarize_text
-
-                text = summarize_text(last_reply, cwd=cwd)
+            if provider == "agy":
+                # agy: rich transcript read straight from its brain dir.
+                had_material = True
+                text = summarize_agy(sid, cwd=cwd)
+            else:
+                # summarize_transcript returns "" for a missing/foreign
+                # transcript (non-Claude), so try it first (rich for Claude).
+                path = transcript_path(cwd, sid)
+                had_material = path.exists() or bool(last_reply) or bool(prompt)
+                text = summarize_transcript(path, cwd=cwd)
+            if not text and (last_reply or prompt):
+                # Fall back to the captured reply + user-prompt context.
+                text = summarize_text(last_reply, cwd=cwd, prompt=prompt)
             self.call_from_thread(self._on_summary_done, sid, text, manual, had_material)
         finally:
             self._summarizing.discard(sid)
