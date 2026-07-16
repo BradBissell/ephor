@@ -43,6 +43,14 @@ ephor init
 # Restart any open Claude Code sessions so they pick up the new hooks.
 ```
 
+This walkthrough uses Claude Code, but ephor hooks into six agents. Pass
+`--provider` to wire up another (`gemini`, `agy` for Antigravity, `codex`,
+`grok`, `opencode`) or `--provider all` to install into every agent you have:
+
+```bash
+ephor init --provider all
+```
+
 To remove later:
 
 ```bash

@@ -1,7 +1,8 @@
 # Architecture
 
 `ephor` is a Linux-native dashboard for terminal coding-agent sessions —
-Claude Code, Gemini CLI, Codex CLI, and Grok CLI. It avoids
+Claude Code, Gemini CLI, Antigravity CLI, Codex CLI, Grok CLI, and
+OpenCode. It avoids
 terminal-automation hacks (AppleScript, iTerm window control) entirely
 and instead leans on three primitives that Linux users already have:
 
@@ -11,7 +12,7 @@ and instead leans on three primitives that Linux users already have:
 
 ## Multi-agent design
 
-Four coding agents expose the same fundamental hook contract Claude Code
+Five coding agents expose the same fundamental hook contract Claude Code
 pioneered: a shell command invoked with event JSON on **stdin**, carrying
 a session id, a working directory, and an event name. `ephor` exploits
 that: `providers.py` describes each agent (its binary, settings-file path,
@@ -19,7 +20,10 @@ event vocabulary, resume flags), and **one** shell handler
 (`hooks/event_handler.sh`) normalizes every dialect into a single on-disk
 state schema. The installer registers that handler in each agent's own
 settings file, tagging the command with `EPHOR_PROVIDER=<name>` so the
-handler knows which agent fired it. Everything downstream (TUI, tmux,
+handler knows which agent fired it (Antigravity execs the command without
+a shell, so its provider and event arrive as positional args instead).
+OpenCode is the sixth agent — it has no shell hooks, so a generated JS
+plugin translates its bus events and pipes them into the same handler. Everything downstream (TUI, tmux,
 reconciler, speech) reads the state files and never cares who wrote them.
 
 Agents differ only at the edges:

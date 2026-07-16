@@ -65,8 +65,9 @@ ephor                       # launches the TUI dashboard (alias: ephor tui)
 
 1. **`ephor init [--provider <agent>|all]`** — registers ephor's hook in
    the agent's settings file (`--provider` defaults to `claude`; pass
-   `gemini`, `codex`, `grok`, or `all`). The original settings file is
-   backed up; `ephor uninstall --provider <agent>` cleanly removes them.
+   `gemini`, `agy`, `codex`, `grok`, `opencode`, or `all`). The original
+   settings file is backed up; `ephor uninstall --provider <agent>` cleanly
+   removes them.
 2. **`ephor`** (or `ephor tui`) — opens the TUI. Use `j`/`k` or arrow keys to navigate,
    `/` to filter, `Enter` to jump to a session's tmux pane, `x` to
    kill, `?` for the full keymap.
@@ -84,10 +85,12 @@ walkthrough.
   hook events — no terminal-output parsing, no AppleScript, no
   Wayland window-poking. Works the same in Ghostty, Alacritty, kitty,
   GNOME Terminal, or under `mosh`.
-- **One handler, four agents.** A single POSIX-shell handler normalizes
-  every agent's event vocabulary (e.g. Gemini's `BeforeTool`/`AfterAgent`,
-  Grok's `user_prompt`) into one on-disk state schema, tagged with the
-  `provider` that produced it.
+- **One handler, five agents.** A single POSIX-shell handler normalizes
+  every stdin-JSON agent's event vocabulary (e.g. Gemini's
+  `BeforeTool`/`AfterAgent`, Antigravity's `PreInvocation`, Grok's
+  `user_prompt`) into one on-disk state schema, tagged with the
+  `provider` that produced it. OpenCode's JS plugin funnels into the same
+  handler, so all six share one state writer.
 - **tmux-native navigation.** Every session is mapped to its tmux
   pane on every event, so resuming after a closed window self-heals.
   Pressing Enter does `tmux select-window -t <pane>` against your
@@ -115,10 +118,10 @@ Running ten sessions in parallel, the bottleneck isn't compute — it's
 When a session's turn ends, ephor enqueues its reply to a single FIFO
 speech queue shared across **all** your sessions, and plays it through
 your local [kokoro](https://github.com/hexgrad/kokoro) TTS pipeline. This
-works for **all five agents** — the reply text is captured at turn-end from
+works for **all six agents** — the reply text is captured at turn-end from
 each: an event-payload field (Gemini, Codex), the plugin's SDK (OpenCode), or
-the session transcript (Claude's JSONL, Grok Build's ACP `session/update`
-stream). Two modes:
+the session transcript (Claude's JSONL, Antigravity's transcript, Grok Build's
+ACP `session/update` stream). Two modes:
 
 - **`summary` (recommended for parallel work).** ephor shells out to
   `claude -p` to turn the reply into a **single ≤70-character
@@ -234,7 +237,8 @@ agents). Full surface area in [`SECURITY.md`](SECURITY.md).
 - `jq` and `flock` on PATH (used by the shell hook handler)
 - tmux 3.2+ (for jump-to-pane navigation)
 - At least one supported coding agent installed (Claude Code, Gemini CLI,
-  Codex CLI, or Grok CLI) with a session run after `ephor init`
+  Antigravity CLI, Codex CLI, Grok CLI, or OpenCode) with a session run
+  after `ephor init`
 
 ## Contributing
 
