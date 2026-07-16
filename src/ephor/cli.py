@@ -56,7 +56,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="ephor",
         description=(
             "ephor — Linux-native dashboard for coding-agent CLI sessions "
-            "(Claude Code, Gemini CLI, Codex CLI, Grok CLI)."
+            "(Claude Code, Gemini CLI, Antigravity CLI, Codex CLI, Grok CLI, OpenCode)."
         ),
     )
     parser.add_argument(
@@ -234,6 +234,7 @@ def _cmd_list() -> int:
 
     table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
     table.add_column("STATUS", justify="left", no_wrap=True)
+    table.add_column("AGENT", no_wrap=True)
     table.add_column("PROJECT", overflow="ellipsis", max_width=22)
     table.add_column("AGE", justify="right", no_wrap=True)
     table.add_column("LAST EVENT", overflow="ellipsis", max_width=20)
@@ -249,6 +250,7 @@ def _cmd_list() -> int:
         err_cell = f"[red]{a.error_count}[/]" if a.error_count else "0"
         table.add_row(
             status_cell,
+            a.provider or "-",
             a.project_name or "-",
             age,
             a.last_event,

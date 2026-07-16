@@ -5,13 +5,13 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
 A Linux-native TUI that watches every terminal coding-agent session you
-have running — **Claude Code, Gemini CLI, Codex CLI, Grok CLI, and
-OpenCode** — and tells you, at a glance, which ones need your attention,
-which are still working, and which went idle.
+have running — **Claude Code, Gemini CLI, Antigravity CLI, Codex CLI, Grok
+CLI, and OpenCode** — and tells you, at a glance, which ones need your
+attention, which are still working, and which went idle.
 
 > `ephor` (Greek *ἔφορος*, "overseer") began as `cco`, a Claude-Code-only
-> dashboard. It now speaks the hook protocol of four coding agents that
-> share Claude Code's stdin-JSON hook model.
+> dashboard. It now speaks the hook protocol of five coding agents that
+> share Claude Code's stdin-JSON hook model, plus OpenCode via a plugin.
 
 ## Supported agents
 
@@ -19,16 +19,22 @@ which are still working, and which went idle.
 |---|---|---|
 | **Claude Code** | `~/.claude/settings.json` | `hooks` object, command + stdin JSON |
 | **Gemini CLI** | `~/.gemini/settings.json` | same `hooks` shape (`Before*`/`After*` events) |
+| **Antigravity CLI** (Google `agy`) | `~/.gemini/config/hooks.json` | dedicated hooks file keyed by a named hook group; `PreInvocation`/`PreToolUse`/`PostToolUse`/`Stop` events |
 | **Codex CLI** | `~/.codex/hooks.json` | dedicated hooks file, command + stdin JSON |
 | **Grok** (xAI Grok Build) | `~/.grok/hooks/ephor.json` | JSON hooks file; camelCase/snake_case dialect |
 | **OpenCode** | `~/.config/opencode/plugins/ephor.js` | bundled JS plugin → shells out to the handler |
 
-The first four share the stdin-JSON hook model, so one shell handler serves
+The first five share the stdin-JSON hook model, so one shell handler serves
 them all — it understands each agent's event-name and field-name dialect and
-records which agent a session belongs to. OpenCode has no shell hooks, so
-`ephor init --provider opencode` installs a tiny JS **plugin** that translates
-OpenCode's bus events and pipes them into the *same* handler — so every agent
-funnels through one state writer.
+records which agent a session belongs to. Antigravity (the Gemini CLI
+successor; its binary is `agy`, not `antigravity`) uses the same stdin JSON but
+keys its hooks file by a named group rather than a top-level `hooks` object, so
+its config lands at `~/.gemini/config/hooks.json` (the shared config root agy's
+backend reads; the legacy `~/.gemini/antigravity-cli/hooks.json` is only loaded
+by the TUI). OpenCode has no
+shell hooks, so `ephor init --provider opencode` installs a tiny JS **plugin**
+that translates OpenCode's bus events and pipes them into the *same* handler —
+so every agent funnels through one state writer.
 
 <img width="2806" height="1972" alt="image" src="https://github.com/user-attachments/assets/50f4b678-2da8-4ee1-b52e-3d148ce4ae7c" />
 
@@ -59,8 +65,9 @@ ephor                       # launches the TUI dashboard (alias: ephor tui)
 
 1. **`ephor init [--provider <agent>|all]`** — registers ephor's hook in
    the agent's settings file (`--provider` defaults to `claude`; pass
-   `gemini`, `codex`, `grok`, or `all`). The original settings file is
-   backed up; `ephor uninstall --provider <agent>` cleanly removes them.
+   `gemini`, `agy`, `codex`, `grok`, `opencode`, or `all`). The original
+   settings file is backed up; `ephor uninstall --provider <agent>` cleanly
+   removes them.
 2. **`ephor`** (or `ephor tui`) — opens the TUI. Use `j`/`k` or arrow keys to navigate,
    `/` to filter, `Enter` to jump to a session's tmux pane, `x` to
    kill, `?` for the full keymap.
@@ -78,10 +85,12 @@ walkthrough.
   hook events — no terminal-output parsing, no AppleScript, no
   Wayland window-poking. Works the same in Ghostty, Alacritty, kitty,
   GNOME Terminal, or under `mosh`.
-- **One handler, four agents.** A single POSIX-shell handler normalizes
-  every agent's event vocabulary (e.g. Gemini's `BeforeTool`/`AfterAgent`,
-  Grok's `user_prompt`) into one on-disk state schema, tagged with the
-  `provider` that produced it.
+- **One handler, five agents.** A single POSIX-shell handler normalizes
+  every stdin-JSON agent's event vocabulary (e.g. Gemini's
+  `BeforeTool`/`AfterAgent`, Antigravity's `PreInvocation`, Grok's
+  `user_prompt`) into one on-disk state schema, tagged with the
+  `provider` that produced it. OpenCode's JS plugin funnels into the same
+  handler, so all six share one state writer.
 - **tmux-native navigation.** Every session is mapped to its tmux
   pane on every event, so resuming after a closed window self-heals.
   Pressing Enter does `tmux select-window -t <pane>` against your
@@ -109,10 +118,10 @@ Running ten sessions in parallel, the bottleneck isn't compute — it's
 When a session's turn ends, ephor enqueues its reply to a single FIFO
 speech queue shared across **all** your sessions, and plays it through
 your local [kokoro](https://github.com/hexgrad/kokoro) TTS pipeline. This
-works for **all five agents** — the reply text is captured at turn-end from
+works for **all six agents** — the reply text is captured at turn-end from
 each: an event-payload field (Gemini, Codex), the plugin's SDK (OpenCode), or
-the session transcript (Claude's JSONL, Grok Build's ACP `session/update`
-stream). Two modes:
+the session transcript (Claude's JSONL, Antigravity's transcript, Grok Build's
+ACP `session/update` stream). Two modes:
 
 - **`summary` (recommended for parallel work).** ephor shells out to
   `claude -p` to turn the reply into a **single ≤70-character
@@ -228,7 +237,8 @@ agents). Full surface area in [`SECURITY.md`](SECURITY.md).
 - `jq` and `flock` on PATH (used by the shell hook handler)
 - tmux 3.2+ (for jump-to-pane navigation)
 - At least one supported coding agent installed (Claude Code, Gemini CLI,
-  Codex CLI, or Grok CLI) with a session run after `ephor init`
+  Antigravity CLI, Codex CLI, Grok CLI, or OpenCode) with a session run
+  after `ephor init`
 
 ## Contributing
 

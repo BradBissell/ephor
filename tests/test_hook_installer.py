@@ -8,6 +8,7 @@ they coexist.
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -389,11 +390,13 @@ def provider_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str,
     paths = {
         "claude": tmp_path / "claude.json",
         "gemini": tmp_path / "gemini.json",
+        "agy": tmp_path / "agy-hooks.json",
         "codex": tmp_path / "codex-hooks.json",
         "grok": tmp_path / "grok.json",
     }
     monkeypatch.setattr(installer, "claude_settings_path", lambda: paths["claude"])
     monkeypatch.setenv("GEMINI_SETTINGS_PATH", str(paths["gemini"]))
+    monkeypatch.setenv("AGY_HOOKS_PATH", str(paths["agy"]))
     monkeypatch.setenv("CODEX_HOOKS_PATH", str(paths["codex"]))
     monkeypatch.setenv("GROK_HOOKS_PATH", str(paths["grok"]))
     return paths
@@ -446,6 +449,152 @@ def test_codex_writes_dedicated_hooks_json(provider_paths: dict[str, Path]) -> N
     # Codex keeps hooks in its own file, not ~/.claude/settings.json.
     assert provider_paths["codex"].exists()
     assert not provider_paths["claude"].exists()
+
+
+def test_codex_entries_omit_async(provider_paths: dict[str, Path]) -> None:
+    """Regression: codex silently skips hooks carrying `async` ("async hooks
+    are not supported yet"), so ephor's codex entries must NOT set it — a
+    synchronous entry with a timeout guard instead."""
+    from ephor.providers import get_provider
+
+    installer.install("codex")
+    data = json.loads(provider_paths["codex"].read_text())
+    for event in get_provider("codex").events:
+        inner = data["hooks"][event][0]["hooks"][0]
+        assert "async" not in inner, f"{event}: codex entry must not carry async"
+        assert inner["timeout"] == 30
+
+
+def test_claude_entries_keep_async(provider_paths: dict[str, Path]) -> None:
+    """Claude-shaped agents still mark hooks async (non-blocking)."""
+    installer.install("claude")
+    data = json.loads(provider_paths["claude"].read_text())
+    inner = data["hooks"]["SessionStart"][0]["hooks"][0]
+    assert inner.get("async") is True
+    assert "timeout" not in inner
+
+
+def test_reinstall_rewrites_stale_async_codex_entry(provider_paths: dict[str, Path]) -> None:
+    """Regression: upgrading and re-running `ephor init --provider codex` must
+    REPLACE a pre-fix `async: true` entry (which codex silently skips), not
+    treat it as already-installed and no-op."""
+    handler = installer.hook_handler_path()
+    # Seed the exact buggy shape ephor used to write before the async fix.
+    stale = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f'EPHOR_PROVIDER=codex "{handler}"',
+                            "async": True,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    provider_paths["codex"].write_text(json.dumps(stale))
+
+    # The stale entry must be seen as needing reinstall, not already-installed.
+    plan = installer.plan_install("codex")
+    assert "SessionStart" in plan.events_to_add
+
+    installer.install("codex")
+    entries = json.loads(provider_paths["codex"].read_text())["hooks"]["SessionStart"]
+    ephor = [e for e in entries if str(handler) in e["hooks"][0]["command"]]
+    assert len(ephor) == 1, "stale entry must be replaced in place, not duplicated"
+    inner = ephor[0]["hooks"][0]
+    assert "async" not in inner, "async must be gone after reinstall"
+    assert inner["timeout"] == 30
+
+
+# ---------------------------------------------------------------------------
+# Antigravity (agy) — named-group hooks shape
+# ---------------------------------------------------------------------------
+
+
+def test_agy_installs_under_named_group_not_hooks_key(
+    provider_paths: dict[str, Path],
+) -> None:
+    from ephor.providers import AGY_DIRECT_EVENTS, get_provider
+
+    prov = get_provider("agy")
+    plan = installer.install("agy")
+    assert sorted(plan.events_to_add) == sorted(prov.events)
+
+    data = json.loads(provider_paths["agy"].read_text())
+    # Antigravity's top level is the named hook group, NOT a "hooks" wrapper.
+    assert "hooks" not in data
+    assert "ephor" in data
+    for event in prov.events:
+        value = data["ephor"][event]
+        if event in AGY_DIRECT_EVENTS:
+            # Direct handler list — no matcher wrapper.
+            handler_obj = value[0]
+            assert "matcher" not in handler_obj and "hooks" not in handler_obj
+        else:
+            # matcher-wrapped for PreToolUse/PostToolUse.
+            assert value[0]["matcher"] == ""
+            handler_obj = value[0]["hooks"][0]
+        cmd = handler_obj["command"]
+        # agy shlex-splits + execs directly (no shell), so we invoke bash and
+        # pass provider + event as positional args, not a shell env-prefix.
+        # Verify the command tokenizes (shlex, as agy does) to exactly that argv.
+        assert "EPHOR_PROVIDER=" not in cmd  # env-prefix would exec as argv[0]
+        assert shlex.split(cmd) == ["bash", str(installer.hook_handler_path()), "agy", event]
+        assert handler_obj["timeout"] == 30
+        assert "async" not in handler_obj
+
+
+def test_agy_writes_its_own_file_not_claude_or_gemini(
+    provider_paths: dict[str, Path],
+) -> None:
+    installer.install("agy")
+    assert provider_paths["agy"].exists()
+    assert not provider_paths["claude"].exists()
+    assert not provider_paths["gemini"].exists()
+
+
+def test_agy_install_idempotent(provider_paths: dict[str, Path]) -> None:
+    installer.install("agy")
+    plan = installer.install("agy")
+    assert plan.events_to_add == []
+    from ephor.providers import get_provider
+
+    assert sorted(plan.events_already_installed) == sorted(get_provider("agy").events)
+
+
+def test_agy_uninstall_removes_named_group(provider_paths: dict[str, Path]) -> None:
+    from ephor.providers import get_provider
+
+    installer.install("agy")
+    plan = installer.uninstall("agy")
+    assert sorted(plan.events_with_ephor_hook) == sorted(get_provider("agy").events)
+    data = json.loads(provider_paths["agy"].read_text())
+    # Named group dropped once emptied — clean inverse of install.
+    assert "ephor" not in data
+
+
+def test_agy_install_preserves_foreign_hook_groups(provider_paths: dict[str, Path]) -> None:
+    """A user's own named hook groups must survive install → uninstall."""
+    pre = {
+        "block-run-command": {
+            "PreToolUse": [
+                {
+                    "matcher": "run_command",
+                    "hooks": [{"type": "command", "command": "/x/deny.sh", "timeout": 30}],
+                }
+            ]
+        }
+    }
+    provider_paths["agy"].write_text(json.dumps(pre, indent=2))
+    installer.install("agy")
+    installer.uninstall("agy")
+    data = json.loads(provider_paths["agy"].read_text())
+    assert data == pre, "foreign hook group must be preserved exactly"
 
 
 # ---------------------------------------------------------------------------

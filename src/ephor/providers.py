@@ -6,16 +6,23 @@ command invoked with event JSON on **stdin**, carrying at least a session id, a
 working directory, and an event name. This module describes each one so the
 rest of ephor (installer, discovery, doctor) can stay provider-agnostic.
 
-The five supported/known agents and how they differ:
+The supported/known agents and how they differ:
 
-  claude  ~/.claude/settings.json          JSON `hooks` obj   stdin JSON
-  gemini  ~/.gemini/settings.json           JSON `hooks` obj   stdin JSON  (diff event names)
-  codex   ~/.codex/hooks.json               JSON hooks file    stdin JSON
-  grok    ~/.grok/user-settings.json        JSON `hooks` obj   stdin JSON  (superagent-ai/grok-cli)
+  claude  ~/.claude/settings.json               JSON `hooks` obj   stdin JSON
+  gemini  ~/.gemini/settings.json                JSON `hooks` obj   stdin JSON  (diff event names)
+  codex   ~/.codex/hooks.json                    JSON hooks file    stdin JSON
+  grok    ~/.grok/user-settings.json             JSON `hooks` obj   stdin JSON  (superagent-ai/grok-cli)
+  agy     ~/.gemini/config/hooks.json            JSON hooks file    stdin JSON  (Google Antigravity CLI)
 
 Claude, Gemini and Grok share the *identical* settings-file `hooks` shape, so
 they use the same installer strategy (`SETTINGS_JSON_HOOKS`); Codex keeps its
-hooks in a dedicated `hooks.json` (`CODEX_HOOKS_JSON`).
+hooks in a dedicated `hooks.json` (`CODEX_HOOKS_JSON`). Antigravity (`agy`, the
+Gemini CLI successor) uses its own dialect entirely (`AGY_HOOKS_JSON`): a
+dedicated hooks file whose top level maps a *named hook group* to an
+event→config object, only five events (PreToolUse/PostToolUse/PreInvocation/
+PostInvocation/Stop), a camelCase stdin payload keyed by `conversationId` with
+no event-name field, and no SessionStart. See the AGY_* helpers below and the
+installer's agy path.
 
 OpenCode is different: it has no shell hooks, only JS/TS plugins. So its
 strategy (`OPENCODE_PLUGIN`) installs a small generated plugin into
@@ -39,6 +46,7 @@ SETTINGS_JSON_HOOKS = (
 )
 CODEX_HOOKS_JSON = "codex_hooks_json"  # codex: a dedicated ~/.codex/hooks.json
 OPENCODE_PLUGIN = "opencode_plugin"  # opencode: a JS plugin file that shells out to the handler
+AGY_HOOKS_JSON = "agy_hooks_json"  # agy: dedicated hooks.json keyed by a named hook group
 
 
 @dataclass(frozen=True)
@@ -63,6 +71,14 @@ class Provider:
     # Command prefix used by summary-mode TTS to condense a reply, e.g.
     # ("claude", "-p"). None → summary mode falls back to the full reply.
     summarize_cmd: tuple[str, ...] | None = None
+    # Extra key/value pairs added to each inner hook object. Claude (and the
+    # agents that inherit its `hooks` shape) mark the hook non-blocking with
+    # `async: true`. Codex, despite sharing the JSON shape, does NOT support
+    # async hooks — it *silently skips* any entry carrying `async`, so ephor's
+    # hooks never run. Codex therefore overrides this to drop `async` (a `timeout`
+    # guard instead). Applies to the SETTINGS_JSON_HOOKS / CODEX_HOOKS_JSON
+    # strategies; the agy strategy builds its own entries.
+    hook_entry_extra: tuple[tuple[str, object], ...] = (("async", True),)
 
     def settings_path(self) -> Path:
         """Resolve the config file the installer reads/writes for this provider."""
@@ -141,6 +157,42 @@ _OPENCODE_EVENTS = (
     "SessionEnd",
 )
 
+# Google Antigravity CLI (`agy`) — the Gemini CLI successor. Per the official
+# hooks reference (https://antigravity.google/docs/hooks) there are exactly five
+# JSON-hook events — no SessionStart, no per-prompt event. The payload carries
+# NO event-name field and identifies the session by `conversationId`. agy execs
+# the hook command via shlex WITHOUT a shell, so a `VAR=value` env-prefix can't
+# work (it would exec as argv[0]); instead the installer passes provider+event
+# as positional args (`bash <handler> agy <event>`) and the handler reads
+# $1/$2 (see _agy_handler_obj + event_handler.sh). We register the subset that
+# maps to a dashboard status:
+#   PreInvocation → model called → WORKING (first turn is also when the session
+#                   first appears, since agy has no SessionStart)
+#   PreToolUse / PostToolUse → WORKING
+#   Stop          → execution loop terminated → IDLE (+ speech)
+# PostInvocation is omitted: it carries no status the next event doesn't set.
+#
+# NOTE: the two event families nest differently in hooks.json —
+#   PreToolUse/PostToolUse:            [{matcher, hooks: [handler, ...]}]
+#   PreInvocation/PostInvocation/Stop: [handler, ...]  (matcher ignored)
+# The AGY_HOOKS_JSON installer strategy writes the right shape per event.
+_AGY_EVENTS = (
+    "PreInvocation",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+)
+
+# Antigravity events whose config value is a *direct* list of handler objects
+# (matcher is ignored) rather than the `{matcher, hooks: [...]}` wrapper that
+# PreToolUse/PostToolUse use.
+AGY_DIRECT_EVENTS: frozenset[str] = frozenset({"PreInvocation", "PostInvocation", "Stop"})
+
+# The named hook group ephor owns inside agy's hooks.json. We own this whole key
+# (like the opencode plugin owns its file), so install writes it and uninstall
+# deletes it, leaving any hook groups the user authored untouched.
+AGY_HOOK_GROUP = "ephor"
+
 
 PROVIDERS: dict[str, Provider] = {
     "claude": Provider(
@@ -165,6 +217,32 @@ PROVIDERS: dict[str, Provider] = {
         resume_flags=(),
         summarize_cmd=("gemini", "-p"),
     ),
+    "agy": Provider(
+        name="agy",
+        display_name="Antigravity CLI",
+        # The binary is `agy`, NOT `antigravity` — both `gemini` and `agy` can
+        # coexist during migration off Gemini CLI.
+        binary="agy",
+        install_kind=AGY_HOOKS_JSON,
+        events=_AGY_EVENTS,
+        # Global hooks live in a dedicated file under ~/.gemini/ (agy is the
+        # Gemini CLI successor and shares its config root). The canonical global
+        # path is ~/.gemini/config/hooks.json: agy >= 1.0.8 fixed a bug where the
+        # /hooks command wrote to ~/.gemini/antigravity-cli/hooks.json instead of
+        # the shared ~/.gemini/config/hooks.json, "ensuring hooks remain
+        # synchronized between the TUI and the backend" (antigravity-cli
+        # CHANGELOG). The legacy antigravity-cli path is still *loaded* by the
+        # TUI, but the *backend* — which actually dispatches hooks during the
+        # agent loop — reads config/hooks.json, so installing there is what makes
+        # hooks fire. Project-scoped hooks in <root>/.agents/hooks.json exist too,
+        # but ephor installs globally.
+        _settings="~/.gemini/config/hooks.json",
+        settings_env="AGY_HOOKS_PATH",
+        # `agy --conversation <id>` resumes a conversation; the id is the same
+        # UUID agy reports as conversationId, so discovery can parse it.
+        resume_flags=("--conversation",),
+        summarize_cmd=None,
+    ),
     "codex": Provider(
         name="codex",
         display_name="Codex CLI",
@@ -175,6 +253,10 @@ PROVIDERS: dict[str, Provider] = {
         settings_env="CODEX_HOOKS_PATH",
         resume_flags=(),
         summarize_cmd=("codex", "exec"),
+        # Codex skips async hooks ("async hooks are not supported yet"), so use
+        # a plain synchronous entry with a timeout guard. The handler is <15ms
+        # and fails open, so running synchronously is safe.
+        hook_entry_extra=(("timeout", 30),),
     ),
     "grok": Provider(
         name="grok",
@@ -206,7 +288,7 @@ PROVIDERS: dict[str, Provider] = {
 }
 
 # Stable display order for CLI output (`ephor init --provider all`, doctor).
-PROVIDER_ORDER: tuple[str, ...] = ("claude", "gemini", "codex", "grok", "opencode")
+PROVIDER_ORDER: tuple[str, ...] = ("claude", "gemini", "agy", "codex", "grok", "opencode")
 
 # Binaries we scan for in process discovery, in preference order.
 KNOWN_BINARIES: tuple[str, ...] = tuple(PROVIDERS[n].binary for n in PROVIDER_ORDER)
