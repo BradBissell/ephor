@@ -98,11 +98,36 @@ DEFAULT_MAX_TOKENS = 128
 # Strips a `<think>…</think>` block some reasoning models inline into content.
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
+# The model emits this sentinel when the excerpt has no real task to describe
+# (a greeting, small talk, an empty reply). We map it — and any all-punctuation
+# reply — back to "" so the UI shows "—" instead of a hollow line.
+_NO_TASK = "—"  # em dash
+
+# Dash/bullet glyphs a model might emit as a stand-in for "no task". Written as
+# escapes so they don't trip ruff's ambiguous-unicode check in a strip set.
+_DASHES = "\u2014\u2013\u00b7\u2022"  # em, en dash, middot, bullet
+
+# Defense-in-depth: even with the instruction below, a small/local model handed
+# a thin excerpt sometimes narrates the *act of summarizing* ("I'm summarizing
+# the transcript…") or announces there's nothing to do. Drop those — they are
+# never a real task summary. Kept deliberately tight to avoid eating genuine
+# summaries that merely mention a "conversation" or "session" feature.
+_META_RE = re.compile(
+    r"\b(summariz\w*\s+(the\s+)?(transcript|conversation|reply|response|session|chat)"
+    r"|no\s+(substantive\s+|real\s+)?(task|activity|content|work)"
+    r"|(nothing|unable)\s+to\s+summariz)",
+    re.IGNORECASE,
+)
+
 _SYSTEM_PROMPT = (
-    "You summarize what an autonomous coding agent is currently working on. "
-    "Read the most recent turns of the transcript and return ONE sentence "
-    f"(max {MAX_LENGTH} characters) describing the current task. "
-    "Output the sentence only — no preamble, no quotes, no trailing period."
+    "You write a one-line status for a terminal coding-agent session, from an "
+    "excerpt of its conversation. Output ONE sentence "
+    f"(max {MAX_LENGTH} characters) naming the concrete coding task the agent "
+    "is working on — e.g. 'Add retry logic to the upload client'. "
+    "Output the sentence only: no preamble, no quotes, no trailing period, and "
+    "never narrate the act of summarizing. "
+    "If the excerpt is empty or has no real coding task (a greeting, small "
+    f"talk, or a bare acknowledgment), output exactly: {_NO_TASK}"
 )
 
 
@@ -201,18 +226,115 @@ def summarize_transcript(path: Path, cwd: str | Path | None = None) -> str:
     return _postprocess(raw, cwd) if raw else ""
 
 
-def summarize_text(text: str, cwd: str | Path | None = None) -> str:
-    """Condense already-extracted reply text into one ≤70-char line.
+def summarize_text(text: str, cwd: str | Path | None = None, *, prompt: str = "") -> str:
+    """Condense a captured reply (and, if known, the user prompt) into one line.
 
-    Provider-agnostic counterpart to summarize_transcript: used by summary-mode
-    TTS for agents whose reply text is captured at turn-end (from an event
-    payload field or a plugin) rather than a Claude-format transcript file.
+    Provider-agnostic counterpart to summarize_transcript: used for agents whose
+    reply text is captured at turn-end (from an event payload field or a plugin)
+    rather than a Claude-format transcript file. When ``prompt`` is supplied (the
+    latest user turn, from the session's ``last_summary``) it is sent alongside
+    the reply as a ``USER:``/``ASSISTANT:`` pair — the task context is what lets
+    the model produce a real summary instead of narrating a lone stray sentence.
     Same backend + ticket-prefix + truncation rules. "" on empty/failure.
     """
-    text = (text or "").strip()
-    if not text:
+    reply = (text or "").strip()
+    prompt = (prompt or "").strip()
+    if not reply and not prompt:
         return ""
-    raw = _run_backend(f"ASSISTANT: {text}")
+    parts: list[str] = []
+    if prompt:
+        parts.append(f"USER: {prompt}")
+    if reply:
+        parts.append(f"ASSISTANT: {reply}")
+    raw = _run_backend("\n\n".join(parts))
+    return _postprocess(raw, cwd) if raw else ""
+
+
+# Google Antigravity (agy) writes each conversation's transcript as JSONL under
+# its "brain" dir, keyed by the same conversationId ephor uses as the session
+# id. Unlike every other agent, agy's Stop hook hands us no transcript path and
+# fires no user-prompt event, so its captured reply is empty — we resolve and
+# read the transcript here instead. Override the root via env for tests.
+ENV_AGY_BRAIN = "EPHOR_AGY_BRAIN_DIR"
+_SAFE_SID_RE = re.compile(r"[A-Za-z0-9_-]+")
+# agy wraps the real user prompt in <USER_REQUEST>…</USER_REQUEST>, surrounded
+# by <ADDITIONAL_METADATA>/<USER_SETTINGS_CHANGE> blocks that are noise here.
+_AGY_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
+
+
+def _agy_brain_dir() -> Path:
+    override = os.environ.get(ENV_AGY_BRAIN)
+    if override:
+        return Path(override)
+    return Path.home() / ".gemini" / "antigravity-cli" / "brain"
+
+
+def _agy_transcript_path(sid: str) -> Path:
+    return _agy_brain_dir() / sid / ".system_generated" / "logs" / "transcript.jsonl"
+
+
+def _agy_user_text(content: str) -> str:
+    m = _AGY_REQUEST_RE.search(content)
+    return (m.group(1) if m else content).strip()
+
+
+def _extract_agy_messages(path: Path) -> list[dict[str, str]]:
+    """Parse an agy transcript.jsonl into user/assistant text pairs.
+
+    Lines look like ``{step_index, source, type, status, content}``. User turns
+    are ``type == "USER_INPUT"`` (content wrapped in <USER_REQUEST>); the model's
+    *prose* is ``type == "PLANNER_RESPONSE"``. agy's other MODEL step types
+    (RUN_COMMAND, VIEW_FILE, GREP_SEARCH, LIST_DIRECTORY, GENERIC) are tool
+    calls/results whose content is timestamped command output — pure noise for a
+    one-line summary, so they're dropped, mirroring the tool-call filtering the
+    Claude reader does. SYSTEM lines (checkpoints, history markers) are skipped
+    too.
+    """
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return []
+
+    messages: list[dict[str, str]] = []
+    for raw in lines[-RECENT_TURNS * 6 :]:  # 6x: absorb the interleaved tool steps
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if entry.get("type") == "USER_INPUT":
+            text = _agy_user_text(content)
+            if text:
+                messages.append({"role": "user", "content": text})
+        elif entry.get("source") == "MODEL" and entry.get("type") == "PLANNER_RESPONSE":
+            messages.append({"role": "assistant", "content": content.strip()})
+
+    if len(messages) > RECENT_TURNS:
+        messages = messages[-RECENT_TURNS:]
+    return messages
+
+
+def summarize_agy(sid: str, cwd: str | Path | None = None) -> str:
+    """One-line summary for a Google Antigravity (agy) session.
+
+    agy hands the hook no transcript path, so we locate its brain transcript by
+    ``sid`` (== conversationId) and summarize it with the same rich, multi-turn
+    context the Claude path enjoys. "" if the id is unsafe, the transcript is
+    missing/unreadable, or the backend fails.
+    """
+    if not sid or not _SAFE_SID_RE.fullmatch(sid):
+        return ""
+    messages = _extract_agy_messages(_agy_transcript_path(sid))
+    if not messages:
+        return ""
+    raw = _run_backend(_format_for_prompt(messages))
     return _postprocess(raw, cwd) if raw else ""
 
 
@@ -476,6 +598,10 @@ def _postprocess(raw: str, cwd: str | Path | None) -> str:
     if text.endswith("."):
         text = text[:-1].rstrip()
     if not text:
+        return ""
+    # No-task sentinel, an all-punctuation reply, or a meta "I'm summarizing…"
+    # narration → treat as "no summary" so the UI shows "—" rather than noise.
+    if not text.strip("-.,: " + _DASHES) or _META_RE.search(text):
         return ""
 
     # Jira-ticket prefix is a single source of truth — the model is told

@@ -16,9 +16,13 @@ import pytest
 from ephor import summarizer as summarizer_module
 from ephor.summarizer import (
     MAX_LENGTH,
+    _extract_agy_messages,
     _extract_messages,
     _extract_text,
     _format_for_prompt,
+    _postprocess,
+    summarize_agy,
+    summarize_text,
     summarize_transcript,
 )
 
@@ -744,3 +748,147 @@ def test_summarize_text_applies_ticket_prefix(
     out = summarize_text("a long reply", cwd=worktree)
     assert out.startswith("DR-7: ")
     assert out.endswith("…")
+
+
+# ---- no-task / meta guards -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "—",
+        "-",
+        "  --  ",
+        "I'm summarizing the transcript",
+        "I am summarizing the conversation now",
+        "Summarizing the reply",
+        "No substantive task in progress",
+        "Nothing to summarize",
+    ],
+)
+def test_postprocess_drops_sentinel_and_meta_narration(raw: str) -> None:
+    """The no-task sentinel and 'I'm summarizing…' style meta narration map to
+    "" so the UI shows '—' instead of a hollow/hallucinated line."""
+    assert _postprocess(raw, None) == ""
+
+
+def test_postprocess_keeps_a_real_task_summary() -> None:
+    assert _postprocess("Added retry logic to the upload client", None) == (
+        "Added retry logic to the upload client"
+    )
+
+
+# ---- summarize_text: prompt pairing ---------------------------------------
+
+
+def test_summarize_text_pairs_prompt_and_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a user prompt is supplied it is sent as USER:/ASSISTANT: context —
+    the task anchor that stops the model narrating a lone stray sentence."""
+    seen: dict[str, str] = {}
+
+    def fake_backend(text: str) -> str:
+        seen["prompt_text"] = text
+        return "Add rate limiting to the gateway"
+
+    monkeypatch.setattr(summarizer_module, "_run_backend", fake_backend)
+    out = summarize_text("Sure, done!", prompt="add rate limiting to the API gateway")
+    assert out == "Add rate limiting to the gateway"
+    assert seen["prompt_text"] == (
+        "USER: add rate limiting to the API gateway\n\nASSISTANT: Sure, done!"
+    )
+
+
+def test_summarize_text_reply_only_when_no_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, str] = {}
+    monkeypatch.setattr(
+        summarizer_module, "_run_backend", lambda t: seen.update(t=t) or "x"
+    )
+    summarize_text("just the reply")
+    assert seen["t"] == "ASSISTANT: just the reply"
+
+
+def test_summarize_text_empty_when_nothing_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = {"n": 0}
+    monkeypatch.setattr(
+        summarizer_module, "_run_backend", lambda t: called.__setitem__("n", called["n"] + 1) or "x"
+    )
+    assert summarize_text("", prompt="") == ""
+    assert called["n"] == 0  # no backend call for empty input
+
+
+# ---- agy transcript reader -------------------------------------------------
+
+
+def _write_agy_transcript(brain: Path, sid: str, lines: list[dict[str, Any]]) -> Path:
+    log_dir = brain / sid / ".system_generated" / "logs"
+    log_dir.mkdir(parents=True)
+    p = log_dir / "transcript.jsonl"
+    p.write_text("\n".join(json.dumps(d) for d in lines) + "\n")
+    return p
+
+
+def test_extract_agy_messages_keeps_prose_drops_tool_noise(tmp_path: Path) -> None:
+    p = _write_agy_transcript(
+        tmp_path,
+        "conv-1",
+        [
+            {"source": "USER_EXPLICIT", "type": "USER_INPUT",
+             "content": "<USER_REQUEST>\nreview the GCP deploy\n</USER_REQUEST>\n"
+                        "<ADDITIONAL_METADATA>time</ADDITIONAL_METADATA>"},
+            {"source": "SYSTEM", "type": "CONVERSATION_HISTORY"},
+            {"source": "MODEL", "type": "LIST_DIRECTORY",
+             "content": "Created At: ...\n{\"name\":\".claude\"}"},
+            {"source": "MODEL", "type": "RUN_COMMAND", "content": "exit code 0"},
+            {"source": "MODEL", "type": "PLANNER_RESPONSE",
+             "content": "The Cloud Run service is missing a health check."},
+        ],
+    )
+    msgs = _extract_agy_messages(p)
+    assert msgs == [
+        {"role": "user", "content": "review the GCP deploy"},
+        {"role": "assistant", "content": "The Cloud Run service is missing a health check."},
+    ]
+
+
+def test_extract_agy_messages_missing_file(tmp_path: Path) -> None:
+    assert _extract_agy_messages(tmp_path / "nope.jsonl") == []
+
+
+def test_summarize_agy_reads_transcript_by_session_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    brain = tmp_path / "brain"
+    _write_agy_transcript(
+        brain,
+        "conv-42",
+        [
+            {"source": "USER_EXPLICIT", "type": "USER_INPUT",
+             "content": "<USER_REQUEST>fix the deploy</USER_REQUEST>"},
+            {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Fixed the health check."},
+        ],
+    )
+    monkeypatch.setenv("EPHOR_AGY_BRAIN_DIR", str(brain))
+    seen: dict[str, str] = {}
+    monkeypatch.setattr(
+        summarizer_module,
+        "_run_backend",
+        lambda t: seen.update(t=t) or "Fix the Cloud Run deploy",
+    )
+    assert summarize_agy("conv-42") == "Fix the Cloud Run deploy"
+    assert "USER: fix the deploy" in seen["t"]
+    assert "ASSISTANT: Fixed the health check." in seen["t"]
+
+
+def test_summarize_agy_rejects_unsafe_session_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EPHOR_AGY_BRAIN_DIR", str(tmp_path / "brain"))
+    # A traversal-y id never touches the filesystem.
+    assert summarize_agy("../../etc/passwd") == ""
+
+
+def test_summarize_agy_empty_when_no_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EPHOR_AGY_BRAIN_DIR", str(tmp_path / "brain"))
+    assert summarize_agy("conv-missing") == ""
