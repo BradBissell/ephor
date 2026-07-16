@@ -100,9 +100,13 @@ def test_agy_direct_vs_wrapped_event_families() -> None:
 
 
 def test_agy_global_hooks_live_under_gemini_config_root() -> None:
+    # agy's BACKEND dispatches from ~/.gemini/config/hooks.json (the shared
+    # config root), NOT the legacy ~/.gemini/antigravity-cli/hooks.json which
+    # the TUI loads but never fires.
     p = providers.get_provider("agy").settings_path()
     assert p.name == "hooks.json"
-    assert "antigravity-cli" in str(p)
+    assert p.parent.name == "config"
+    assert ".gemini" in str(p)
 
 
 def test_agy_settings_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:

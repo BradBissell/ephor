@@ -12,7 +12,7 @@ The supported/known agents and how they differ:
   gemini  ~/.gemini/settings.json                JSON `hooks` obj   stdin JSON  (diff event names)
   codex   ~/.codex/hooks.json                    JSON hooks file    stdin JSON
   grok    ~/.grok/user-settings.json             JSON `hooks` obj   stdin JSON  (superagent-ai/grok-cli)
-  agy     ~/.gemini/antigravity-cli/hooks.json   JSON hooks file    stdin JSON  (Google Antigravity CLI)
+  agy     ~/.gemini/config/hooks.json            JSON hooks file    stdin JSON  (Google Antigravity CLI)
 
 Claude, Gemini and Grok share the *identical* settings-file `hooks` shape, so
 they use the same installer strategy (`SETTINGS_JSON_HOOKS`); Codex keeps its
@@ -226,11 +226,17 @@ PROVIDERS: dict[str, Provider] = {
         install_kind=AGY_HOOKS_JSON,
         events=_AGY_EVENTS,
         # Global hooks live in a dedicated file under ~/.gemini/ (agy is the
-        # Gemini CLI successor and shares its config root). This is the path the
-        # CLI actually loads — confirmed by its log line "loaded N named hooks
-        # from N hooks.json file(s)". Project-scoped hooks in <root>/.agents/
-        # hooks.json exist too, but ephor installs globally.
-        _settings="~/.gemini/antigravity-cli/hooks.json",
+        # Gemini CLI successor and shares its config root). The canonical global
+        # path is ~/.gemini/config/hooks.json: agy >= 1.0.8 fixed a bug where the
+        # /hooks command wrote to ~/.gemini/antigravity-cli/hooks.json instead of
+        # the shared ~/.gemini/config/hooks.json, "ensuring hooks remain
+        # synchronized between the TUI and the backend" (antigravity-cli
+        # CHANGELOG). The legacy antigravity-cli path is still *loaded* by the
+        # TUI, but the *backend* — which actually dispatches hooks during the
+        # agent loop — reads config/hooks.json, so installing there is what makes
+        # hooks fire. Project-scoped hooks in <root>/.agents/hooks.json exist too,
+        # but ephor installs globally.
+        _settings="~/.gemini/config/hooks.json",
         settings_env="AGY_HOOKS_PATH",
         # `agy --conversation <id>` resumes a conversation; the id is the same
         # UUID agy reports as conversationId, so discovery can parse it.

@@ -28,7 +28,7 @@ Agents differ only at the edges:
 |---|---|---|
 | Claude Code | `~/.claude/settings.json` (`hooks`) | `PreToolUse`, `PostToolUse`, `Stop`, … |
 | Gemini CLI | `~/.gemini/settings.json` (`hooks`) | `BeforeTool`, `AfterTool`, `AfterAgent`, `Notification(ToolPermission)` |
-| Antigravity CLI (`agy`) | `~/.gemini/antigravity-cli/hooks.json` (named group) | `PreInvocation`, `PreToolUse`, `PostToolUse`, `Stop` |
+| Antigravity CLI (`agy`) | `~/.gemini/config/hooks.json` (named group) | `PreInvocation`, `PreToolUse`, `PostToolUse`, `Stop` |
 | Codex CLI | `~/.codex/hooks.json` | `PreToolUse`, `PermissionRequest`, `Stop`, … |
 | Grok CLI | `~/.grok/user-settings.json` (`hooks`) | Claude-like; `UserPromptSubmit` carries `user_prompt` |
 | OpenCode | `~/.config/opencode/plugins/ephor.js` | JS plugin → canonical events |

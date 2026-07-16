@@ -19,7 +19,7 @@ attention, which are still working, and which went idle.
 |---|---|---|
 | **Claude Code** | `~/.claude/settings.json` | `hooks` object, command + stdin JSON |
 | **Gemini CLI** | `~/.gemini/settings.json` | same `hooks` shape (`Before*`/`After*` events) |
-| **Antigravity CLI** (Google `agy`) | `~/.gemini/antigravity-cli/hooks.json` | dedicated hooks file keyed by a named hook group; `PreInvocation`/`PreToolUse`/`PostToolUse`/`Stop` events |
+| **Antigravity CLI** (Google `agy`) | `~/.gemini/config/hooks.json` | dedicated hooks file keyed by a named hook group; `PreInvocation`/`PreToolUse`/`PostToolUse`/`Stop` events |
 | **Codex CLI** | `~/.codex/hooks.json` | dedicated hooks file, command + stdin JSON |
 | **Grok** (xAI Grok Build) | `~/.grok/hooks/ephor.json` | JSON hooks file; camelCase/snake_case dialect |
 | **OpenCode** | `~/.config/opencode/plugins/ephor.js` | bundled JS plugin → shells out to the handler |
@@ -29,7 +29,9 @@ them all — it understands each agent's event-name and field-name dialect and
 records which agent a session belongs to. Antigravity (the Gemini CLI
 successor; its binary is `agy`, not `antigravity`) uses the same stdin JSON but
 keys its hooks file by a named group rather than a top-level `hooks` object, so
-its config lands at `~/.gemini/antigravity-cli/hooks.json`. OpenCode has no
+its config lands at `~/.gemini/config/hooks.json` (the shared config root agy's
+backend reads; the legacy `~/.gemini/antigravity-cli/hooks.json` is only loaded
+by the TUI). OpenCode has no
 shell hooks, so `ephor init --provider opencode` installs a tiny JS **plugin**
 that translates OpenCode's bus events and pipes them into the *same* handler —
 so every agent funnels through one state writer.
