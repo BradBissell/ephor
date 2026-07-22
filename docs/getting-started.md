@@ -15,16 +15,20 @@ python3 -c 'import sys; assert sys.version_info >= (3,11)' && echo "✓ python �
 
 ## 2. Install
 
+Not on PyPI yet — install from GitHub with the TUI extra:
+
 ```bash
-pipx install ephor          # or: pip install --user ephor / uv tool install ephor
-ephor --version             # → ephor 0.1.1
+pipx install 'ephor-orchestrator[tui] @ git+https://github.com/BradBissell/ephor'
+# or: uv tool install 'ephor-orchestrator[tui] @ git+https://github.com/BradBissell/ephor'
+ephor --version             # → ephor 0.2.0
 ```
 
 To hack on ephor itself, install editable from a checkout instead:
 
 ```bash
 cd ~/projects/ephor
-pipx install --editable .
+pipx install --editable '.[tui]'
+# or: uv tool install --editable '.[tui]'
 ```
 
 ## 3. Wire up hooks

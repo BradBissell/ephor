@@ -696,7 +696,8 @@ def _cmd_tui() -> int:
         from ephor.tui.app import run as run_tui
     except ImportError as exc:
         print(
-            "ephor: TUI extras not installed. Reinstall with `pipx install -e '.[tui]'` "
+            "ephor: TUI extras not installed. Reinstall with "
+            "`pipx install 'ephor-orchestrator[tui] @ git+https://github.com/BradBissell/ephor'` "
             f"or `pip install textual`. ({exc})",
             file=sys.stderr,
         )

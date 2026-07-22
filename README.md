@@ -1,6 +1,6 @@
 # ephor — coding-agent session orchestrator for Linux
 
-[![CI](https://github.com/BradBissell/claude-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/BradBissell/claude-orchestrator/actions/workflows/ci.yml)
+[![CI](https://github.com/BradBissell/ephor/actions/workflows/ci.yml/badge.svg)](https://github.com/BradBissell/ephor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
@@ -53,13 +53,30 @@ presses Enter to jump to the right tmux window.
 
 ## Install
 
+`ephor-orchestrator` is not on PyPI yet (the bare name `ephor` is taken by an
+unrelated project). Install from GitHub with the TUI extra:
+
 ```bash
-pipx install ephor-orchestrator
+# pipx
+pipx install 'ephor-orchestrator[tui] @ git+https://github.com/BradBissell/ephor'
+
+# or uv
+uv tool install 'ephor-orchestrator[tui] @ git+https://github.com/BradBissell/ephor'
+
 ephor init --provider all   # installs hooks into every agent you use
 ephor                       # launches the TUI dashboard (alias: ephor tui)
 ```
 
-(Or use `pip install --user ephor-orchestrator` / `uv tool install ephor-orchestrator`.)
+Without `[tui]` you still get `ephor list` / `init` / `doctor`; the dashboard
+needs Textual, which the extra pulls in.
+
+Editable checkout (for hacking on ephor itself):
+
+```bash
+cd /path/to/ephor
+pipx install --editable '.[tui]'
+# or: uv tool install --editable '.[tui]'
+```
 
 ## Quickstart
 

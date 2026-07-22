@@ -6,7 +6,7 @@ reports, fixes, and well-scoped features are all welcome.
 ## Quick start
 
 ```bash
-git clone https://github.com/BradBissell/claude-orchestrator
+git clone https://github.com/BradBissell/ephor
 cd ephor
 
 # Editable install with dev + TUI extras.
