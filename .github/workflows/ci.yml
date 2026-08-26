@@ -41,7 +41,7 @@ jobs:
         run: mypy src
 
       - name: Test (pytest)
-        run: pytest --cov=claude_orchestrator --cov-report=term-missing
+        run: pytest --cov=ephor --cov-report=term-missing
 
   shell:
     name: Shell scripts (shellcheck)
