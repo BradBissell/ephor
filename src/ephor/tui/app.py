@@ -30,6 +30,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
+from textual.css.query import NoMatches
 from textual.widgets import Footer, Header, Input, ListItem, ListView, Static
 
 from ephor.account import AccountConfig, load_account_config
@@ -303,7 +304,15 @@ class EphorApp(App[int]):
                 self._activity.sample(pid)
             self._activity.prune(live_pids)
 
-            list_view = self.query_one(ListView)
+            try:
+                list_view = self.query_one(ListView)
+            except NoMatches:
+                # A refresh tick can land before compose has mounted the list,
+                # or after the screen has started tearing down. Textual lets
+                # the exception escape the timer callback and kills the app,
+                # so treat a missing list as "nothing to draw" and let the
+                # next tick catch up.
+                return
             new_sids = [a.session_id for a in agents]
 
             # If the user just switched their terminal focus (e.g. clicked a

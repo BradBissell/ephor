@@ -898,3 +898,28 @@ async def test_summarize_agy_reads_brain_transcript(
     saved = (tmp_path / "summaries" / "agy-sid.json").read_text()
     assert "Review GCP deployment config" in saved
     assert "WRONG-claude-path" not in saved
+
+
+@pytest.mark.asyncio
+async def test_refresh_tick_survives_missing_list_view(populated_dir: Path) -> None:
+    """A refresh tick landing while the ListView is absent must be a no-op.
+
+    Textual lets an exception raised inside a timer callback escape and kill
+    the app, so the unguarded `query_one(ListView)` in `_refresh_table` turned
+    a normal teardown-window race into a hard failure:
+
+        textual/timer.py:189 in _tick -> app.py in _refresh_table
+        textual.css.query.NoMatches: No nodes match 'ListView'
+
+    It only reproduced on the slowest CI runners, where the window is wide
+    enough to lose. Removing the widget makes that window deterministic.
+    """
+    app = EphorApp(manager=StateManager(populated_dir))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        list_view = await _list_view(app, pilot)
+        await list_view.remove()
+        await pilot.pause()
+        assert not len(app.query(type(list_view)))
+
+        # The tick must return quietly rather than raise.
+        await app._refresh_table()
