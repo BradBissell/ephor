@@ -800,9 +800,7 @@ def test_summarize_text_pairs_prompt_and_reply(monkeypatch: pytest.MonkeyPatch) 
 
 def test_summarize_text_reply_only_when_no_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, str] = {}
-    monkeypatch.setattr(
-        summarizer_module, "_run_backend", lambda t: seen.update(t=t) or "x"
-    )
+    monkeypatch.setattr(summarizer_module, "_run_backend", lambda t: seen.update(t=t) or "x")
     summarize_text("just the reply")
     assert seen["t"] == "ASSISTANT: just the reply"
 
@@ -832,15 +830,24 @@ def test_extract_agy_messages_keeps_prose_drops_tool_noise(tmp_path: Path) -> No
         tmp_path,
         "conv-1",
         [
-            {"source": "USER_EXPLICIT", "type": "USER_INPUT",
-             "content": "<USER_REQUEST>\nreview the GCP deploy\n</USER_REQUEST>\n"
-                        "<ADDITIONAL_METADATA>time</ADDITIONAL_METADATA>"},
+            {
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>\nreview the GCP deploy\n</USER_REQUEST>\n"
+                "<ADDITIONAL_METADATA>time</ADDITIONAL_METADATA>",
+            },
             {"source": "SYSTEM", "type": "CONVERSATION_HISTORY"},
-            {"source": "MODEL", "type": "LIST_DIRECTORY",
-             "content": "Created At: ...\n{\"name\":\".claude\"}"},
+            {
+                "source": "MODEL",
+                "type": "LIST_DIRECTORY",
+                "content": 'Created At: ...\n{"name":".claude"}',
+            },
             {"source": "MODEL", "type": "RUN_COMMAND", "content": "exit code 0"},
-            {"source": "MODEL", "type": "PLANNER_RESPONSE",
-             "content": "The Cloud Run service is missing a health check."},
+            {
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "content": "The Cloud Run service is missing a health check.",
+            },
         ],
     )
     msgs = _extract_agy_messages(p)
@@ -862,8 +869,11 @@ def test_summarize_agy_reads_transcript_by_session_id(
         brain,
         "conv-42",
         [
-            {"source": "USER_EXPLICIT", "type": "USER_INPUT",
-             "content": "<USER_REQUEST>fix the deploy</USER_REQUEST>"},
+            {
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>fix the deploy</USER_REQUEST>",
+            },
             {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Fixed the health check."},
         ],
     )
