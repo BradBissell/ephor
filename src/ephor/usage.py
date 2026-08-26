@@ -581,7 +581,7 @@ def fetch_oauth_usage(
     token = _read_oauth_token(credentials_path)
     if token is None:
         return OAuthUsageSnapshot(None, None, None, None, now, error="no_oauth")
-    req = urllib.request.Request(  # noqa: S310 — endpoint is hardcoded https
+    req = urllib.request.Request(  # endpoint is hardcoded https
         OAUTH_USAGE_ENDPOINT,
         headers={
             "Authorization": f"Bearer {token}",
