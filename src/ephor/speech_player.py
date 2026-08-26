@@ -348,7 +348,7 @@ class SpeechPlayer:
                     summary = fn(Path(transcript_path), cwd)
                 if not summary and item.text:
                     summary = summarize_text(item.text, cwd)
-            except Exception:  # noqa: BLE001 - background work must not crash the TUI
+            except Exception:  # background work must not crash the TUI
                 log.debug("summary worker failed", exc_info=True)
                 summary = ""
             if not summary:
