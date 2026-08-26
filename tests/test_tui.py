@@ -29,6 +29,24 @@ def _write_state(directory: Path, sid: str, **overrides: Any) -> None:
     (directory / f"{sid}.json").write_text(state.to_json())
 
 
+async def _list_view(app: EphorApp, pilot: Any) -> Any:
+    """Return the app's mounted ListView, waiting for compose to finish.
+
+    A single `pilot.pause()` yields one message-pump cycle. That is enough on
+    a fast machine, but on a loaded CI runner the query can land before the
+    widget has mounted and raise NoMatches. Pump until it shows up instead of
+    assuming one cycle was enough.
+    """
+    from textual.widgets import ListView
+
+    for _ in range(50):
+        nodes = app.query(ListView)
+        if len(nodes):
+            return nodes.first()
+        await pilot.pause()
+    raise AssertionError("ListView never mounted")
+
+
 @pytest.fixture
 def populated_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     sd = tmp_path / "sessions"
@@ -409,9 +427,7 @@ async def test_next_attention_jumps_to_perm_row(
     app = EphorApp(manager=StateManager(sd))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
-        from textual.widgets import ListView
-
-        list_view = app.query_one(ListView)
+        list_view = await _list_view(app, pilot)
         list_view.index = 0
         await pilot.press("n")
         await pilot.pause()
@@ -435,9 +451,7 @@ async def test_next_attention_wraps_when_past_last(
     app = EphorApp(manager=StateManager(sd))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
-        from textual.widgets import ListView
-
-        list_view = app.query_one(ListView)
+        list_view = await _list_view(app, pilot)
         # Park cursor past the only attention row to force wrap.
         list_view.index = len(app._sid_by_row) - 1
         await pilot.press("n")
@@ -525,12 +539,10 @@ async def test_cold_path_refresh_keeps_dom_and_state_in_sync(
     populated, producing a "no row selected" toast even though the visible
     list looked normal.
     """
-    from textual.widgets import ListView
-
     app = EphorApp(manager=StateManager(populated_dir))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
-        list_view = app.query_one(ListView)
+        list_view = await _list_view(app, pilot)
 
         # Initial mount: 3 sessions. DOM and state must agree.
         assert len(app._sid_by_row) == 3
@@ -685,9 +697,7 @@ async def test_auto_follow_moves_cursor_to_externally_focused_session(
     app = EphorApp(manager=StateManager(sd))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
-        from textual.widgets import ListView
-
-        list_view = app.query_one(ListView)
+        list_view = await _list_view(app, pilot)
 
         # The user "switches" to a Ghostty showing session beta.
         state["pane"] = "%20"
@@ -730,9 +740,7 @@ async def test_auto_follow_ignores_panes_with_no_matching_session(
     app = EphorApp(manager=StateManager(sd))
     async with app.run_test() as pilot:  # type: ignore[arg-type]
         await pilot.pause()
-        from textual.widgets import ListView
-
-        list_view = app.query_one(ListView)
+        list_view = await _list_view(app, pilot)
         # User picks the second row manually.
         list_view.index = 1
         await app._refresh_table()
