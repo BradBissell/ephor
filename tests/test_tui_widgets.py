@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from ephor.constants import AgentStatus
+from ephor.github import PullRequest
 from ephor.state.manager import StateManager
 from ephor.state.models import AgentState, StatusSummary
 from ephor.tui.app import EphorApp
@@ -21,7 +22,9 @@ from ephor.tui.widgets.header_bar import format_header
 from ephor.tui.widgets.session_row import (
     _SPARK_GLYPHS,
     _SPARK_WIDTH,
+    _TICKET_COL_WIDTH,
     render_sparkline,
+    render_ticket_cell,
 )
 
 # ---- render_sparkline -----------------------------------------------------
@@ -230,19 +233,33 @@ def test_session_row_uses_em_dash_when_no_ticket(tmp_path: Path) -> None:
     assert "—" in rendered
 
 
-def test_session_row_prefers_summary_prefix_over_cwd(tmp_path: Path) -> None:
-    """When the LLM summary already begins with a Jira key, that wins
-    over a cwd-derived key (summary is the freshest signal)."""
+def test_session_row_prefers_cwd_over_summary_prefix(tmp_path: Path) -> None:
+    """The cwd-derived key wins over one parsed out of the LLM summary.
+
+    The summarizer already glues the cwd key onto its own output, so a key
+    that differs there is the model's reading of the transcript — the
+    weakest of the signals, not the freshest.
+    """
     from ephor.tui.widgets.session_row import SessionRow
 
     worktree = tmp_path / "DR-1111"
     worktree.mkdir()
     row = SessionRow()
     agent = _agent_for_row(cwd=str(worktree))
-    row.update_agent(agent, summary="DR-2222: fresh signal")
+    row.update_agent(agent, summary="DR-2222: model's guess")
+    rendered = str(row.render())
+    assert "DR-1111" in rendered
+
+
+def test_session_row_falls_back_to_summary_when_cwd_has_no_key(tmp_path: Path) -> None:
+    """A shared checkout with no key in the path still gets a ticket."""
+    from ephor.tui.widgets.session_row import SessionRow
+
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(tmp_path))
+    row.update_agent(agent, summary="DR-2222: doing the work")
     rendered = str(row.render())
     assert "DR-2222" in rendered
-    assert "DR-1111" not in rendered
 
 
 def test_session_row_shows_provider_column(tmp_path: Path) -> None:
@@ -282,3 +299,78 @@ def test_session_row_provider_placeholder_when_unknown(tmp_path: Path) -> None:
     row.update_agent(agent, summary="x")
     rendered = str(row.render())
     assert "—" in rendered
+
+
+# ---- Jira cell / PR link --------------------------------------------------
+
+
+def test_ticket_cell_without_pr_is_plain_but_clickable() -> None:
+    cell = render_ticket_cell("DR-8222", "sid-1")
+    assert "@click=app.open_pr('sid-1')" in cell
+    assert "underline" not in cell
+    assert "DR-8222" in cell
+
+
+def test_ticket_cell_with_open_pr_is_underlined() -> None:
+    pr = PullRequest(number=7, url="https://github.com/a/b/pull/7", state="OPEN")
+    cell = render_ticket_cell("DR-8222", "sid-1", pr)
+    assert "underline" in cell
+    assert "@click=app.open_pr('sid-1')" in cell
+
+
+def test_ticket_cell_colors_merged_and_closed_differently() -> None:
+    merged = render_ticket_cell("DR-1", "sid", PullRequest(number=1, url="u", state="MERGED"))
+    closed = render_ticket_cell("DR-1", "sid", PullRequest(number=1, url="u", state="CLOSED"))
+    open_pr = render_ticket_cell("DR-1", "sid", PullRequest(number=1, url="u", state="OPEN"))
+    assert merged != closed != open_pr
+
+
+def test_ticket_cell_placeholder_is_not_clickable() -> None:
+    cell = render_ticket_cell("—", "sid-1")
+    assert "@click" not in cell
+
+
+def test_ticket_cell_refuses_to_interpolate_an_unsafe_session_id() -> None:
+    """A crafted state file must not be able to inject markup or an action."""
+    cell = render_ticket_cell("DR-8222", "sid') app.quit(")
+    assert "@click" not in cell
+    assert "app.quit" not in cell
+
+
+def test_ticket_cell_pads_to_a_stable_width() -> None:
+    """Column alignment must not shift as PR status changes."""
+    import re as _re
+
+    def visible(markup: str) -> str:
+        return _re.sub(r"\[[^\]]*\]", "", markup)
+
+    pr = PullRequest(number=7, url="u", state="OPEN")
+    widths = {
+        len(visible(render_ticket_cell("DR-8222", "sid-1"))),
+        len(visible(render_ticket_cell("DR-8222", "sid-1", pr))),
+        len(visible(render_ticket_cell("DR-1", "sid-1", pr))),
+        len(visible(render_ticket_cell("—", "sid-1"))),
+    }
+    assert widths == {_TICKET_COL_WIDTH}
+
+
+def test_ticket_cell_markup_parses_into_a_click_span() -> None:
+    """Textual must actually turn the cell into a click target.
+
+    render_ticket_cell emits markup; if Textual's parser ever stops
+    accepting the `@click` form the key would silently render as inert
+    text, so assert on the parsed spans rather than the string.
+    """
+    from textual.content import Content
+
+    content = Content.from_markup(render_ticket_cell("DR-8222", "sid-1"))
+    click_spans = [
+        span
+        for span in content.spans
+        if isinstance(span.style, str) and span.style.startswith("@click=")
+    ]
+    assert len(click_spans) == 1
+    span = click_spans[0]
+    assert span.style == "@click=app.open_pr('sid-1')"
+    # The hit area is the key itself, not the alignment padding.
+    assert content.plain[span.start : span.end] == "DR-8222"

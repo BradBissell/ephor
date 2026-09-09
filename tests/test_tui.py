@@ -6,6 +6,7 @@ StateManager and that key bindings invoke the right action.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -923,3 +924,197 @@ async def test_refresh_tick_survives_missing_list_view(populated_dir: Path) -> N
 
         # The tick must return quietly rather than raise.
         await app._refresh_table()
+
+
+# ---- pull-request link ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_open_pr_opens_the_cached_url(
+    populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`o` on a row with a known PR hands the URL to the browser."""
+    from ephor.github import PullRequest
+
+    app = EphorApp(manager=StateManager(populated_dir))
+    opened: list[str] = []
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        list_view = await _list_view(app, pilot)
+        assert list_view.index is not None
+        sid = app._sid_by_row[list_view.index]
+        agent = next(a for a in app._manager.scan() if a.session_id == sid)
+        pr = PullRequest(number=99, url="https://github.com/acme/repo/pull/99", state="OPEN")
+        app._prs._store(app._prs._key(agent.cwd), pr)  # type: ignore[arg-type]
+        monkeypatch.setattr(app, "open_url", lambda url, **kw: opened.append(url))
+        await pilot.press("o")
+        await pilot.pause()
+    assert opened == ["https://github.com/acme/repo/pull/99"]
+
+
+@pytest.mark.asyncio
+async def test_clicking_the_ticket_cell_dispatches_open_pr(populated_dir: Path) -> None:
+    """The markup action the row emits must be a real, callable action.
+
+    Guards the string in render_ticket_cell against silently rotting into a
+    no-op if the action is ever renamed.
+    """
+    app = EphorApp(manager=StateManager(populated_dir))
+    called: list[str | None] = []
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        list_view = await _list_view(app, pilot)
+        assert list_view.index is not None
+        sid = app._sid_by_row[list_view.index]
+        app.action_open_pr = lambda s=None: called.append(s)  # type: ignore[method-assign]
+        await app.run_action(f"open_pr('{sid}')")
+        await pilot.pause()
+    assert called == [sid]
+
+
+@pytest.mark.asyncio
+async def test_open_pr_with_no_selection_toasts(tmp_path: Path) -> None:
+    app = EphorApp(manager=StateManager(tmp_path))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        await _list_view(app, pilot)
+        app.action_open_pr()
+        await pilot.pause()
+        assert app._toast is not None
+        assert "no row selected" in str(app._toast.render())
+
+
+@pytest.mark.asyncio
+async def test_background_sweep_attaches_a_pr_to_the_row(
+    populated_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep resolves each visible session once and repaints its row."""
+    from ephor.github import PullRequest
+
+    pr = PullRequest(number=5, url="https://github.com/acme/repo/pull/5", state="OPEN")
+    resolved: list[str] = []
+
+    def fake_resolve(self: Any, cwd: Any, ticket: Any = None) -> PullRequest:
+        resolved.append(str(cwd))
+        self._store(self._key(cwd), pr)
+        return pr
+
+    monkeypatch.setattr(tui_app.PrResolver, "resolve", fake_resolve)
+
+    app = EphorApp(manager=StateManager(populated_dir))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        list_view = await _list_view(app, pilot)
+        for _ in range(50):
+            if resolved:
+                break
+            await pilot.pause()
+        assert resolved, "sweep never probed any session"
+        await pilot.pause()
+        sid = app._sid_by_row[list_view.index or 0]
+        agent = next(a for a in app._manager.scan() if a.session_id == sid)
+        assert app._prs.cached(agent.cwd) == pr
+        # A TTL'd hit means the next sweep leaves it alone.
+        before = len(resolved)
+        app._refresh_prs()
+        await pilot.pause()
+        assert len(resolved) == before
+
+
+@pytest.fixture
+def solo_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A state dir with exactly one session.
+
+    The PR cache is keyed by working directory, and every session in
+    `populated_dir` shares `/tmp/x` — fine for the app, useless for
+    counting probes. One session, one cwd, one probe.
+    """
+    sd = tmp_path / "solo"
+    sd.mkdir()
+    monkeypatch.setenv("EPHOR_STATE_DIR", str(sd))
+    _write_state(sd, "solo-id", project_name="solo", cwd=str(tmp_path / "DR-4242"))
+    return sd
+
+
+@pytest.mark.asyncio
+async def test_r_forces_a_fresh_ticket_and_pr_probe(
+    solo_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`r` must invalidate both caches so a long-lived session re-harvests."""
+    from ephor import jira as jira_module
+    from ephor.github import PullRequest
+
+    pr = PullRequest(number=5, url="https://github.com/acme/repo/pull/5", state="OPEN")
+    probes: list[str] = []
+
+    def fake_resolve(self: Any, cwd: Any, ticket: Any = None) -> PullRequest:
+        probes.append(str(cwd))
+        self._store(self._key(cwd), pr)
+        return pr
+
+    monkeypatch.setattr(tui_app.PrResolver, "resolve", fake_resolve)
+
+    app = EphorApp(manager=StateManager(solo_dir))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        await _list_view(app, pilot)
+        for _ in range(50):
+            if probes:
+                break
+            await pilot.pause()
+        assert len(probes) == 1
+        # A warm hit is normally held for an hour — the sweep leaves it be.
+        app._refresh_prs()
+        await pilot.pause()
+        assert len(probes) == 1
+        # Poison the cwd→ticket memo with a long-lived wrong answer, the
+        # way a real one goes stale when the session switches branch.
+        cwd = next(a.cwd for a in app._manager.scan())
+        jira_module._cwd_cache[cwd] = ("DR-9999", time.monotonic() + 9999)
+        # Repaint on demand — the 500ms refresh timer doesn't tick under Pilot.
+        await app._refresh_table()
+        row = app._rows_by_sid["solo-id"]
+        assert "DR-9999" in str(row.render())
+
+        await pilot.press("r")
+        for _ in range(50):
+            if len(probes) > 1:
+                break
+            await pilot.pause()
+        assert len(probes) == 2, "r did not re-probe the PR cache"
+        assert "DR-4242" in str(row.render()), "r did not re-harvest the ticket"
+
+
+@pytest.mark.asyncio
+async def test_o_re_probes_after_a_cached_miss(
+    solo_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Press `o`, push the branch, press `o` again — the second press must
+    hit `gh` rather than re-serving the memoized "no PR"."""
+    from ephor.github import PullRequest
+
+    pr = PullRequest(number=8, url="https://github.com/acme/repo/pull/8", state="OPEN")
+    results: list[PullRequest | None] = [None, pr]
+    probes: list[str] = []
+    opened: list[str] = []
+
+    def fake_resolve(self: Any, cwd: Any, ticket: Any = None) -> PullRequest | None:
+        probes.append(str(cwd))
+        out = results.pop(0) if results else pr
+        self._store(self._key(cwd), out)
+        return out
+
+    monkeypatch.setattr(tui_app.PrResolver, "resolve", fake_resolve)
+
+    app = EphorApp(manager=StateManager(solo_dir))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        await _list_view(app, pilot)
+        monkeypatch.setattr(app, "open_url", lambda url, **kw: opened.append(url))
+        # Let the startup sweep record the miss.
+        for _ in range(50):
+            if probes:
+                break
+            await pilot.pause()
+        assert len(probes) == 1
+        await pilot.press("o")
+        for _ in range(50):
+            if opened:
+                break
+            await pilot.pause()
+    assert len(probes) == 2, "o re-served the cached miss instead of re-probing"
+    assert opened == ["https://github.com/acme/repo/pull/8"]

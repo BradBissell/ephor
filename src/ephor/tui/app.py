@@ -59,6 +59,8 @@ from ephor.account_usage import (
     save_store as save_account_store,
 )
 from ephor.constants import AgentStatus
+from ephor.github import PrResolver, PullRequest
+from ephor.jira import clear_cwd_cache, ticket_for_agent
 from ephor.speech import SpeechWatcher
 from ephor.speech_player import SpeechPlayer
 from ephor.speech_settings import load as load_speech_settings
@@ -103,6 +105,11 @@ KILL_CONFIRM_WINDOW_SEC = 3.0  # second-press window to actually fire the kill
 # update on assistant turn completion, so refreshing more often than this
 # is wasted I/O.
 USAGE_REFRESH_INTERVAL = DEFAULT_REFRESH_INTERVAL_SEC
+# How often the background worker sweeps sessions looking for a pull
+# request to attach to their Jira cell. Each miss costs a `gh` round trip,
+# and PrResolver's own TTL already throttles re-probes, so this only needs
+# to be often enough that a PR opened mid-session lights up promptly.
+PR_REFRESH_INTERVAL = 20.0
 
 
 class StatusToast(Static):
@@ -133,6 +140,7 @@ class EphorApp(App[int]):
         Binding("r", "refresh", "refresh now"),
         Binding("x", "kill", "kill selected session"),
         Binding("s", "summarize", "summarize selected session"),
+        Binding("o", "open_pr", "open the selected session's pull request"),
         Binding("t", "jump_speaking", "jump to TTS speaking session"),
         Binding("m", "toggle_mute", "mute / unmute TTS playback"),
         Binding("M", "toggle_speak_mode", "TTS: full reply ↔ summary"),
@@ -169,6 +177,10 @@ class EphorApp(App[int]):
         self._account: AccountConfig = load_account_config()
         self._summaries = SummaryStore()
         self._summarizing: set[str] = set()  # in-flight session_ids
+        # Jira key -> GitHub PR, resolved off the render path. `cached()` is
+        # what SessionRow reads; the worker below fills it in.
+        self._prs = PrResolver()
+        self._pr_lookup_in_flight: set[str] = set()
         self._kill_armed_sid: str | None = None
         self._kill_armed_at: float = 0.0
         self._filter: str = ""  # case-insensitive substring filter; "" = show all
@@ -252,6 +264,10 @@ class EphorApp(App[int]):
         # so the next queued item starts. Same cadence as the SpeechBar
         # refresh — they read the same underlying state.
         self.set_interval(0.2, self._tick_speech_player)
+        # Warm the PR cache immediately so the first paint after startup
+        # already carries links for sessions with review in flight.
+        self._refresh_prs()
+        self.set_interval(PR_REFRESH_INTERVAL, self._refresh_prs)
 
     def _tick_speech_player(self) -> None:
         """Drive the speech player. Wrapped in suppress so a transient
@@ -380,6 +396,7 @@ class EphorApp(App[int]):
                     summary=self._summaries.get(agent.session_id),
                     tokens=self._tokens.total_for(agent),
                     speaking=(agent.session_id == speaking_sid),
+                    pr=self._prs.cached(agent.cwd),
                 )
                 item = ListItem(row)
                 items.append(item)
@@ -418,6 +435,7 @@ class EphorApp(App[int]):
                     samples=self._activity.samples_for(agent.agent_pid),
                     summary=self._summaries.get(agent.session_id),
                     speaking=(agent.session_id == speaking_sid),
+                    pr=self._prs.cached(agent.cwd),
                 )
 
     def _speaking_sid(self) -> str | None:
@@ -569,8 +587,20 @@ class EphorApp(App[int]):
         await self.action_jump()
 
     async def action_refresh(self) -> None:
+        """Redraw, and force a fresh ticket + PR harvest. Bound to `r`.
+
+        Both caches exist to keep subprocesses off the render path, which
+        means a long-lived session can outlast the truth: the branch moved,
+        the PR merged, or a PR was opened after we last looked. `r` is the
+        escape hatch — it drops every memoized answer so the next sweep
+        re-probes `git` and `gh` from scratch, rather than making the user
+        restart ephor or wait out an hour-long TTL.
+        """
+        clear_cwd_cache()
+        self._prs.invalidate()
         await self._refresh_table()
-        self._set_toast("refreshed")
+        self._refresh_prs()
+        self._set_toast("refreshed — re-resolving tickets and pull requests")
 
     def action_filter(self) -> None:
         """Reveal the filter input and focus it. '/' enters this state."""
@@ -1070,6 +1100,7 @@ class EphorApp(App[int]):
                         agent,
                         samples=self._activity.samples_for(agent.agent_pid),
                         summary=text,
+                        pr=self._prs.cached(agent.cwd),
                     )
             if manual:
                 self._set_toast(f"summary updated for {sid[:8]}")
@@ -1085,6 +1116,132 @@ class EphorApp(App[int]):
                 )
             else:
                 self._set_toast(unavailable_reason())
+
+    # ---- pull requests --------------------------------------------------
+
+    def action_open_pr(self, sid: str | None = None) -> None:
+        """Open the pull request for a session in the browser.
+
+        Bound to ``o`` for the highlighted row, and dispatched by clicking
+        the Jira cell (which passes the row's session id). When the PR
+        isn't cached yet we kick off a lookup and open it when it lands, so
+        a click always does *something* — the alternative (a dead-looking
+        key until the background sweep catches up) is worse.
+        """
+        if sid is None:
+            try:
+                list_view = self.query_one(ListView)
+            except NoMatches:
+                return
+            sid = self._cursor_sid(list_view)
+        if sid is None:
+            self._set_toast("no row selected")
+            return
+        agent = next((a for a in self._manager.scan() if a.session_id == sid), None)
+        if agent is None:
+            self._set_toast(f"session {sid[:8]} disappeared between refreshes")
+            return
+        pr = self._prs.cached(agent.cwd)
+        if pr is not None:
+            self._open_pr(pr)
+            return
+        # No cached PR. Drop any memoized miss first: the usual reason a
+        # user presses `o` twice is that they just pushed the branch, and
+        # re-serving the 90s-old "nothing here" would make the key look
+        # broken. An explicit keypress is worth one fresh `gh` call.
+        clear_cwd_cache()
+        self._prs.invalidate(agent.cwd)
+        ticket = ticket_for_agent(agent, self._summaries.get(sid))
+        self._set_toast(f"looking up pull request for {ticket or agent.project_name or sid[:8]}…")
+        self._lookup_pr(sid, agent.cwd, ticket, announce=True)
+
+    def _open_pr(self, pr: PullRequest) -> None:
+        self.open_url(pr.url)
+        self._set_toast(f"opening PR #{pr.number} — {pr.url}")
+
+    @work(thread=True, exit_on_error=False, group="pr-lookup")
+    def _lookup_pr(self, sid: str, cwd: str, ticket: str | None, announce: bool = False) -> None:
+        """Background-thread worker: resolve one session's PR via `gh`.
+
+        ``announce=True`` means a human is waiting on this (they pressed
+        ``o`` or clicked the key), so open the result — or explain the
+        miss — instead of silently warming the cache.
+        """
+        if sid in self._pr_lookup_in_flight:
+            return
+        self._pr_lookup_in_flight.add(sid)
+        try:
+            pr = self._prs.resolve(cwd, ticket)
+        finally:
+            self._pr_lookup_in_flight.discard(sid)
+        self.call_from_thread(self._on_pr_resolved, sid, pr, ticket, announce)
+
+    def _on_pr_resolved(
+        self, sid: str, pr: PullRequest | None, ticket: str | None, announce: bool
+    ) -> None:
+        """Main-thread callback: repaint the row, and open if asked."""
+        if pr is not None:
+            row = self._rows_by_sid.get(sid)
+            if row is not None:
+                agent = next((a for a in self._manager.scan() if a.session_id == sid), None)
+                if agent is not None:
+                    row.update_agent(
+                        agent,
+                        samples=self._activity.samples_for(agent.agent_pid),
+                        summary=self._summaries.get(sid),
+                        pr=pr,
+                    )
+            if announce:
+                self._open_pr(pr)
+            return
+        if announce:
+            label = ticket or sid[:8]
+            self._set_toast(
+                f"no pull request found for {label} — is the branch pushed, and is `gh` "
+                "installed and authenticated?"
+            )
+
+    def _refresh_prs(self) -> None:
+        """Sweep visible sessions and queue `gh` lookups for stale entries.
+
+        Runs on the UI thread but does no I/O itself: it only decides which
+        directories still need probing (PrResolver's TTL does the
+        throttling) and hands the batch to a single worker.
+        """
+        visible = set(self._sid_by_row)
+        if not visible:
+            return
+        pending: list[tuple[str, str, str | None]] = []
+        for state in self._manager.scan():
+            sid = state.session_id
+            if sid not in visible or not state.cwd:
+                continue
+            if sid in self._pr_lookup_in_flight or not self._prs.needs_refresh(state.cwd):
+                continue
+            pending.append((sid, state.cwd, ticket_for_agent(state, self._summaries.get(sid))))
+        if pending:
+            self._sweep_prs(pending)
+
+    @work(thread=True, exit_on_error=False, group="pr-sweep", exclusive=True)
+    def _sweep_prs(self, pending: list[tuple[str, str, str | None]]) -> None:
+        """Background-thread worker: probe a batch of sessions, one at a time.
+
+        Serial on purpose. Each miss is a `gh` round trip of up to a second;
+        firing one worker per session would put a dozen network calls in
+        flight every sweep on a busy dashboard for a decoration, not a
+        blocker. exclusive=True means a slow sweep is superseded by the
+        next one rather than piling up.
+        """
+        for sid, cwd, ticket in pending:
+            if sid in self._pr_lookup_in_flight:
+                continue
+            self._pr_lookup_in_flight.add(sid)
+            try:
+                pr = self._prs.resolve(cwd, ticket)
+            finally:
+                self._pr_lookup_in_flight.discard(sid)
+            if pr is not None:
+                self.call_from_thread(self._on_pr_resolved, sid, pr, ticket, False)
 
 
 # ---------------------------------------------------------------------------

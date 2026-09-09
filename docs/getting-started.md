@@ -115,7 +115,15 @@ Bare `ephor` (or the explicit `ephor tui`) opens the live Textual
 dashboard — the daily-driver UI. Use
 `j`/`k` or arrows to move, `Enter` to jump to a session's tmux pane,
 `/` to filter, `x` to kill, `n` to hop to the next session needing
-attention, and `?` for the full keymap.
+attention, `o` to open the selected session's GitHub pull request, and
+`?` for the full keymap.
+
+The Jira key at the tail of each row is clickable: when ephor has
+resolved the session's PR (via `gh`, in the background) the key is
+underlined and a click opens the pull request. Green means open, purple
+merged, red closed. `r` re-harvests tickets and PRs for every visible
+session — use it after switching a session's branch or merging its PR,
+rather than restarting ephor.
 
 Prefer the shell? The same state is available script-side:
 
