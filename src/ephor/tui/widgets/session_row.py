@@ -10,13 +10,18 @@ than a leading icon/label cell.
 Sparkline data comes from `activity_samples`; if empty, render a dim placeholder
 so the column doesn't shift width when samples land later.
 
-The Jira ticket cell replaces the older session_id tail. T/E (tool count +
+The Jira ticket cell replaces the older session_id tail. It is clickable:
+when the session's PR is known the key dispatches ``app.open_pr(<sid>)``,
+which opens the pull request in the browser (the ``o`` hotkey does the same
+for the selected row). Underlined + bright = PR resolved; plain green =
+ticket known but no PR found yet; dim dash = no ticket. T/E (tool count +
 error count) cells were removed once the LLM summary made them redundant —
 errors still surface through the status icon and the STALE badge.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 from textual.widgets import Static
@@ -26,7 +31,8 @@ from ephor.constants import (
     STATUS_DISPLAY,
     AgentStatus,
 )
-from ephor.jira import ticket_for_cwd
+from ephor.github import PullRequest
+from ephor.jira import ticket_for_agent
 from ephor.state.models import AgentState
 
 _SPARK_GLYPHS = "▁▂▃▄▅▆▇█"
@@ -79,20 +85,54 @@ def _truncate(text: str, width: int) -> str:
     return text[: width - 1] + "…"
 
 
+# Session ids come off disk, and the id is interpolated into a Textual
+# markup action. Only render a click handler for ids that can't break out
+# of the quoted argument.
+_SAFE_SID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
 def _ticket_label(agent: AgentState, summary: str | None) -> str:
     """Best-effort Jira key for the row. Falls back to "—" placeholder.
 
-    Preference order: an LLM summary that already carries a JIRA-shaped
-    prefix wins (it's the freshest signal — the model just read the
-    transcript). Otherwise we infer from the working directory.
+    See :func:`ephor.jira.ticket_for_agent` for the probe order.
     """
-    if summary:
-        from ephor.jira import extract_ticket
+    return ticket_for_agent(agent, summary) or "—"
 
-        ticket = extract_ticket(summary)
-        if ticket:
-            return ticket
-    return ticket_for_cwd(agent.cwd) or "—"
+
+def render_ticket_cell(
+    ticket: str,
+    session_id: str = "",
+    pr: PullRequest | None = None,
+    width: int = _TICKET_COL_WIDTH,
+) -> str:
+    """Markup for the Jira cell — a click target when a PR is known.
+
+    A resolved PR renders the key underlined and colored by PR state
+    (green open, purple merged, red closed) and wraps it in a Textual
+    ``@click`` action so a mouse click opens the pull request. Without a
+    PR the key still clicks through — the action resolves lazily and
+    toasts if there's nothing to open — but stays unadorned so the
+    dashboard shows at a glance which sessions have review in flight.
+    """
+    if ticket == "—":
+        return f"[dim]{ticket:<{width}}[/]"
+    if pr is not None:
+        state = pr.state.upper()
+        if state == "MERGED":
+            color = "#bc8cff"
+        elif state == "CLOSED":
+            color = "#f85149"
+        else:
+            color = "#7ee787"
+        style = f"{color} underline"
+    else:
+        style = "#7ee787"
+    padded = f"{ticket:<{width}}"
+    if not _SAFE_SID.fullmatch(session_id):
+        return f"[{style}]{padded}[/]"
+    # Pad outside the click span so the hit area is the key itself, not
+    # the trailing alignment whitespace.
+    return f"[@click=app.open_pr('{session_id}')][{style}]{ticket}[/][/]{padded[len(ticket) :]}"
 
 
 class SessionRow(Static):
@@ -105,6 +145,7 @@ class SessionRow(Static):
         summary: str | None = None,
         tokens: int | None = None,
         speaking: bool = False,
+        pr: PullRequest | None = None,
     ) -> None:
         # Status is shown purely by color now (no icon/label cell); the color
         # tints the project name below.
@@ -132,10 +173,9 @@ class SessionRow(Static):
 
         # Jira cell: takes the slot the session_id occupied. When no
         # ticket can be inferred we render a dim em-dash so column width
-        # stays stable across sessions.
+        # stays stable across sessions. Clicking it opens the PR.
         ticket = _ticket_label(agent, summary)
-        ticket_color = "#7ee787" if ticket != "—" else "dim"
-        ticket_cell = f"[{ticket_color}]{ticket:<{_TICKET_COL_WIDTH}}[/]"
+        ticket_cell = render_ticket_cell(ticket, agent.session_id, pr)
 
         # Speaking marker: a 1-char left accent (▌) in cyan when this row
         # is the TTS source. A leading space when silent — ALWAYS 2 chars

@@ -87,7 +87,37 @@ pipx install --editable '.[tui]'
    removes them.
 2. **`ephor`** (or `ephor tui`) — opens the TUI. Use `j`/`k` or arrow keys to navigate,
    `/` to filter, `Enter` to jump to a session's tmux pane, `x` to
-   kill, `?` for the full keymap.
+   kill, `o` (or a click on the Jira key) to open that session's pull
+   request, `?` for the full keymap.
+### The Jira column
+
+The tail of each row is the session's Jira key, harvested from whichever
+signal the session actually offers — the git branch at its cwd, a
+worktree or ancestor directory named after the ticket, the tmux window
+label, the latest user prompt, and finally the LLM summary, in that order
+of trust. Well-known lookalikes (`UTF-8`, `SHA-256`, `ISO-8601`, …) are
+never mistaken for keys.
+
+The key is a link. ephor resolves the session's pull request in the
+background with `gh` — first the PR whose head is the checked-out branch,
+then a repo search for the ticket — and once found the key is underlined
+and clicking it (or pressing `o` on the row) opens the PR in your
+browser. Color tracks PR state: green open, purple merged, red closed. A
+plain green key means "ticket known, no PR yet"; press `o` anyway and
+ephor looks it up on the spot.
+
+A session that outlives its answers re-harvests on its own: a "no PR
+yet" is re-probed every 90s, so a branch you push mid-session gains its
+link without a restart. Resolved PRs are held for an hour — press `r` to
+force the issue. That drops every memoized ticket *and* PR and re-runs
+`git` and `gh` from scratch for every visible session, which is what you
+want after switching a session's branch or merging its PR. Pressing `o`
+on a session with no PR always re-probes that one session, so the
+push-then-press-again loop works.
+
+Requires `gh` installed and authenticated. Without it the column still
+shows tickets — it just never gains links.
+
 3. **`ephor list`** — script-friendly one-line-per-session status, for
    tmux status-right widgets or shell scripts.
 4. **`ephor doctor`** — checks dependencies and, per agent, whether its
