@@ -34,8 +34,31 @@ Agents differ only at the edges:
 | Gemini CLI | `~/.gemini/settings.json` (`hooks`) | `BeforeTool`, `AfterTool`, `AfterAgent`, `Notification(ToolPermission)` |
 | Antigravity CLI (`agy`) | `~/.gemini/config/hooks.json` (named group) | `PreInvocation`, `PreToolUse`, `PostToolUse`, `Stop` |
 | Codex CLI | `~/.codex/hooks.json` | `PreToolUse`, `PermissionRequest`, `Stop`, … |
-| Grok CLI | `~/.grok/user-settings.json` (`hooks`) | Claude-like; `UserPromptSubmit` carries `user_prompt` |
+| Grok CLI | `~/.grok/hooks/ephor.json` | Claude-like; `UserPromptSubmit` carries `user_prompt`; subagent sessions suppressed |
 | OpenCode | `~/.config/opencode/plugins/ephor.js` | JS plugin → canonical events |
+
+### Grok subagent sessions
+
+Grok spawns subagents as *first-class sessions*: each gets its own UUID, its
+own `~/.grok/sessions/<encoded-cwd>/<id>/` directory with a full chat history,
+and fires the whole hook set under that id. Keyed naively on the payload's
+session id, one grok session doing a three-way fan-out renders as four
+dashboard rows.
+
+Grok labels them itself — each session's `prompt_context.json` carries
+`"audience": "subagent"`, versus `"primary"` for a session the user started —
+so the handler reads grok's own declaration rather than inferring from shape.
+On every grok event it globs `~/.grok/sessions/*/<session_id>/prompt_context.json`
+(the id is already anchored to `[a-zA-Z0-9_-]`, and globbing avoids
+reimplementing grok's percent-encoding of the cwd) and exits without writing
+state when the audience is `subagent`.
+
+The check runs on *every* event, not just `SessionStart`: grok may not have
+written `prompt_context.json` when the first hook fires, so a row can already
+exist by the time the label appears — a later event notices and removes it.
+Absent the file entirely, the session is kept; a missing label must never
+hide a real session.
+
 
 OpenCode has no shell hooks, only JS/TS plugins, so it uses the
 `OPENCODE_PLUGIN` strategy: `ephor init --provider opencode` writes a generated
@@ -49,7 +72,7 @@ TTS is Claude-transcript-specific and not yet wired for OpenCode sessions.)
 ## Components
 
 ```
-~/.claude/settings.json · ~/.gemini/settings.json · ~/.codex/hooks.json · ~/.grok/user-settings.json
+~/.claude/settings.json · ~/.gemini/settings.json · ~/.codex/hooks.json · ~/.grok/hooks/ephor.json
   hooks → src/ephor/hooks/event_handler.sh   (command tagged EPHOR_PROVIDER=<name>)
             │ on every PreToolUse / BeforeTool / Notification / Stop / AfterAgent / …
             ▼

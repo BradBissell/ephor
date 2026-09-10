@@ -956,3 +956,108 @@ def test_grok_stop_persists_last_reply_to_state(state_env: dict[str, str], tmp_p
             break
         time.sleep(0.2)
     assert reply == "A deadlock is mutual waiting."
+
+
+# ---- grok subagent suppression --------------------------------------------
+#
+# Grok spawns subagents as first-class sessions: own UUID, own session dir,
+# firing the full hook set under that id. Without suppression a single grok
+# session doing a 3-way fan-out renders as four dashboard rows.
+
+
+def _write_grok_prompt_context(env: dict[str, str], cwd: str, sid: str, audience: str) -> Path:
+    """Mirror grok's on-disk layout: sessions/<percent-encoded cwd>/<sid>/."""
+    encoded = cwd.replace("/", "%2F")
+    d = Path(env["HOME"]) / ".grok" / "sessions" / encoded / sid
+    d.mkdir(parents=True, exist_ok=True)
+    pc = d / "prompt_context.json"
+    pc.write_text(json.dumps({"audience": audience, "working_directory": cwd}))
+    return pc
+
+
+def _fire_grok_native(
+    env: dict[str, str], sid: str, cwd: str, event: str = "session_start"
+) -> None:
+    """Fire the way ~/.grok/hooks/ephor.json does: EPHOR_PROVIDER=grok.
+
+    The sibling `_fire_grok` above covers the other real registration path --
+    Grok Build reading ~/.claude/settings.json with EPHOR_PROVIDER=claude and
+    the GROK_* env correcting the label. Both are installed in practice.
+    """
+    subprocess.run(
+        ["bash", str(HANDLER)],
+        input=json.dumps({"hookEventName": event, "sessionId": sid, "cwd": cwd}),
+        capture_output=True,
+        text=True,
+        timeout=8,
+        env={**env, "EPHOR_PROVIDER": "grok", "GROK_SESSION_ID": sid, "GROK_HOOK_EVENT": event},
+        check=False,
+    )
+
+
+def test_grok_subagent_session_writes_no_state(state_env: dict[str, str]) -> None:
+    sid = "01a08b7a-fe31-7730-b925-90e80f285e1b"
+    _write_grok_prompt_context(state_env, "/home/u/proj", sid, "subagent")
+    _fire_grok_native(state_env, sid, "/home/u/proj")
+    assert not _state_file(state_env, sid).exists()
+
+
+def test_grok_primary_session_still_writes_state(state_env: dict[str, str]) -> None:
+    """The suppression must not swallow the session the user actually started."""
+    sid = "01a08b99-94cd-7293-8a4b-5bf5435b47db"
+    _write_grok_prompt_context(state_env, "/home/u/proj", sid, "primary")
+    _fire_grok_native(state_env, sid, "/home/u/proj")
+    state = _state_file(state_env, sid)
+    assert state.exists()
+    assert json.loads(state.read_text())["provider"] == "grok"
+
+
+def test_grok_session_without_prompt_context_is_not_suppressed(
+    state_env: dict[str, str],
+) -> None:
+    """Absent evidence, keep the row — a missing label must never hide a session."""
+    sid = "01a08b99-0000-7000-8000-000000000001"
+    _fire_grok_native(state_env, sid, "/home/u/proj")
+    assert _state_file(state_env, sid).exists()
+
+
+def test_grok_subagent_labelled_late_has_its_row_swept(state_env: dict[str, str]) -> None:
+    """grok may not have written prompt_context.json when the first hook fires.
+
+    The row exists by then, so a later event has to notice and remove it.
+    """
+    sid = "01a08b7a-fe31-7730-b925-90c16e91b888"
+    _fire_grok_native(state_env, sid, "/home/u/proj")
+    assert _state_file(state_env, sid).exists(), "precondition: row created before label"
+    _write_grok_prompt_context(state_env, "/home/u/proj", sid, "subagent")
+    _fire_grok_native(state_env, sid, "/home/u/proj", event="pre_tool_use")
+    assert not _state_file(state_env, sid).exists()
+
+
+def test_non_grok_session_ignores_a_matching_grok_subagent_dir(
+    state_env: dict[str, str],
+) -> None:
+    """The lookup is grok-only; a claude session with a colliding id survives."""
+    sid = "3f415485-5247-4329-af02-8695299b5f8d"
+    _write_grok_prompt_context(state_env, "/home/u/proj", sid, "subagent")
+    subprocess.run(
+        ["bash", str(HANDLER)],
+        input=json.dumps(
+            {"hook_event_name": "SessionStart", "session_id": sid, "cwd": "/home/u/proj"}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=8,
+        env={**state_env, "EPHOR_PROVIDER": "claude"},
+        check=False,
+    )
+    assert _state_file(state_env, sid).exists()
+
+
+def test_grok_subagent_suppression_survives_an_odd_cwd(state_env: dict[str, str]) -> None:
+    """The glob sidesteps grok's path encoding, so a space or '%' still matches."""
+    sid = "01a08b7a-fe31-7730-b925-90d0ebf8164b"
+    cwd = "/home/u/my proj%weird"
+    _write_grok_prompt_context(state_env, cwd, sid, "subagent")
+    _fire_grok_native(state_env, sid, cwd)
+    assert not _state_file(state_env, sid).exists()
