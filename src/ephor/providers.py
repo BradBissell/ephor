@@ -11,7 +11,7 @@ The supported/known agents and how they differ:
   claude  ~/.claude/settings.json               JSON `hooks` obj   stdin JSON
   gemini  ~/.gemini/settings.json                JSON `hooks` obj   stdin JSON  (diff event names)
   codex   ~/.codex/hooks.json                    JSON hooks file    stdin JSON
-  grok    ~/.grok/user-settings.json             JSON `hooks` obj   stdin JSON  (superagent-ai/grok-cli)
+  grok    ~/.grok/hooks/ephor.json               JSON `hooks` obj   stdin JSON  (xAI Grok Build)
   agy     ~/.gemini/config/hooks.json            JSON hooks file    stdin JSON  (Google Antigravity CLI)
 
 Claude, Gemini and Grok share the *identical* settings-file `hooks` shape, so

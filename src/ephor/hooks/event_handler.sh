@@ -25,6 +25,9 @@
 #   Notification, PermissionRequest, PermissionDenied
 #   Stop / StopFailure / AfterAgent, SubagentStart, SubagentStop
 #
+# Grok subagent sessions are dropped before any state is written --
+# see the suppression block below.
+#
 # For PermissionRequest, the handler emits a JSON decision object on stdout
 # IF a pending decision file exists at $EPHOR_PENDING_DIR/<sid>.json. Otherwise
 # emits empty output (the agent shows its normal dialog).
@@ -125,6 +128,34 @@ LOCK_FILE="$LOCK_DIR/$SESSION_ID.lock"
 # --- per-session lock -----------------------------------------------------
 exec 9>"$LOCK_FILE" || ephor_exit_open
 flock -w 2 9 || ephor_exit_open
+
+# --- grok subagent suppression --------------------------------------------
+# Grok spawns subagents as FIRST-CLASS sessions: each gets its own UUID, its
+# own ~/.grok/sessions/<encoded-cwd>/<id>/ directory, and fires the whole hook
+# set under that id. Keyed naively on the payload's session id, one grok
+# session doing a 3-way fan-out becomes four dashboard rows.
+#
+# Grok labels them itself -- prompt_context.json carries
+# `"audience": "subagent"`, vs `"primary"` for a session the user started --
+# so this reads grok's own declaration rather than guessing from shape.
+#
+# The session id is a UUID already anchored to [a-zA-Z0-9_-] above, so it is
+# safe to glob it across the percent-encoded cwd directories; that beats
+# reimplementing grok's path encoding, which we would have to keep in sync.
+#
+# Deliberately not limited to SessionStart: if grok has not written
+# prompt_context.json by the time the first hook fires, a row already exists,
+# so every later event gets a chance to notice the label and sweep it.
+if [ "$PROVIDER" = "grok" ]; then
+  for _pc in "$HOME"/.grok/sessions/*/"$SESSION_ID"/prompt_context.json; do
+    [ -r "$_pc" ] || continue
+    if [ "$(jq -r '.audience // empty' "$_pc" 2>/dev/null)" = "subagent" ]; then
+      rm -f "$STATE_FILE" 2>/dev/null || true
+      ephor_exit_open
+    fi
+    break
+  done
+fi
 
 # --- claude PID discovery -------------------------------------------------
 # Walk parents from our own PID, skipping shells, until we hit the claude
