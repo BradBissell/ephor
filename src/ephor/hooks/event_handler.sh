@@ -56,7 +56,7 @@ export PATH
 STATE_DIR="${EPHOR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ephor/sessions}"
 PENDING_DIR="${EPHOR_PENDING_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ephor/pending}"
 LOCK_DIR="${EPHOR_LOCK_DIR:-${XDG_RUNTIME_DIR:-/tmp}/ephor/locks}"
-SCHEMA_VERSION=3
+SCHEMA_VERSION=4
 
 # Which coding-agent CLI fired this hook. Most agents set it via a shell
 # env-prefix in the registered command (EPHOR_PROVIDER=<name>). Google
@@ -221,6 +221,7 @@ base_state() {
       --arg proj "$PROJECT_NAME" \
       --arg cpid "${CLAUDE_PID:-}" \
       --arg prov "$PROVIDER" \
+      --arg ticket "${EPHOR_TICKET:-}" \
       '. + {
          schema_version: $sv,
          cwd: $cwd,
@@ -229,7 +230,8 @@ base_state() {
          last_event_time: $ts,
          last_event_seq: ((.last_event_seq // 0) + 1),
          agent_pid: (if $cpid == "" then .agent_pid else ($cpid | tonumber) end),
-         provider: (if $prov == "" then (.provider // "") else $prov end)
+         provider: (if $prov == "" then (.provider // "") else $prov end),
+         ticket: (if $ticket == "" then (.ticket // "") else $ticket end)
        }' "$STATE_FILE"
   else
     jq -nc \
@@ -242,6 +244,7 @@ base_state() {
       --argjson sv "$SCHEMA_VERSION" \
       --arg cpid "${CLAUDE_PID:-}" \
       --arg prov "$PROVIDER" \
+      --arg ticket "${EPHOR_TICKET:-}" \
       '{
          schema_version: $sv,
          session_id: $sid,
@@ -260,7 +263,8 @@ base_state() {
          agent_pid: (if $cpid == "" then null else ($cpid | tonumber) end),
          notification: null,
          last_summary: "",
-         provider: $prov
+         provider: $prov,
+         ticket: $ticket
        }'
   fi
 }
@@ -637,11 +641,49 @@ case "$EVENT_NAME" in
            }' \
       | write_state
 
-    # If a pending decision file exists, emit it as the hook return value.
+    # Emit a decision as the hook return value, from one of two sources.
+    #
+    #   <sid>.json        a one-shot answer — consumed and deleted.
+    #   <sid>.always.json a standing answer for this session — left in place,
+    #                     so "approve everything this session asks" is one
+    #                     dashboard keystroke rather than one per prompt.
+    #
+    # The one-shot file normally only exists if the user answered a PREVIOUS
+    # prompt ahead of time, because this hook runs *before* the agent renders
+    # its dialog: by the time a human could see the request on the dashboard,
+    # the hook has already returned. EPHOR_PERMISSION_WAIT_SEC is what closes
+    # that gap — the handler writes WAITING_PERMISSION state (above), then
+    # waits up to N seconds for the dashboard to drop an answer in.
+    #
+    # It defaults to 0, i.e. off, and that default is deliberate. While the
+    # handler waits, the agent has not yet drawn its own prompt, so the wait
+    # is time during which the pane cannot be answered either. Turning this on
+    # trades "answer in the pane" for "answer anywhere"; leaving it off keeps
+    # the sub-15ms latency budget and the agent's native dialog exactly as
+    # they were.
     PENDING_FILE="$PENDING_DIR/$SESSION_ID.json"
+    ALWAYS_FILE="$PENDING_DIR/$SESSION_ID.always.json"
+    WAIT_SEC="${EPHOR_PERMISSION_WAIT_SEC:-0}"
+    case "$WAIT_SEC" in
+      *[!0-9]*) WAIT_SEC=0 ;;   # non-numeric (or negative) means off
+    esac
+    [ "$WAIT_SEC" -gt 60 ] && WAIT_SEC=60   # never hang an agent for a minute+
+
+    if [ ! -f "$PENDING_FILE" ] && [ ! -f "$ALWAYS_FILE" ] && [ "$WAIT_SEC" -gt 0 ]; then
+      WAIT_TICKS=$((WAIT_SEC * 10))
+      while [ "$WAIT_TICKS" -gt 0 ]; do
+        [ -f "$PENDING_FILE" ] && break
+        [ -f "$ALWAYS_FILE" ] && break
+        sleep 0.1 2>/dev/null || sleep 1
+        WAIT_TICKS=$((WAIT_TICKS - 1))
+      done
+    fi
+
     if [ -f "$PENDING_FILE" ]; then
       cat "$PENDING_FILE"
       rm -f "$PENDING_FILE" 2>/dev/null || true
+    elif [ -f "$ALWAYS_FILE" ]; then
+      cat "$ALWAYS_FILE"
     fi
     ;;
 
