@@ -177,19 +177,23 @@ def test_is_heartbeat_stale_tolerates_garbage_timestamp() -> None:
 # ---- SessionRow column composition ---------------------------------------
 
 
-def _agent_for_row(cwd: str = "/tmp/proj", *, sid: str = "abcdef1234") -> AgentState:
-    return AgentState(
-        session_id=sid,
-        cwd=cwd,
-        started_at="2026-01-01T00:00:00Z",
-        status=AgentStatus.WORKING,
-        project_name="proj",
-        last_event="PreToolUse",
-        last_event_time="2026-01-01T00:00:01Z",
-        last_event_seq=1,
-        tool_count=7,
-        error_count=2,
-    )
+def _agent_for_row(
+    cwd: str = "/tmp/proj", *, sid: str = "abcdef1234", **overrides: Any
+) -> AgentState:
+    fields: dict[str, Any] = {
+        "session_id": sid,
+        "cwd": cwd,
+        "started_at": "2026-01-01T00:00:00Z",
+        "status": AgentStatus.WORKING,
+        "project_name": "proj",
+        "last_event": "PreToolUse",
+        "last_event_time": "2026-01-01T00:00:01Z",
+        "last_event_seq": 1,
+        "tool_count": 7,
+        "error_count": 2,
+    }
+    fields.update(overrides)
+    return AgentState(**fields)
 
 
 def test_session_row_drops_tool_and_error_columns(tmp_path: Path) -> None:
@@ -335,6 +339,46 @@ def test_ticket_cell_refuses_to_interpolate_an_unsafe_session_id() -> None:
     cell = render_ticket_cell("DR-8222", "sid') app.quit(")
     assert "@click" not in cell
     assert "app.quit" not in cell
+
+
+def test_ticket_cell_marks_a_guessed_key_differently() -> None:
+    """A key read out of prose must not look like one read out of git."""
+    certain = render_ticket_cell("DR-8222", "sid-1", confident=True)
+    guessed = render_ticket_cell("DR-8222", "sid-1", confident=False)
+    assert certain != guessed
+    assert "italic" in guessed
+    assert "italic" not in certain
+    # Still a link — a guess is worth following, just not worth asserting.
+    assert "@click=app.open_pr('sid-1')" in guessed
+
+
+def test_ticket_cell_confidence_does_not_shift_the_column() -> None:
+    import re as _re
+
+    def visible(markup: str) -> str:
+        return _re.sub(r"\[[^\]]*\]", "", markup)
+
+    assert len(visible(render_ticket_cell("DR-8222", "s", confident=False))) == len(
+        visible(render_ticket_cell("DR-8222", "s", confident=True))
+    )
+
+
+def test_ticket_label_reports_confidence(tmp_path: Path) -> None:
+    from ephor.tui.widgets.session_row import _ticket_label
+
+    plain = tmp_path / "shared"
+    plain.mkdir()
+    agent = _agent_for_row(cwd=str(plain), tmux_window="DR-2000")
+    assert _ticket_label(agent, None) == ("DR-2000", False)
+
+    worktree = tmp_path / "DR-8222"
+    worktree.mkdir()
+    assert _ticket_label(_agent_for_row(cwd=str(worktree)), None) == ("DR-8222", True)
+
+    empty = tmp_path / "nothing-here"
+    empty.mkdir()
+    # The placeholder is "confident" so it keeps its own dim styling.
+    assert _ticket_label(_agent_for_row(cwd=str(empty)), None) == ("—", True)
 
 
 def test_ticket_cell_pads_to_a_stable_width() -> None:

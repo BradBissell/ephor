@@ -14,8 +14,10 @@ from pathlib import Path
 # v3 renamed `claude_pid`→`agent_pid` and added `provider` (which coding-agent
 # CLI wrote the file). Readers tolerate v1/v2 files in-place, mapping the legacy
 # `claude_pid` key onto `agent_pid` — see AgentState.from_dict.
-SCHEMA_VERSION = 3
-KNOWN_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+# v4 added `ticket` — the Jira key declared by the launcher via $EPHOR_TICKET,
+# so the dashboard can stop inferring for sessions that already knew.
+SCHEMA_VERSION = 4
+KNOWN_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
 
 # Hook handler timing budget — emit a warning above WARN, kill criterion above KILL.
 HOOK_LATENCY_WARN_MS = 15
@@ -93,3 +95,19 @@ def ensure_state_dirs() -> None:
     for d in (sd, pd):
         d.mkdir(parents=True, exist_ok=True)
         d.chmod(0o700)
+
+
+def ticket_projects() -> frozenset[str]:
+    """Jira project keys this user actually works in, uppercased.
+
+    Set ``$EPHOR_TICKET_PROJECTS`` to a comma-separated list (``DR,ABC``) to
+    turn ticket extraction from a denylist into an allowlist. The denylist
+    of Jira-shaped standards (``UTF-8``, ``SHA-256``) can only ever grow —
+    it needs a new CVE year every January — whereas naming your projects
+    rules out every other ``LETTERS-DIGITS`` token at once. Unset means fall
+    back to the denylist, which is the right default for a fresh install
+    that hasn't been told anything.
+    """
+    raw = os.environ.get("EPHOR_TICKET_PROJECTS") or ""
+    keys = {part.strip().upper() for part in raw.split(",")}
+    return frozenset(k for k in keys if k)

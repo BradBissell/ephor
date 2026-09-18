@@ -726,6 +726,38 @@ def _cmd_doctor(*, provider: str = "all") -> int:
             "EPHOR_SUMMARY_API_BASE/MODEL to use a local model",
         )
 
+    # 7. Opt-in integrations. Each of these is off until configured, so "not
+    #    configured" is a normal, healthy state and is reported as such —
+    #    the check exists to show *which* of them this shell can actually
+    #    see, which is the usual reason one of them appears not to work.
+    from ephor import jira_api, notify, permissions, work_items
+
+    if jira_api.is_configured():
+        creds = jira_api.credentials()
+        ok("jira: configured", creds.base_url if creds else "")
+    else:
+        ok(
+            "jira: not configured",
+            "set EPHOR_JIRA_URL / _EMAIL / _TOKEN for ticket status and drift detection",
+        )
+
+    if notify.is_configured():
+        ok("notifications: configured", notify.notify_url())
+    else:
+        ok("notifications: not configured", "set EPHOR_NOTIFY_URL (e.g. an ntfy topic)")
+
+    wait = permissions.hook_wait_sec()
+    if wait:
+        ok(f"permission inbox: live ({wait}s wait)", "a/d answer the prompt on screen")
+    else:
+        ok(
+            "permission inbox: queued only",
+            "set EPHOR_PERMISSION_WAIT_SEC=10 to answer the prompt on screen",
+        )
+
+    recorded = len(work_items.load_all())
+    ok(f"work items: {recorded} recorded", str(work_items.work_dir()))
+
     # Render results.
     icons = {"ok": "[ ok ]", "warn": "[warn]", "fail": "[FAIL]"}
     fails = sum(1 for level, _, _ in checks if level == "fail")

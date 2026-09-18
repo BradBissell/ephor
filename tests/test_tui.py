@@ -1021,9 +1021,10 @@ async def test_background_sweep_attaches_a_pr_to_the_row(
 def solo_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A state dir with exactly one session.
 
-    The PR cache is keyed by working directory, and every session in
-    `populated_dir` shares `/tmp/x` — fine for the app, useless for
-    counting probes. One session, one cwd, one probe.
+    The PR cache is keyed by the session's checkout (worktree + branch, or
+    the plain path outside a repo), and every session in `populated_dir`
+    shares `/tmp/x` — fine for the app, useless for counting probes. One
+    session, one checkout, one probe.
     """
     sd = tmp_path / "solo"
     sd.mkdir()
@@ -1065,7 +1066,10 @@ async def test_r_forces_a_fresh_ticket_and_pr_probe(
         # Poison the cwd→ticket memo with a long-lived wrong answer, the
         # way a real one goes stale when the session switches branch.
         cwd = next(a.cwd for a in app._manager.scan())
-        jira_module._cwd_cache[cwd] = ("DR-9999", time.monotonic() + 9999)
+        jira_module._cwd_cache[cwd] = (
+            jira_module.TicketMatch("DR-9999", jira_module.TicketSource.BRANCH),
+            time.monotonic() + 9999,
+        )
         # Repaint on demand — the 500ms refresh timer doesn't tick under Pilot.
         await app._refresh_table()
         row = app._rows_by_sid["solo-id"]
@@ -1118,3 +1122,84 @@ async def test_o_re_probes_after_a_cached_miss(
             await pilot.pause()
     assert len(probes) == 2, "o re-served the cached miss instead of re-probing"
     assert opened == ["https://github.com/acme/repo/pull/8"]
+
+
+# ---- ticket pins ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p_pins_a_ticket_to_the_selected_session(solo_dir: Path) -> None:
+    """`p` is the escape hatch from inference: the user just says."""
+    from ephor import ticket_pins
+
+    app = EphorApp(manager=StateManager(solo_dir))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        list_view = await _list_view(app, pilot)
+        list_view.index = 0
+        await pilot.pause()
+        row = app._rows_by_sid["solo-id"]
+        assert "DR-4242" in str(row.render())
+
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._ticket_input is not None
+        assert app._ticket_input.display
+        app._ticket_input.value = "DR-9001"
+        await pilot.press("enter")
+        for _ in range(50):
+            if ticket_pins.get("solo-id"):
+                break
+            await pilot.pause()
+
+        assert ticket_pins.get("solo-id") == "DR-9001"
+        # The prompt closes and hands focus back, or j/k stop navigating.
+        assert not app._ticket_input.display
+        await app._refresh_table()
+        assert "DR-9001" in str(app._rows_by_sid["solo-id"].render())
+
+
+@pytest.mark.asyncio
+async def test_an_empty_pin_unpins_and_falls_back_to_inference(solo_dir: Path) -> None:
+    from ephor import ticket_pins
+
+    ticket_pins.pin("solo-id", "DR-9001")
+    app = EphorApp(manager=StateManager(solo_dir))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        list_view = await _list_view(app, pilot)
+        list_view.index = 0
+        await pilot.pause()
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._ticket_input is not None
+        # The prompt is seeded with the existing pin so it can be edited.
+        assert app._ticket_input.value == "DR-9001"
+        app._ticket_input.value = "   "
+        await pilot.press("enter")
+        for _ in range(50):
+            if ticket_pins.get("solo-id") is None:
+                break
+            await pilot.pause()
+
+    assert ticket_pins.get("solo-id") is None
+
+
+@pytest.mark.asyncio
+async def test_escape_abandons_the_pin_prompt(solo_dir: Path) -> None:
+    """Escape has to close this prompt too, or it swallows j/k."""
+    from ephor import ticket_pins
+
+    app = EphorApp(manager=StateManager(solo_dir))
+    async with app.run_test() as pilot:  # type: ignore[arg-type]
+        list_view = await _list_view(app, pilot)
+        list_view.index = 0
+        await pilot.pause()
+        await pilot.press("p")
+        await pilot.pause()
+        assert app._ticket_input is not None
+        app._ticket_input.value = "DR-9001"
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not app._ticket_input.display
+        assert app._pin_target is None
+
+    assert ticket_pins.get("solo-id") is None

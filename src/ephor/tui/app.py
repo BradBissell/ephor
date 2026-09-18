@@ -33,6 +33,7 @@ from textual.containers import Container
 from textual.css.query import NoMatches
 from textual.widgets import Footer, Header, Input, ListItem, ListView, Static
 
+from ephor import eventlog, gitinfo, jira, launcher, permissions, ticket_pins, work_items
 from ephor.account import AccountConfig, load_account_config
 from ephor.account_usage import (
     AccountFingerprint,
@@ -58,9 +59,12 @@ from ephor.account_usage import (
 from ephor.account_usage import (
     save_store as save_account_store,
 )
-from ephor.constants import AgentStatus
+from ephor.constants import WORK_ATTENTION_DISPLAY, AgentStatus, WorkAttention
 from ephor.github import PrResolver, PullRequest
-from ephor.jira import clear_cwd_cache, ticket_for_agent
+from ephor.jira import clear_cwd_cache, match_for_agent, ticket_for_agent
+from ephor.jira_api import IssueResolver
+from ephor.jira_api import drift as jira_drift
+from ephor.notify import Notifier
 from ephor.speech import SpeechWatcher
 from ephor.speech_player import SpeechPlayer
 from ephor.speech_settings import load as load_speech_settings
@@ -85,7 +89,7 @@ from ephor.tmux.navigator import (
 from ephor.tui.activity import ActivitySampler
 from ephor.tui.tokens import TokenTracker, format_tokens, transcript_path
 from ephor.tui.widgets import HeaderBar, SessionRow, SpeechBar
-from ephor.tui.widgets.session_row import render_sparkline
+from ephor.tui.widgets.session_row import RowContext, render_sparkline
 from ephor.usage import (
     DEFAULT_REFRESH_INTERVAL_SEC,
     UsageSnapshot,
@@ -110,10 +114,34 @@ USAGE_REFRESH_INTERVAL = DEFAULT_REFRESH_INTERVAL_SEC
 # and PrResolver's own TTL already throttles re-probes, so this only needs
 # to be often enough that a PR opened mid-session lights up promptly.
 PR_REFRESH_INTERVAL = 20.0
+# Ticket status changes on a human's clock. IssueResolver's own 10-minute
+# TTL does the real throttling; this only has to be often enough to notice
+# a ticket that moved while you were watching a different row.
+JIRA_REFRESH_INTERVAL = 60.0
+
+
+# Prefix marking a ListView row as a group header rather than a session.
+# Starts with NUL so it can never collide with a session id, which the hook
+# handler anchors to [A-Za-z0-9_-].
+_GROUP_PREFIX = "\x00grp:"
+
+
+def is_group_row(row_id: str | None) -> bool:
+    """True when a row id names a group header instead of a session."""
+    return bool(row_id) and row_id.startswith(_GROUP_PREFIX)
+
+
+def group_key_of(row_id: str) -> str:
+    """The group name inside a header row id."""
+    return row_id[len(_GROUP_PREFIX) :]
 
 
 class StatusToast(Static):
     """One-line ephemeral message at the bottom (jump result, errors, etc.)."""
+
+
+class GroupHeader(Static):
+    """A non-session row naming a group and summarising what is inside it."""
 
 
 class EphorApp(App[int]):
@@ -141,22 +169,43 @@ class EphorApp(App[int]):
         Binding("x", "kill", "kill selected session"),
         Binding("s", "summarize", "summarize selected session"),
         Binding("o", "open_pr", "open the selected session's pull request"),
+        Binding("p", "pin_ticket", "pin a ticket to the selected session"),
         Binding("t", "jump_speaking", "jump to TTS speaking session"),
         Binding("m", "toggle_mute", "mute / unmute TTS playback"),
         Binding("M", "toggle_speak_mode", "TTS: full reply ↔ summary"),
-        Binding("n", "next_attention", "jump cursor to next PERM/WAIT/ERR row"),
+        Binding("n", "next_attention", "jump cursor to next row needing a human"),
         Binding("slash", "filter", "filter sessions by substring"),
         Binding("escape", "clear_filter", "clear filter", show=False),
         Binding("j", "cursor_down", "down", show=False),
         Binding("k", "cursor_up", "up", show=False),
+        # Permission inbox — answer a blocked session without leaving the board.
+        Binding("a", "allow", "allow the selected session's permission request"),
+        Binding("d", "deny", "deny the selected session's permission request"),
+        Binding("A", "allow_standing", "allow everything this session asks, until revoked"),
+        Binding("D", "revoke", "revoke a queued or standing decision"),
+        # Batch operations — everything above acts on the marked set when
+        # there is one, and on the cursor row when there is not.
+        Binding("space", "toggle_select", "mark / unmark this row", priority=True),
+        Binding("c", "clear_selection", "unmark every row"),
+        # Fleet shape.
+        Binding("g", "cycle_grouping", "group rows by ticket / repo / not at all"),
+        Binding("z", "toggle_collapse", "collapse or expand the group at the cursor"),
+        # Launching, not just watching.
+        Binding("N", "new_session", "start another session on this row's ticket"),
+        Binding("R", "resume_session", "reopen this session in a new tmux window"),
     ]
+
+    # Grouping modes, in the order `g` cycles them.
+    GROUPINGS: ClassVar[tuple[str, ...]] = ("none", "ticket", "repo")
 
     def __init__(self, manager: StateManager | None = None) -> None:
         super().__init__()
         self._manager = manager or StateManager()
         self._sid_by_row: list[str] = []  # row index → session_id
         self._rows_by_sid: dict[str, SessionRow] = {}  # for in-place updates
+        self._headers_by_id: dict[str, GroupHeader] = {}  # group rows, same list
         self._items_by_sid: dict[str, ListItem] = {}  # for in-place reorder
+        self._agents_by_sid: dict[str, AgentState] = {}  # last painted snapshot
         self._toast: StatusToast | None = None
         self._header_bar: HeaderBar | None = None
         self._summary_line: Static | None = None
@@ -181,10 +230,35 @@ class EphorApp(App[int]):
         # what SessionRow reads; the worker below fills it in.
         self._prs = PrResolver()
         self._pr_lookup_in_flight: set[str] = set()
+        # Jira's own view of each ticket, resolved off the render path like
+        # the PR is. Stays empty — and costs nothing — until the user has
+        # configured credentials; see ephor.jira_api.
+        self._issues = IssueResolver()
+        self._issue_lookup_in_flight: set[str] = set()
+        # Rows the user has marked for a batch action. Every action that can
+        # act on many sessions reads this first and falls back to the cursor.
+        self._selected: set[str] = set()
+        # Fleet shape: how rows are grouped, and which groups are folded away.
+        self._group_by: str = "none"
+        self._collapsed: set[str] = set()
+        # session_id -> the other sessions sharing its worktree. Recomputed
+        # each refresh from cwds we already have; see gitinfo.collisions.
+        self._collisions: dict[str, tuple[str, ...]] = {}
+        # Queued permission answers, refreshed once per tick (see _refresh_table).
+        self._pending_decisions: dict[str, permissions.PendingDecision] = {}
+        # Previous status / PR state per session, so the refresh loop can
+        # tell a *change* from a repaint and log only the former.
+        self._prev_status: dict[str, str] = {}
+        self._prev_pr: dict[str, tuple[str, str, str]] = {}
+        self._notifier = Notifier(desktop_fallback=True)
         self._kill_armed_sid: str | None = None
         self._kill_armed_at: float = 0.0
         self._filter: str = ""  # case-insensitive substring filter; "" = show all
         self._filter_input: Input | None = None
+        self._ticket_input: Input | None = None
+        # Session the pin prompt is editing, so a scroll mid-typing can't
+        # land the answer on whichever row happens to be selected on submit.
+        self._pin_target: str | None = None
         # Re-entrancy guard for _refresh_table. Cold-path DOM rebuilds await
         # ListView.clear()/mount(); without this guard a 500ms timer tick
         # firing mid-rebuild could interleave clears and mounts, leaving
@@ -230,6 +304,12 @@ class EphorApp(App[int]):
             self._filter_input = Input(placeholder="filter (esc to clear)…", id="filter-input")
             self._filter_input.display = False
             yield self._filter_input
+            self._ticket_input = Input(
+                placeholder="ticket for this session (empty to unpin, esc to cancel)…",
+                id="ticket-input",
+            )
+            self._ticket_input.display = False
+            yield self._ticket_input
             self._toast = StatusToast("")
             yield self._toast
             # SpeechBar mirrors the TTS engine. Sits above the Footer so
@@ -268,6 +348,10 @@ class EphorApp(App[int]):
         # already carries links for sessions with review in flight.
         self._refresh_prs()
         self.set_interval(PR_REFRESH_INTERVAL, self._refresh_prs)
+        # Jira is read on a slower clock than GitHub: a ticket's status moves
+        # when a human drags a card, not when a build finishes. Costs nothing
+        # until credentials are configured.
+        self.set_interval(JIRA_REFRESH_INTERVAL, self._refresh_issues)
 
     def _tick_speech_player(self) -> None:
         """Drive the speech player. Wrapped in suppress so a transient
@@ -320,6 +404,18 @@ class EphorApp(App[int]):
                 self._activity.sample(pid)
             self._activity.prune(live_pids)
 
+            # Two sessions in one worktree will interleave edits and neither
+            # agent can tell. gitinfo memoizes the underlying git probe, so
+            # this costs a dict build per tick.
+            self._collisions = gitinfo.collisions([(a.session_id, a.cwd) for a in agents])
+            # Read the decision queue once per tick rather than once per row:
+            # it is a directory scan, and the render path walks every row.
+            self._pending_decisions = permissions.pending()
+            # Everything that watches for *changes* — the event log, the
+            # notifier, ticket promotion — runs here, once per tick, before
+            # anything is drawn.
+            self._observe(agents)
+
             try:
                 list_view = self.query_one(ListView)
             except NoMatches:
@@ -329,7 +425,9 @@ class EphorApp(App[int]):
                 # so treat a missing list as "nothing to draw" and let the
                 # next tick catch up.
                 return
-            new_sids = [a.session_id for a in agents]
+            visible = self._visible_order(agents)
+            self._agents_by_sid = {a.session_id: a for a in agents}
+            new_sids = [row_id for row_id, _ in visible]
 
             # If the user just switched their terminal focus (e.g. clicked a
             # different Ghostty window hosting session X) auto-highlight that
@@ -384,25 +482,26 @@ class EphorApp(App[int]):
             prev_sid: str | None = self._cursor_sid(list_view)
 
             new_rows: dict[str, SessionRow] = {}
+            new_headers: dict[str, GroupHeader] = {}
             new_items: dict[str, ListItem] = {}
             items: list[ListItem] = []
             cursor_target = 0
             speaking_sid = self._speaking_sid()
-            for i, agent in enumerate(agents):
-                row = SessionRow()
-                row.update_agent(
-                    agent,
-                    samples=self._activity.samples_for(agent.agent_pid),
-                    summary=self._summaries.get(agent.session_id),
-                    tokens=self._tokens.total_for(agent),
-                    speaking=(agent.session_id == speaking_sid),
-                    pr=self._prs.cached(agent.cwd),
-                )
-                item = ListItem(row)
+            members = self._group_members(agents)
+            for i, (row_id, agent) in enumerate(visible):
+                if agent is None:
+                    key = group_key_of(row_id)
+                    header = GroupHeader(self._group_header_markup(key, members.get(key, [])))
+                    item = ListItem(header)
+                    new_headers[row_id] = header
+                else:
+                    row = SessionRow()
+                    self._paint_row(row, agent, speaking_sid)
+                    item = ListItem(row)
+                    new_rows[row_id] = row
                 items.append(item)
-                new_rows[agent.session_id] = row
-                new_items[agent.session_id] = item
-                if prev_sid and agent.session_id == prev_sid:
+                new_items[row_id] = item
+                if prev_sid and row_id == prev_sid:
                     cursor_target = i
 
             await list_view.clear()
@@ -412,6 +511,7 @@ class EphorApp(App[int]):
             # DOM is consistent — swap state mappings + index atomically.
             self._sid_by_row = list(new_sids)
             self._rows_by_sid = new_rows
+            self._headers_by_id = new_headers
             self._items_by_sid = new_items
             if items:
                 list_view.index = cursor_target
@@ -424,19 +524,149 @@ class EphorApp(App[int]):
         finally:
             self._refreshing = False
 
+    # --- change observation ----------------------------------------------
+
+    def _observe(self, agents: list[AgentState]) -> None:
+        """Notice what changed since the last tick, and act on it once.
+
+        The dashboard repaints twice a second; almost nothing it draws is
+        *new*. This is the one place that tells the difference, so the event
+        log records transitions rather than frames, the notifier fires on the
+        edge rather than continuously, and a confirmed ticket is promoted the
+        first time it is seen rather than on every repaint.
+        """
+        seen: set[str] = set()
+        for agent in agents:
+            sid = agent.session_id
+            seen.add(sid)
+            match = match_for_agent(agent, self._summaries.get(sid), self._prs.cached(agent.cwd))
+            ticket = match.key if match else ""
+            # Promotion: write a fact down the first time a fact-tier probe
+            # produces it, so a deleted branch can never demote it later.
+            jira.promote(match, agent)
+
+            previous = self._prev_status.get(sid)
+            current = str(agent.status)
+            if previous is None:
+                eventlog.append(
+                    eventlog.EventKind.SESSION_STARTED,
+                    session_id=sid,
+                    ticket=ticket,
+                    detail=f"{agent.provider or 'agent'} in {agent.project_name or agent.cwd}",
+                )
+            elif previous != current:
+                eventlog.append(
+                    eventlog.EventKind.STATUS_CHANGED,
+                    session_id=sid,
+                    ticket=ticket,
+                    detail=f"{previous} → {current}",
+                )
+            self._prev_status[sid] = current
+            self._observe_pr(agent, ticket)
+            self._maybe_notify(agent, ticket)
+
+        for sid in [s for s in self._prev_status if s not in seen]:
+            eventlog.append(eventlog.EventKind.SESSION_ENDED, session_id=sid)
+            self._prev_status.pop(sid, None)
+            self._prev_pr.pop(sid, None)
+            self._selected.discard(sid)
+            self._notifier.clear(sid)
+
+    def _observe_pr(self, agent: AgentState, ticket: str) -> None:
+        """Log PR/CI/review transitions and keep the work record current."""
+        pr = self._prs.cached(agent.cwd)
+        if pr is None:
+            return
+        sid = agent.session_id
+        current = (pr.state, str(pr.ci), str(pr.review))
+        previous = self._prev_pr.get(sid)
+        if previous == current:
+            return
+        self._prev_pr[sid] = current
+        if previous is None:
+            eventlog.append(
+                eventlog.EventKind.PR_LINKED,
+                session_id=sid,
+                ticket=ticket,
+                detail=f"#{pr.number} {pr.state.lower()}",
+                url=pr.url,
+            )
+        else:
+            for kind, before, after in (
+                (eventlog.EventKind.PR_STATE_CHANGED, previous[0], current[0]),
+                (eventlog.EventKind.CI_CHANGED, previous[1], current[1]),
+                (eventlog.EventKind.REVIEW_CHANGED, previous[2], current[2]),
+            ):
+                if before != after:
+                    eventlog.append(
+                        kind,
+                        session_id=sid,
+                        ticket=ticket,
+                        detail=f"#{pr.number}: {before} → {after}",
+                    )
+        if ticket:
+            work_items.record(
+                ticket,
+                session_id=sid,
+                pr_number=pr.number,
+                pr_url=pr.url,
+                pr_state=pr.state,
+            )
+
+    def _maybe_notify(self, agent: AgentState, ticket: str) -> None:
+        """Push a notification when this session starts needing a human.
+
+        Deduping lives in the Notifier; this only decides *whether* the
+        session currently wants something, and says so in one line.
+        """
+        from ephor.constants import ATTENTION_STATUSES
+
+        label = ticket or agent.project_name or agent.session_id[:8]
+        if agent.status in ATTENTION_STATUSES:
+            reason = str(agent.status)
+            self._notifier.notify(
+                agent.session_id,
+                reason,
+                title=f"ephor: {label}",
+                body=f"{reason.replace('_', ' ').lower()} — {agent.project_name or agent.cwd}",
+                priority="high" if agent.status is AgentStatus.WAITING_PERMISSION else "default",
+            )
+            return
+        work = self._work_attention(agent)
+        if work is not None:
+            self._notifier.notify(
+                agent.session_id,
+                str(work),
+                title=f"ephor: {label}",
+                body=WORK_ATTENTION_DISPLAY[work][1] + f" — {agent.project_name or agent.cwd}",
+            )
+            return
+        # Nothing wanted any more: re-arm so the next block notifies at once
+        # rather than waiting out the dedupe window.
+        self._notifier.clear(agent.session_id)
+
+    def _group_members(self, agents: list[AgentState]) -> dict[str, list[AgentState]]:
+        """Sessions per group key, for the header counts."""
+        if self._group_by == "none":
+            return {}
+        members: dict[str, list[AgentState]] = {}
+        for agent in agents:
+            members.setdefault(self._group_key(agent), []).append(agent)
+        return members
+
     def _update_rows(self, agents: list[AgentState]) -> None:
-        """Refresh in-place row content for every cached SessionRow."""
+        """Refresh in-place row content for every cached row and header."""
         speaking_sid = self._speaking_sid()
         for agent in agents:
             row = self._rows_by_sid.get(agent.session_id)
             if row is not None:
-                row.update_agent(
-                    agent,
-                    samples=self._activity.samples_for(agent.agent_pid),
-                    summary=self._summaries.get(agent.session_id),
-                    speaking=(agent.session_id == speaking_sid),
-                    pr=self._prs.cached(agent.cwd),
-                )
+                self._paint_row(row, agent, speaking_sid)
+        if not self._headers_by_id:
+            return
+        members = self._group_members(agents)
+        for row_id, header in self._headers_by_id.items():
+            key = group_key_of(row_id)
+            header.update(self._group_header_markup(key, members.get(key, [])))
 
     def _speaking_sid(self) -> str | None:
         """Session id whose response is currently being read aloud, if any.
@@ -447,6 +677,111 @@ class EphorApp(App[int]):
         if self._speech_bar is None:
             return None
         return self._speech_bar.speaking_session_id
+
+    # --- grouping ---------------------------------------------------------
+    #
+    # Group headers live in the same ListView as sessions, as rows whose id
+    # is a sentinel no session id can collide with (state files key on a
+    # UUID, and this starts with a NUL). Keeping them in `_sid_by_row` means
+    # the existing index bookkeeping — cursor restore, reorder, follow-focus
+    # — keeps working unchanged; every action that needs a *session* asks
+    # `_cursor_session_sid`, which reads a header as "nothing selected".
+
+    def _group_key(self, agent: AgentState) -> str:
+        """Which group ``agent`` belongs to under the current mode."""
+        if self._group_by == "ticket":
+            return ticket_for_agent(agent, self._summaries.get(agent.session_id)) or "no ticket"
+        if self._group_by == "repo":
+            root = gitinfo.worktree_of(agent.cwd)
+            return Path(root).name if root else (agent.project_name or "no repo")
+        return ""
+
+    def _visible_order(self, agents: list[AgentState]) -> list[tuple[str, AgentState | None]]:
+        """The rows to draw, in order: (row id, agent or None for a header).
+
+        Grouping sorts by group first so a ticket's sessions sit together,
+        then preserves the stable (started_at, session_id) order inside each
+        group — the property that keeps a row from jumping under the cursor
+        is worth more than any ordering *between* groups.
+        """
+        if self._group_by == "none":
+            return [(a.session_id, a) for a in agents]
+        grouped: dict[str, list[AgentState]] = {}
+        for agent in agents:
+            grouped.setdefault(self._group_key(agent), []).append(agent)
+        rows: list[tuple[str, AgentState | None]] = []
+        # "no ticket" / "no repo" last: a named group is something you are
+        # working on, the catch-all is everything else.
+        for key in sorted(grouped, key=lambda k: (k.startswith("no "), k)):
+            rows.append((f"{_GROUP_PREFIX}{key}", None))
+            if key in self._collapsed:
+                continue
+            rows.extend((a.session_id, a) for a in grouped[key])
+        return rows
+
+    def _group_header_markup(self, key: str, members: list[AgentState]) -> str:
+        """One header line: the group, how many sessions, how many need you."""
+        from ephor.constants import ATTENTION_STATUSES
+
+        collapsed = key in self._collapsed
+        caret = "▸" if collapsed else "▾"
+        needs = sum(1 for a in members if a.status in ATTENTION_STATUSES)
+        working = sum(1 for a in members if a.status is AgentStatus.WORKING)
+        parts = [f"[bold #58a6ff]{caret} {key}[/]", f"[dim]{len(members)} session(s)[/]"]
+        if working:
+            parts.append(f"[#A3BE8C]{working} working[/]")
+        if needs:
+            parts.append(f"[bold #BF616A]{needs} need you[/]")
+        return "  " + "  ·  ".join(parts)
+
+    # --- per-row context --------------------------------------------------
+
+    def _row_context(self, agent: AgentState, pr: PullRequest | None) -> RowContext:
+        """Assemble everything the row renderer needs beyond the agent itself."""
+        ticket = ticket_for_agent(agent, self._summaries.get(agent.session_id))
+        issue = self._issues.cached(ticket) if ticket else None
+        queued = self._pending_decisions.get(agent.session_id)
+        decision = ""
+        if queued is not None:
+            decision = f"{queued.decision}{' (standing)' if queued.standing else ''}"
+        return RowContext(
+            selected=agent.session_id in self._selected,
+            collisions=self._collisions.get(agent.session_id, ()),
+            jira_status=issue.status if issue else "",
+            jira_title=issue.title if issue else "",
+            drift=jira_drift(issue, pr.state if pr else "") or "",
+            decision_queued=decision,
+            failing_checks=pr.failing_checks if pr else (),
+        )
+
+    def _paint_row(self, row: SessionRow, agent: AgentState, speaking_sid: str | None) -> None:
+        """Render one session row from the current caches."""
+        pr = self._prs.cached(agent.cwd)
+        row.update_agent(
+            agent,
+            samples=self._activity.samples_for(agent.agent_pid),
+            summary=self._summaries.get(agent.session_id),
+            tokens=self._tokens.total_for(agent),
+            speaking=(agent.session_id == speaking_sid),
+            pr=pr,
+            context=self._row_context(agent, pr),
+        )
+
+    def _work_attention(self, agent: AgentState) -> WorkAttention | None:
+        """Why this session's *work* needs a human, or None.
+
+        Distinct from its agent status: a session can be perfectly idle and
+        still be the most urgent thing on the board because its PR is red.
+        """
+        pr = self._prs.cached(agent.cwd)
+        found = pr.attention() if pr is not None else None
+        if found is not None:
+            return found
+        ticket = ticket_for_agent(agent, self._summaries.get(agent.session_id))
+        issue = self._issues.cached(ticket) if ticket else None
+        if issue is not None and pr is not None and jira_drift(issue, pr.state):
+            return WorkAttention.TICKET_DRIFT
+        return None
 
     def _reorder_list_view(self, list_view: ListView, target_order: list[str]) -> None:
         """Reorder ListView children to match target_order without rebuilding.
@@ -478,6 +813,29 @@ class EphorApp(App[int]):
             return self._sid_by_row[idx]
         except IndexError:
             return None
+
+    def _cursor_session_sid(self, list_view: ListView | None = None) -> str | None:
+        """The session under the cursor, or None when it is on a group header."""
+        view = list_view if list_view is not None else self.query_one(ListView)
+        row_id = self._cursor_sid(view)
+        if row_id is None or is_group_row(row_id):
+            return None
+        return row_id
+
+    def _target_sids(self) -> list[str]:
+        """Sessions the next action applies to: the marked set, else the cursor.
+
+        Marking is what makes an action a batch action, and falling back to
+        the cursor is what keeps every single-row keystroke working exactly
+        as it did before anything could be marked.
+        """
+        if self._selected:
+            # Preserve on-screen order so the toast reads the way the board
+            # looks, and drop anything that has since disappeared.
+            visible = [s for s in self._sid_by_row if not is_group_row(s)]
+            return [sid for sid in visible if sid in self._selected]
+        sid = self._cursor_session_sid()
+        return [sid] if sid else []
 
     def _compute_follow_target(self, agents: list[AgentState]) -> str | None:
         """Return the sid to auto-highlight this tick, or None for no change.
@@ -611,7 +969,15 @@ class EphorApp(App[int]):
         self._filter_input.focus()
 
     async def action_clear_filter(self) -> None:
-        """Hide the filter input and reset the filter. Bound to escape."""
+        """Dismiss whichever prompt is open, and reset the filter. Bound to escape.
+
+        Escape is the universal "get me out of here" key, so it has to
+        abandon the ticket prompt as well — leaving it open and focused
+        would swallow j/k exactly the way the filter input used to.
+        """
+        if self._ticket_input is not None and self._ticket_input.display:
+            self._close_ticket_input()
+            return
         self._filter = ""
         if self._filter_input is not None:
             self._filter_input.value = ""
@@ -635,10 +1001,70 @@ class EphorApp(App[int]):
         that any future binding change (or platform where the priority
         binding doesn't fire first) still gets the filter dismissed.
         """
+        if self._ticket_input is not None and event.input is self._ticket_input:
+            self.run_worker(self._submit_ticket_pin(event.value), exclusive=False)
+            return
         if self._filter_input is None or event.input is not self._filter_input:
             return
         self._filter_input.display = False
         self.query_one(ListView).focus()
+
+    def action_pin_ticket(self) -> None:
+        """Prompt for the ticket this session is on. Bound to `p`.
+
+        Every other probe in the chain is inference; this is the one place
+        the user gets to simply say. The answer outranks all of them and
+        persists across restarts, so a session on a shared checkout with a
+        generic branch name stops being a permanent "—".
+        """
+        if self._ticket_input is None:
+            return
+        try:
+            list_view = self.query_one(ListView)
+        except NoMatches:
+            return
+        sid = self._cursor_session_sid(list_view)
+        if sid is None:
+            self._set_toast("select a session row first")
+            return
+        self._pin_target = sid
+        self._ticket_input.value = ticket_pins.get(sid) or ""
+        self._ticket_input.display = True
+        self._ticket_input.focus()
+
+    def _close_ticket_input(self) -> None:
+        """Dismiss the pin prompt and hand focus back to the list.
+
+        Focus matters more than the hiding: a prompt left focused swallows
+        j/k, which reads to the user as the dashboard freezing.
+        """
+        self._pin_target = None
+        if self._ticket_input is not None:
+            self._ticket_input.value = ""
+            self._ticket_input.display = False
+        with contextlib.suppress(NoMatches):
+            self.query_one(ListView).focus()
+
+    async def _submit_ticket_pin(self, raw: str) -> None:
+        """Apply (or clear) the pin the user just typed."""
+        sid = self._pin_target
+        self._close_ticket_input()
+        if sid is None:
+            return
+        ticket = raw.strip()
+        if not ticket:
+            ticket_pins.unpin(sid)
+            self._set_toast(f"unpinned {sid[:8]} — back to the inferred ticket")
+        else:
+            ticket_pins.pin(sid, ticket)
+            self._set_toast(f"pinned {ticket} to {sid[:8]}")
+        # A pin changes which PR we would search for, so drop this
+        # session's cached answer and let the next sweep re-probe.
+        agent = next((a for a in self._manager.scan() if a.session_id == sid), None)
+        if agent is not None:
+            self._prs.invalidate(agent.cwd)
+        await self._refresh_table()
+        self._refresh_prs()
 
     def action_cursor_down(self) -> None:
         self.query_one(ListView).action_cursor_down()
@@ -647,10 +1073,15 @@ class EphorApp(App[int]):
         self.query_one(ListView).action_cursor_up()
 
     def action_next_attention(self) -> None:
-        """Move cursor to the next row whose status needs attention.
+        """Move cursor to the next row that needs a human, wrapping.
 
-        Cycles through ATTENTION_STATUSES (PERM / WAIT / ERR), wrapping.
-        Looks first at rows strictly after the cursor; if none, wraps to top.
+        "Needs a human" is deliberately broader than the agent-status machine:
+        alongside PERM / WAIT / ERR it walks work-level attention — failing
+        CI, a conflict, requested changes, a review nobody has done, a ticket
+        that has drifted from its PR. Those rows are usually sitting in IDLE,
+        which is exactly why they were invisible before: the agent finished,
+        so the status column has nothing left to say, and the work is still
+        not done.
         """
         from ephor.constants import ATTENTION_STATUSES
 
@@ -663,74 +1094,265 @@ class EphorApp(App[int]):
 
         # Pull current statuses from the latest scan so we don't reuse a
         # stale snapshot; map sid → status for visible rows only.
-        status_by_sid: dict[str, AgentStatus] = {
-            a.session_id: a.status for a in self._manager.scan()
-        }
-        attention_indices = [
-            i
-            for i, sid in enumerate(self._sid_by_row)
-            if status_by_sid.get(sid) in ATTENTION_STATUSES
-        ]
-        if not attention_indices:
+        agents_by_sid = {a.session_id: a for a in self._manager.scan()}
+        reasons: dict[int, str] = {}
+        for i, sid in enumerate(self._sid_by_row):
+            agent = agents_by_sid.get(sid) if not is_group_row(sid) else None
+            if agent is None:
+                continue
+            if agent.status in ATTENTION_STATUSES:
+                reasons[i] = str(agent.status)
+                continue
+            work = self._work_attention(agent)
+            if work is not None:
+                reasons[i] = WORK_ATTENTION_DISPLAY[work][1]
+        if not reasons:
             self._set_toast("no rows need attention")
             return
 
+        attention_indices = sorted(reasons)
         cursor_idx = list_view.index if list_view.index is not None else -1
         target = next(
             (i for i in attention_indices if i > cursor_idx),
             attention_indices[0],
         )
         list_view.index = target
-        target_sid = self._sid_by_row[target]
-        target_status = status_by_sid.get(target_sid, AgentStatus.IDLE)
-        self._set_toast(f"→ {target_sid[:8]} ({target_status.value})")
+        self._set_toast(f"→ {self._sid_by_row[target][:8]} ({reasons[target]})")
+
+    # --- selection & grouping --------------------------------------------
+
+    def action_toggle_select(self) -> None:
+        """Mark or unmark the row under the cursor for a batch action."""
+        list_view = self.query_one(ListView)
+        row_id = self._cursor_sid(list_view)
+        if row_id is None:
+            self._set_toast("no row selected")
+            return
+        if is_group_row(row_id):
+            # Space on a header marks the whole group — the reason to group
+            # rows in the first place is to act on them together.
+            key = group_key_of(row_id)
+            members = [
+                sid
+                for sid in self._sid_by_row
+                if not is_group_row(sid)
+                and self._agents_by_sid.get(sid) is not None
+                and self._group_key(self._agents_by_sid[sid]) == key
+            ]
+            if all(sid in self._selected for sid in members) and members:
+                self._selected.difference_update(members)
+                self._set_toast(f"unmarked {len(members)} in {key}")
+            else:
+                self._selected.update(members)
+                self._set_toast(f"marked {len(members)} in {key}")
+            return
+        if row_id in self._selected:
+            self._selected.discard(row_id)
+        else:
+            self._selected.add(row_id)
+        self._set_toast(f"{len(self._selected)} marked")
+        list_view.action_cursor_down()
+
+    def action_clear_selection(self) -> None:
+        """Unmark every row."""
+        count = len(self._selected)
+        self._selected.clear()
+        self._set_toast(f"cleared {count} mark(s)" if count else "nothing was marked")
+
+    def action_cycle_grouping(self) -> None:
+        """Cycle none → ticket → repo. A flat list is hostile at 25 rows."""
+        index = self.GROUPINGS.index(self._group_by) if self._group_by in self.GROUPINGS else 0
+        self._group_by = self.GROUPINGS[(index + 1) % len(self.GROUPINGS)]
+        # Group names differ per mode, so folds from the previous mode would
+        # hide nothing and confuse everything.
+        self._collapsed.clear()
+        self._set_toast(f"grouping: {self._group_by}")
+
+    def action_toggle_collapse(self) -> None:
+        """Fold or unfold the group at the cursor."""
+        if self._group_by == "none":
+            self._set_toast("not grouped — press g first")
+            return
+        row_id = self._cursor_sid(self.query_one(ListView))
+        if row_id is None:
+            self._set_toast("no row selected")
+            return
+        if is_group_row(row_id):
+            key = group_key_of(row_id)
+        else:
+            agent = self._agents_by_sid.get(row_id)
+            if agent is None:
+                self._set_toast("no group here")
+                return
+            key = self._group_key(agent)
+        if key in self._collapsed:
+            self._collapsed.discard(key)
+            self._set_toast(f"expanded {key}")
+        else:
+            self._collapsed.add(key)
+            self._set_toast(f"collapsed {key}")
+
+    # --- permission inbox -------------------------------------------------
+
+    def action_allow(self) -> None:
+        """Answer "allow" for the marked sessions (or the cursor row)."""
+        self._decide(permissions.Decision.ALLOW, standing=False)
+
+    def action_deny(self) -> None:
+        """Answer "deny" for the marked sessions (or the cursor row)."""
+        self._decide(permissions.Decision.DENY, standing=False)
+
+    def action_allow_standing(self) -> None:
+        """Allow everything these sessions ask, until revoked with D."""
+        self._decide(permissions.Decision.ALLOW, standing=True)
+
+    def action_revoke(self) -> None:
+        """Withdraw any queued or standing decision for the target sessions."""
+        sids = self._target_sids()
+        if not sids:
+            self._set_toast("no row selected")
+            return
+        revoked = sum(1 for sid in sids if permissions.revoke(sid))
+        self._set_toast(f"revoked {revoked} decision(s)")
+
+    def _decide(self, decision: permissions.Decision, *, standing: bool) -> None:
+        """Write permission answers, and say plainly when they will take effect.
+
+        The honesty matters. The hook runs *before* the agent draws its
+        prompt, so unless the user has opted into a wait window
+        (EPHOR_PERMISSION_WAIT_SEC) a decision written now answers the
+        session's *next* request, not the one on screen. Reporting that as
+        "unblocked" would be a lie the user only discovers by watching a
+        session stay stuck.
+        """
+        sids = self._target_sids()
+        if not sids:
+            self._set_toast("no row selected")
+            return
+        written = 0
+        for sid in sids:
+            if permissions.decide(sid, decision, standing=standing):
+                written += 1
+                eventlog.append(
+                    eventlog.EventKind.PERMISSION_DECIDED,
+                    session_id=sid,
+                    ticket=self._ticket_for_sid(sid),
+                    detail=f"{decision}{' (standing)' if standing else ''}",
+                )
+        scope = "standing " if standing else ""
+        if permissions.hook_wait_sec() > 0:
+            when = "now"
+        elif standing:
+            when = "applies from this session's next request"
+        else:
+            when = "queued for the next request (set EPHOR_PERMISSION_WAIT_SEC to answer live)"
+        self._set_toast(f"{scope}{decision} x{written} — {when}")
+
+    def _ticket_for_sid(self, sid: str) -> str:
+        """Ticket for a session id, from the last painted snapshot."""
+        agent = self._agents_by_sid.get(sid)
+        if agent is None:
+            return ""
+        return ticket_for_agent(agent, self._summaries.get(sid)) or ""
+
+    # --- launching --------------------------------------------------------
+
+    def action_new_session(self) -> None:
+        """Start another session on the cursor row's ticket.
+
+        The second attempt at a ticket is a normal thing to want — the first
+        went down a dead end, or you want a second agent on an independent
+        part of it — and until now it meant leaving the dashboard.
+        """
+        sid = self._cursor_session_sid()
+        if sid is None:
+            self._set_toast("select a session row first")
+            return
+        ticket = self._ticket_for_sid(sid)
+        if not ticket:
+            self._set_toast("no ticket on this row — pin one with p")
+            return
+        agent = self._agents_by_sid.get(sid)
+        self._start_work(ticket, agent.provider if agent else "claude", agent.cwd if agent else "")
+
+    def action_resume_session(self) -> None:
+        """Reopen the cursor row's session in a fresh tmux window."""
+        sid = self._cursor_session_sid()
+        if sid is None:
+            self._set_toast("select a session row first")
+            return
+        agent = self._agents_by_sid.get(sid)
+        if agent is None:
+            self._set_toast("that session is gone")
+            return
+        self._resume_worker(sid, agent.provider or "claude", agent.cwd, self._ticket_for_sid(sid))
+
+    @work(thread=True, exit_on_error=False, group="launch")
+    def _start_work(self, ticket: str, provider: str, cwd: str) -> None:
+        """Create the worktree and window off the event loop — git is slow."""
+        result = launcher.start(ticket, provider=provider or "claude", cwd=cwd or None)
+        self.call_from_thread(self._set_toast, f"start {ticket}: {result.message}")
+
+    @work(thread=True, exit_on_error=False, group="launch")
+    def _resume_worker(self, sid: str, provider: str, cwd: str, ticket: str) -> None:
+        result = launcher.resume(sid, provider=provider, cwd=cwd, ticket=ticket)
+        self.call_from_thread(self._set_toast, result.message)
 
     async def action_kill(self) -> None:
         """Two-press kill: first press arms, second within 3s fires.
 
         Killing tears down the claude process, the tmux window, and the
         on-disk state file. No undo — the confirmation window is the only
-        guard against accidental presses.
+        guard against accidental presses. Marked rows are killed together,
+        and the arming key is the whole marked set, so arming on one row and
+        then changing the selection cannot fire against the wrong sessions.
         """
-        list_view = self.query_one(ListView)
-        idx = list_view.index
-        try:
-            sid = self._sid_by_row[idx] if idx is not None else None
-        except (IndexError, AttributeError):
-            sid = None
-        if sid is None:
+        sids = self._target_sids()
+        if not sids:
             self._set_toast("no row selected")
             return
 
-        agent = next(
-            (a for a in self._manager.scan() if a.session_id == sid),
-            None,
-        )
-        if agent is None:
-            self._set_toast(f"session {sid[:8]} disappeared between refreshes")
+        by_sid = {a.session_id: a for a in self._manager.scan()}
+        agents = [by_sid[sid] for sid in sids if sid in by_sid]
+        if not agents:
+            self._set_toast("those sessions disappeared between refreshes")
             self._kill_armed_sid = None
             return
 
-        label = agent.project_name or sid[:8]
+        arm_key = "\x00".join(sids)
+        label = (
+            f"{len(agents)} sessions"
+            if len(agents) > 1
+            else (agents[0].project_name or agents[0].session_id[:8])
+        )
         now = time.monotonic()
-        armed = self._kill_armed_sid == sid and now - self._kill_armed_at < KILL_CONFIRM_WINDOW_SEC
+        armed = (
+            self._kill_armed_sid == arm_key and now - self._kill_armed_at < KILL_CONFIRM_WINDOW_SEC
+        )
 
         if not armed:
-            self._kill_armed_sid = sid
+            self._kill_armed_sid = arm_key
             self._kill_armed_at = now
             self._set_toast(f"press x again within 3s to kill {label}")
             return
 
         self._kill_armed_sid = None
-        outcome = kill_session(agent, self._manager.directory)
-        # Drop any cached summary so a future session reusing the sid doesn't
-        # display stale text. Best-effort.
-        self._summaries.delete(sid)
-        if outcome.ok:
-            note = f" ({outcome.detail})" if outcome.detail else ""
-            self._set_toast(f"killed {label}{note}")
+        killed = 0
+        failures: list[str] = []
+        for agent in agents:
+            outcome = kill_session(agent, self._manager.directory)
+            # Drop any cached summary so a future session reusing the sid
+            # doesn't display stale text. Best-effort.
+            self._summaries.delete(agent.session_id)
+            self._selected.discard(agent.session_id)
+            if outcome.ok:
+                killed += 1
+            else:
+                failures.append(outcome.detail)
+        if failures:
+            self._set_toast(f"killed {killed}/{len(agents)} — {failures[0]}")
         else:
-            self._set_toast(f"kill failed: {outcome.detail}")
+            self._set_toast(f"killed {label}")
         await self._refresh_table()
 
     def action_summarize(self) -> None:
@@ -740,36 +1362,44 @@ class EphorApp(App[int]):
         on first sight. Rate-limited via the in-flight set: pressing `s`
         repeatedly is a no-op while a previous call is still pending.
         """
-        list_view = self.query_one(ListView)
-        idx = list_view.index
-        try:
-            sid = self._sid_by_row[idx] if idx is not None else None
-        except (IndexError, AttributeError):
-            sid = None
-        if sid is None:
+        sids = self._target_sids()
+        if not sids:
             self._set_toast("no row selected")
             return
-        agent = next(
-            (a for a in self._manager.scan() if a.session_id == sid),
-            None,
-        )
-        if agent is None:
-            self._set_toast(f"session {sid[:8]} disappeared between refreshes")
-            return
-        if sid in self._summarizing:
+        by_sid = {a.session_id: a for a in self._manager.scan()}
+        started = 0
+        for sid in sids:
+            agent = by_sid.get(sid)
+            if agent is None or sid in self._summarizing:
+                continue
+            self._summarize(
+                sid,
+                agent.cwd,
+                manual=True,
+                last_reply=agent.last_reply,
+                provider=agent.provider,
+                prompt=agent.last_summary,
+            )
+            started += 1
+        if not started:
             self._set_toast("already summarizing…")
-            return
-        self._summarize(
-            sid,
-            agent.cwd,
-            manual=True,
-            last_reply=agent.last_reply,
-            provider=agent.provider,
-            prompt=agent.last_summary,
-        )
+        elif started > 1:
+            self._set_toast(f"summarizing {started} sessions…")
 
     async def action_jump(self) -> None:
         list_view = self.query_one(ListView)
+
+        # Enter inside the ticket prompt means "save this pin", not "jump".
+        # Same priority-binding quirk as the filter input below: the `enter`
+        # binding fires before Input.Submitted, so the prompt has to be
+        # handled here or the keystroke is swallowed by a jump.
+        if (
+            self._ticket_input is not None
+            and self._ticket_input.display
+            and self.focused is self._ticket_input
+        ):
+            await self._submit_ticket_pin(self._ticket_input.value)
+            return
 
         # If the user pressed Enter while the filter input was focused, we
         # interpret that as "commit the filter and jump to the highlighted
@@ -785,12 +1415,14 @@ class EphorApp(App[int]):
             self._filter_input.display = False
             list_view.focus()
 
-        idx = list_view.index
-        try:
-            sid = self._sid_by_row[idx] if idx is not None else None
-        except (IndexError, AttributeError):
-            sid = None
+        # Enter on a group header folds it. There is nothing to jump to, and
+        # fold/unfold is the only thing a header can usefully do.
+        row_id = self._cursor_sid(list_view)
+        if is_group_row(row_id):
+            self.action_toggle_collapse()
+            return
 
+        sid = row_id
         if sid is None:
             self._set_toast("no row selected")
             return
@@ -1129,11 +1761,14 @@ class EphorApp(App[int]):
         key until the background sweep catches up) is worse.
         """
         if sid is None:
-            try:
-                list_view = self.query_one(ListView)
-            except NoMatches:
+            # No explicit row (a keypress, not a click): open every marked
+            # row's review at once, which is how a batch of finished work
+            # actually gets looked at.
+            marked = self._target_sids()
+            if len(marked) > 1:
+                self._open_many_prs(marked)
                 return
-            sid = self._cursor_sid(list_view)
+            sid = marked[0] if marked else None
         if sid is None:
             self._set_toast("no row selected")
             return
@@ -1151,13 +1786,33 @@ class EphorApp(App[int]):
         # broken. An explicit keypress is worth one fresh `gh` call.
         clear_cwd_cache()
         self._prs.invalidate(agent.cwd)
-        ticket = ticket_for_agent(agent, self._summaries.get(sid))
+        ticket = ticket_for_agent(agent, self._summaries.get(sid), pr)
         self._set_toast(f"looking up pull request for {ticket or agent.project_name or sid[:8]}…")
         self._lookup_pr(sid, agent.cwd, ticket, announce=True)
 
     def _open_pr(self, pr: PullRequest) -> None:
         self.open_url(pr.url)
         self._set_toast(f"opening PR #{pr.number} — {pr.url}")
+
+    def _open_many_prs(self, sids: list[str]) -> None:
+        """Open every marked row's pull request, and say what had none.
+
+        Only cached PRs are opened. Resolving the misses would mean a `gh`
+        round trip per session before the first tab appeared, and a batch
+        action that stalls for ten seconds is one nobody presses twice.
+        """
+        opened = 0
+        missing = 0
+        for sid in sids:
+            agent = self._agents_by_sid.get(sid)
+            pr = self._prs.cached(agent.cwd) if agent else None
+            if pr is None:
+                missing += 1
+                continue
+            self.open_url(pr.url)
+            opened += 1
+        note = f" ({missing} had no PR yet)" if missing else ""
+        self._set_toast(f"opened {opened} pull request(s){note}")
 
     @work(thread=True, exit_on_error=False, group="pr-lookup")
     def _lookup_pr(self, sid: str, cwd: str, ticket: str | None, announce: bool = False) -> None:
@@ -1218,7 +1873,11 @@ class EphorApp(App[int]):
                 continue
             if sid in self._pr_lookup_in_flight or not self._prs.needs_refresh(state.cwd):
                 continue
-            pending.append((sid, state.cwd, ticket_for_agent(state, self._summaries.get(sid))))
+            # Feed the cached PR back in: when the branch name says nothing,
+            # the PR's own title/body is where the key lives, and that call
+            # has already been paid for.
+            ticket = ticket_for_agent(state, self._summaries.get(sid), self._prs.cached(state.cwd))
+            pending.append((sid, state.cwd, ticket))
         if pending:
             self._sweep_prs(pending)
 
@@ -1242,6 +1901,51 @@ class EphorApp(App[int]):
                 self._pr_lookup_in_flight.discard(sid)
             if pr is not None:
                 self.call_from_thread(self._on_pr_resolved, sid, pr, ticket, False)
+
+    def _refresh_issues(self) -> None:
+        """Queue Jira lookups for the tickets currently on screen.
+
+        A no-op when no credentials are configured, which is the default —
+        ephor stays a local tool until told otherwise. Deduped by ticket
+        rather than by session, so five sessions on one ticket cost one
+        request.
+        """
+        tickets: set[str] = set()
+        for sid in self._sid_by_row:
+            if is_group_row(sid):
+                continue
+            agent = self._agents_by_sid.get(sid)
+            if agent is None:
+                continue
+            key = ticket_for_agent(agent, self._summaries.get(sid))
+            if key and key not in self._issue_lookup_in_flight and self._issues.needs_refresh(key):
+                tickets.add(key)
+        if tickets:
+            self._sweep_issues(sorted(tickets))
+
+    @work(thread=True, exit_on_error=False, group="jira-sweep", exclusive=True)
+    def _sweep_issues(self, tickets: list[str]) -> None:
+        """Background-thread worker: read a batch of tickets from Jira."""
+        for key in tickets:
+            if key in self._issue_lookup_in_flight:
+                continue
+            self._issue_lookup_in_flight.add(key)
+            try:
+                issue = self._issues.resolve(key)
+            finally:
+                self._issue_lookup_in_flight.discard(key)
+            if issue is not None:
+                self.call_from_thread(self._on_issue_resolved, key, issue)
+
+    def _on_issue_resolved(self, key: str, issue: object) -> None:
+        """Fold a resolved ticket into its work record."""
+        status = getattr(issue, "status", "")
+        work_items.record(
+            key,
+            jira_status=status,
+            jira_title=getattr(issue, "title", ""),
+            jira_assignee=getattr(issue, "assignee", ""),
+        )
 
 
 # ---------------------------------------------------------------------------

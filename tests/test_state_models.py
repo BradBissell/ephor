@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from ephor.config import SCHEMA_VERSION
 from ephor.constants import AgentStatus
 from ephor.state.models import AgentState, Notification, StatusSummary
 
@@ -27,7 +28,7 @@ def test_to_json_roundtrip() -> None:
     data = json.loads(raw)
     assert data["session_id"] == "abc-123"
     assert data["status"] == "WORKING"
-    assert data["schema_version"] == 3
+    assert data["schema_version"] == SCHEMA_VERSION
     assert data["tool_count"] == 3
 
 

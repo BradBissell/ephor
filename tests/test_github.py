@@ -9,7 +9,15 @@ from pathlib import Path
 import pytest
 
 from ephor import github as gh
+from ephor import gitinfo
 from ephor.github import PrResolver, PullRequest, pr_for_branch, pr_for_ticket
+
+
+@pytest.fixture(autouse=True)
+def _clear_git_cache() -> None:
+    """PrResolver's cache key is derived from memoized git facts — reset them."""
+    gitinfo.clear_cache()
+
 
 _PR_JSON = json.dumps(
     {
@@ -84,24 +92,46 @@ def test_pr_for_ticket_returns_none_on_empty_search(
     assert pr_for_ticket(tmp_path, "DR-8222") is None
 
 
+def _fake_cli(
+    gh_stdout: str,
+    *,
+    gh_returncode: int = 0,
+    branch: str = "topic",
+    toplevel: str = "/repo",
+    gh_calls: list[list[str]] | None = None,
+) -> object:
+    """Stub subprocess.run for both CLIs, dispatching on argv.
+
+    `gh.subprocess` and `gitinfo.subprocess` are the same module object, so
+    patching one patches both. PrResolver now asks git for the branch to
+    build its cache key, which means a resolver test has to answer git as
+    well as gh — and count only the gh calls it means to assert on.
+    """
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "git" in argv:
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{branch}\n{toplevel}\n", stderr=""
+            )
+        if gh_calls is not None:
+            gh_calls.append(list(argv))
+        return subprocess.CompletedProcess(
+            args=argv, returncode=gh_returncode, stdout=gh_stdout, stderr=""
+        )
+
+    return run
+
+
 # ---- PrResolver -----------------------------------------------------------
 
 
 def test_resolver_caches_hits_and_does_not_re_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[int] = []
-
-    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append(1)
-        return subprocess.CompletedProcess(
-            args=list(args),  # type: ignore[arg-type]
-            returncode=0,
-            stdout=_PR_JSON,
-            stderr="",
-        )
-
-    monkeypatch.setattr(gh.subprocess, "run", run)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        gh.subprocess, "run", _fake_cli(_PR_JSON, toplevel=str(tmp_path), gh_calls=calls)
+    )
     resolver = PrResolver()
     assert resolver.needs_refresh(tmp_path)
     first = resolver.resolve(tmp_path)
@@ -120,7 +150,11 @@ def test_resolver_cached_is_none_before_any_probe(tmp_path: Path) -> None:
 def test_resolver_miss_expires_sooner_than_a_hit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(gh.subprocess, "run", _fake_gh("", returncode=1))
+    monkeypatch.setattr(
+        gh.subprocess,
+        "run",
+        _fake_cli("", gh_returncode=1, toplevel=str(tmp_path)),
+    )
     resolver = PrResolver(hit_ttl=1000.0, miss_ttl=0.0)
     assert resolver.resolve(tmp_path) is None
     # A zero-length negative TTL means the next sweep probes again — that's
@@ -162,3 +196,75 @@ def test_resolver_invalidate_clears_entries(
     resolver.resolve(tmp_path)
     resolver.invalidate(tmp_path)
     assert resolver.cached(tmp_path) is None
+
+
+def test_pr_fields_request_body_and_head_ref() -> None:
+    """The Jira harvester reads a key back out of these — see ephor.jira."""
+    for field in ("body", "headRefName"):
+        assert field in gh._PR_FIELDS
+
+
+def test_parse_pr_keeps_body_and_head_ref(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = json.dumps(
+        {
+            "number": 7,
+            "url": "https://github.com/acme/repo/pull/7",
+            "state": "OPEN",
+            "title": "add the thing",
+            "isDraft": False,
+            "body": "Closes DR-8222",
+            "headRefName": "feature/whatever",
+        }
+    )
+    monkeypatch.setattr(gh.subprocess, "run", _fake_gh(payload))
+    pr = pr_for_branch(tmp_path)
+    assert pr is not None
+    assert pr.body == "Closes DR-8222"
+    assert pr.head_ref == "feature/whatever"
+
+
+def test_resolver_key_follows_the_branch_not_the_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PR belongs to a branch, so a branch switch must miss the cache.
+
+    Keyed on cwd, a shared checkout served the previous branch's review for
+    the rest of the hour-long hit TTL.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        gh.subprocess,
+        "run",
+        _fake_cli(_PR_JSON, branch="DR-1-first", toplevel=str(tmp_path), gh_calls=calls),
+    )
+    resolver = PrResolver()
+    assert resolver.resolve(tmp_path) is not None
+    assert len(calls) == 1
+    assert not resolver.needs_refresh(tmp_path)
+
+    # Same directory, different branch.
+    gitinfo.clear_cache()
+    monkeypatch.setattr(
+        gh.subprocess,
+        "run",
+        _fake_cli(_PR_JSON, branch="DR-2-second", toplevel=str(tmp_path), gh_calls=calls),
+    )
+    assert resolver.needs_refresh(tmp_path), "branch switch re-served a stale entry"
+    assert resolver.resolve(tmp_path) is not None
+    assert len(calls) == 2
+
+
+def test_resolver_falls_back_to_the_path_outside_a_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-repo directories (and detached heads) still cache per directory."""
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "git" in argv:
+            return subprocess.CompletedProcess(args=argv, returncode=128, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=_PR_JSON, stderr="")
+
+    monkeypatch.setattr(gh.subprocess, "run", run)
+    resolver = PrResolver()
+    assert resolver.resolve(tmp_path) is not None
+    assert resolver.cached(tmp_path) is not None

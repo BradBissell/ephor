@@ -14,7 +14,9 @@ The Jira ticket cell replaces the older session_id tail. It is clickable:
 when the session's PR is known the key dispatches ``app.open_pr(<sid>)``,
 which opens the pull request in the browser (the ``o`` hotkey does the same
 for the selected row). Underlined + bright = PR resolved; plain green =
-ticket known but no PR found yet; dim dash = no ticket. T/E (tool count +
+ticket known but no PR found yet; amber = the key was only *mentioned* in a
+tmux label, a prompt or a model summary rather than established by git, so
+it is a guess and is drawn as one; dim dash = no ticket. T/E (tool count +
 error count) cells were removed once the LLM summary made them redundant —
 errors still surface through the status icon and the STALE badge.
 """
@@ -22,6 +24,7 @@ errors still surface through the status icon and the STALE badge.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from textual.widgets import Static
@@ -30,9 +33,11 @@ from ephor.constants import (
     STALE_HEARTBEAT_SEC,
     STATUS_DISPLAY,
     AgentStatus,
+    CiState,
+    ReviewState,
 )
 from ephor.github import PullRequest
-from ephor.jira import ticket_for_agent
+from ephor.jira import match_for_agent
 from ephor.state.models import AgentState
 
 _SPARK_GLYPHS = "▁▂▃▄▅▆▇█"
@@ -40,6 +45,7 @@ _SPARK_WIDTH = 16
 _SUMMARY_COL_WIDTH = 40  # LLM summary column on the primary row
 _SUBLINE_WIDTH = 70  # latest user prompt on the dim subline
 _TICKET_COL_WIDTH = 12  # Jira key cell on the tail of row 1
+_WORK_COL_WIDTH = 12  # PR number + CI/review glyphs, right of the Jira key
 
 
 def is_heartbeat_stale(agent: AgentState, threshold_sec: int = STALE_HEARTBEAT_SEC) -> bool:
@@ -91,12 +97,19 @@ def _truncate(text: str, width: int) -> str:
 _SAFE_SID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
-def _ticket_label(agent: AgentState, summary: str | None) -> str:
-    """Best-effort Jira key for the row. Falls back to "—" placeholder.
+def _ticket_label(
+    agent: AgentState, summary: str | None, pr: PullRequest | None = None
+) -> tuple[str, bool]:
+    """Jira key for the row plus whether it is a fact, not a guess.
 
-    See :func:`ephor.jira.ticket_for_agent` for the probe order.
+    See :func:`ephor.jira.match_for_agent` for the probe order. The bool is
+    the match's confidence; the placeholder is reported as confident so the
+    dash renders with its own dim style rather than the guess style.
     """
-    return ticket_for_agent(agent, summary) or "—"
+    match = match_for_agent(agent, summary, pr)
+    if match is None:
+        return "—", True
+    return match.key, match.confident
 
 
 def render_ticket_cell(
@@ -104,6 +117,7 @@ def render_ticket_cell(
     session_id: str = "",
     pr: PullRequest | None = None,
     width: int = _TICKET_COL_WIDTH,
+    confident: bool = True,
 ) -> str:
     """Markup for the Jira cell — a click target when a PR is known.
 
@@ -113,6 +127,12 @@ def render_ticket_cell(
     PR the key still clicks through — the action resolves lazily and
     toasts if there's nothing to open — but stays unadorned so the
     dashboard shows at a glance which sessions have review in flight.
+
+    ``confident=False`` (the key was read out of a label, a prompt or a
+    model summary rather than out of git) draws it amber and italic. The
+    column used to present a lucky regex hit on prose exactly like a branch
+    name; this is the difference between the two being visible instead of
+    silently asserted.
     """
     if ticket == "—":
         return f"[dim]{ticket:<{width}}[/]"
@@ -125,14 +145,125 @@ def render_ticket_cell(
         else:
             color = "#7ee787"
         style = f"{color} underline"
-    else:
+    elif confident:
         style = "#7ee787"
+    else:
+        style = "#d29922 italic"
     padded = f"{ticket:<{width}}"
     if not _SAFE_SID.fullmatch(session_id):
         return f"[{style}]{padded}[/]"
     # Pad outside the click span so the hit area is the key itself, not
     # the trailing alignment whitespace.
     return f"[@click=app.open_pr('{session_id}')][{style}]{ticket}[/][/]{padded[len(ticket) :]}"
+
+
+@dataclass(frozen=True)
+class RowContext:
+    """Everything about a row that does not come from its ``AgentState``.
+
+    These arrive from four different resolvers on four different clocks (the
+    PR cache, the Jira cache, the collision scan, the selection set), and
+    passing them as one object keeps :meth:`SessionRow.update_agent` from
+    growing a tenth positional parameter every time the dashboard learns to
+    notice something new.
+    """
+
+    selected: bool = False
+    collisions: tuple[str, ...] = ()
+    jira_status: str = ""
+    jira_title: str = ""
+    drift: str = ""
+    decision_queued: str = ""
+    failing_checks: tuple[str, ...] = field(default=())
+
+
+_EMPTY_CONTEXT = RowContext()
+
+# Glyphs for the work cell. Deliberately ASCII-adjacent: this sits at the
+# right edge of a row that already spends its Unicode budget on the
+# sparkline, and a box-drawing failure there would misalign every column.
+_CI_GLYPH: dict[CiState, tuple[str, str]] = {
+    CiState.PASSING: ("v", "#7ee787"),
+    CiState.FAILING: ("x", "#f85149"),
+    CiState.PENDING: ("~", "#d29922"),
+    CiState.NONE: (" ", "dim"),
+}
+_REVIEW_GLYPH: dict[ReviewState, tuple[str, str]] = {
+    ReviewState.APPROVED: ("+", "#7ee787"),
+    ReviewState.CHANGES_REQUESTED: ("!", "#f85149"),
+    ReviewState.REVIEW_REQUIRED: ("?", "#d29922"),
+    ReviewState.NONE: (" ", "dim"),
+}
+
+
+def render_work_cell(
+    pr: PullRequest | None,
+    drift: str = "",
+    width: int = _WORK_COL_WIDTH,
+) -> str:
+    """Markup for the work-state cell: PR number, CI verdict, review verdict.
+
+    This is the cell that answers "is this finished?" — the question the
+    status column cannot answer, because the coding agent going idle says
+    nothing about whether its work is mergeable. A blank cell means no PR,
+    which for an in-flight session is information too.
+    """
+    if pr is None:
+        return f"[dim]{'—':<{width}}[/]"
+    number = f"#{pr.number}"
+    ci_char, ci_color = _CI_GLYPH.get(pr.ci, (" ", "dim"))
+    review_char, review_color = _REVIEW_GLYPH.get(pr.review, (" ", "dim"))
+    # A conflicting branch overrides the review glyph: no verdict matters
+    # while the thing cannot merge.
+    if pr.has_conflict:
+        review_char, review_color = ("><"[0], "#f85149")
+    drift_char = "[#bc8cff]~[/]" if drift else " "
+    body = f"{number} [{ci_color}]{ci_char}[/][{review_color}]{review_char}[/]{drift_char}"
+    # Pad against the *visible* width; the markup tags are zero-width.
+    visible = len(number) + 3
+    return (
+        f"[dim]{body}{' ' * max(0, width - visible)}[/]"
+        if not pr.is_open
+        else (f"{body}{' ' * max(0, width - visible)}")
+    )
+
+
+def render_subline(
+    agent: AgentState,
+    context: RowContext,
+    width: int = _SUBLINE_WIDTH,
+) -> str:
+    """The dim second line: a warning if there is one, else what was asked.
+
+    Warnings displace the prompt rather than sharing the line with it. The
+    prompt is context you already have — you typed it — whereas "two sessions
+    are editing this worktree" is news, and news that scrolls off the right
+    edge is news nobody reads.
+    """
+    if context.collisions:
+        others = len(context.collisions)
+        plural = "s" if others != 1 else ""
+        return (
+            f"  [bold #f85149]! shares its worktree with {others} other session{plural}[/]"
+            f"[dim] — edits will interleave[/]"
+        )
+    if context.drift:
+        return f"  [#bc8cff]~ {_truncate(context.drift, width)}[/]"
+    if context.failing_checks:
+        names = ", ".join(context.failing_checks[:3])
+        return f"  [#f85149]x CI failing:[/][dim] {_truncate(names, width)}[/]"
+    if context.decision_queued:
+        return f"  [#7ee787]> {context.decision_queued} queued — sent on the next prompt[/]"
+
+    prompt = getattr(agent, "last_summary", "") or ""
+    if context.jira_status and prompt:
+        tag = f"[dim italic]«{context.jira_status}»[/] "
+        return f"  {tag}[dim italic]{_truncate(prompt, width - len(context.jira_status) - 4)}[/]"
+    if context.jira_title and not prompt:
+        return f"  [dim italic]↳ {_truncate(context.jira_title, width)}[/]"
+    if prompt:
+        return f"  [dim italic]↳ {_truncate(prompt, width)}[/]"
+    return "  [dim]·[/]"
 
 
 class SessionRow(Static):
@@ -146,6 +277,7 @@ class SessionRow(Static):
         tokens: int | None = None,
         speaking: bool = False,
         pr: PullRequest | None = None,
+        context: RowContext | None = None,
     ) -> None:
         # Status is shown purely by color now (no icon/label cell); the color
         # tints the project name below.
@@ -174,21 +306,27 @@ class SessionRow(Static):
         # Jira cell: takes the slot the session_id occupied. When no
         # ticket can be inferred we render a dim em-dash so column width
         # stays stable across sessions. Clicking it opens the PR.
-        ticket = _ticket_label(agent, summary)
-        ticket_cell = render_ticket_cell(ticket, agent.session_id, pr)
+        ticket, ticket_confident = _ticket_label(agent, summary, pr)
+        ticket_cell = render_ticket_cell(ticket, agent.session_id, pr, confident=ticket_confident)
+
+        ctx = context or _EMPTY_CONTEXT
+        work_cell = render_work_cell(pr, ctx.drift)
 
         # Speaking marker: a 1-char left accent (▌) in cyan when this row
         # is the TTS source. A leading space when silent — ALWAYS 2 chars
         # of prefix so column alignment never shifts as the speaker
         # changes. Subtler than an emoji and matches the native TUI feel.
         speak_prefix = "[bold #00ffff]▌[/] " if speaking else "  "
+        # Batch-selection marker, one char ahead of the speaking accent, so
+        # a marked row reads at a glance without the two signals colliding.
+        select_prefix = "[bold #58a6ff]•[/]" if ctx.selected else " "
 
         # Provider column: which coding agent this session belongs to. Muted so
         # the status color (on the project name) stays the primary signal.
         provider_cell = f"[#8b949e]{(agent.provider or '—'):<8}[/]"
 
         primary = (
-            f"{speak_prefix}"
+            f"{select_prefix}{speak_prefix}"
             f"{provider_cell} "
             f"[bold {color}]{agent.project_name or '—':<20}[/] "
             f"{summary_cell} "
@@ -196,12 +334,7 @@ class SessionRow(Static):
             f"{tok_cell}  "
             f"[#00ffff]{spark}[/]  "
             f"{ticket_cell}"
+            f"{work_cell}"
         )
 
-        last_prompt = getattr(agent, "last_summary", "") or ""
-        if last_prompt:
-            subline = f"  [dim italic]↳ {_truncate(last_prompt, _SUBLINE_WIDTH)}[/]"
-        else:
-            subline = "  [dim]·[/]"
-
-        self.update(f"{primary}\n{subline}")
+        self.update(f"{primary}\n{render_subline(agent, ctx)}")

@@ -96,8 +96,69 @@ src/ephor/
 ├── speech.py                  ← append-only NDJSON log of TTS start/stop events
 ├── speech_player.py           ← FIFO speech queue + kokoro subprocess manager
 ├── speech_settings.py         ← persisted enabled/mode + learned chars/sec rate
-└── tui/widgets/speech_bar.py  ← bottom bar mirroring the speech engine
+├── tui/widgets/speech_bar.py  ← bottom bar mirroring the speech engine
+├── work_items.py              ← per-ticket record: branch, worktree, PR, Jira, sessions
+├── eventlog.py                ← append-only NDJSON tape of transitions (`ephor log`)
+├── launcher.py                ← `ephor start` / `ephor resume`: worktree + tmux + $EPHOR_TICKET
+├── permissions.py             ← writes the decisions the hook handler emits
+├── jira_api.py                ← opt-in Jira read: status, summary, assignee, drift
+└── notify.py                  ← opt-in push (ntfy/webhook) for sessions needing a human
 ```
+
+## Work items: the second axis
+
+Everything above is keyed on a *session*. That is the right key for
+"what is running right now" and the wrong one for "what happened to
+DR-8222", which spans several sessions, some of them long dead.
+
+`work_items.py` is the second axis: one JSON file per ticket under
+`$XDG_STATE_HOME/ephor/work/`, merged field-by-field by whichever component
+learns something — the launcher at `ephor start`, the PR resolver when `gh`
+answers, the Jira probe when it reads a status, the ticket harvester when a
+fact-tier probe fires. Every field is last-writer-wins, and `confirmed` is a
+ratchet: a guess can never demote a key a branch name already settled.
+
+Two properties fall out of the key being a ticket rather than a session:
+grouping (several sessions attempting one ticket fold under one header), and
+promotion (a key established once is read back rather than re-derived, so a
+deleted branch cannot turn a settled fact back into an amber guess).
+
+### Who writes what
+
+| File | Writer | Lock |
+|---|---|---|
+| `sessions/<sid>.json` | the hook handler, only | per-session flock |
+| `work/<KEY>.json` | ephor (TUI, CLI, launcher) | none — single writer |
+| `pending/<sid>.json` | ephor; **read + deleted** by the hook | none — create/consume |
+| `events.ndjson` | the TUI | none — `O_APPEND`, one line per write |
+
+The invariant `docs/architecture.md` has always promised holds unchanged:
+**the hook is still the only writer of session state files.** `ephor start`
+does not write one. It hands the ticket to the agent through the
+environment, and the hook records it on the first event exactly as it
+records everything else.
+
+## Change observation
+
+The dashboard repaints twice a second and almost nothing it draws is new.
+`EphorApp._observe()` is the single place that diffs the current scan
+against the previous one, and everything edge-triggered hangs off it: the
+event log records transitions rather than frames, the notifier fires once
+per (session, reason) rather than continuously, and a confirmed ticket is
+promoted the first time it is seen.
+
+## Attention, in two layers
+
+`AgentStatus` says what the *agent* is doing. It cannot say whether the work
+is finished, because a session that pushed a branch and exited is `IDLE`
+whether its CI is green or red.
+
+So attention is derived from two sources. `ATTENTION_STATUSES` covers the
+agent (`WAITING_PERMISSION`, `WAITING_ANSWER`, `ERROR`); `WorkAttention`
+covers the work (`CI_FAILED`, `CONFLICT`, `CHANGES_REQUESTED`,
+`REVIEW_REQUESTED`, `TICKET_DRIFT`), computed from the PR fields `gh`
+returns and, when Jira is configured, from the disagreement between the
+ticket and its PR. `n` walks both.
 
 ## Speech subsystem (TTS speak-back)
 
