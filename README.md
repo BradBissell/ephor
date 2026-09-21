@@ -88,15 +88,38 @@ pipx install --editable '.[tui]'
 2. **`ephor`** (or `ephor tui`) — opens the TUI. Use `j`/`k` or arrow keys to navigate,
    `/` to filter, `Enter` to jump to a session's tmux pane, `x` to
    kill, `o` (or a click on the Jira key) to open that session's pull
-   request, `?` for the full keymap.
+   request, `p` to pin a ticket to the selected session, `?` for the full
+   keymap.
 ### The Jira column
 
-The tail of each row is the session's Jira key, harvested from whichever
-signal the session actually offers — the git branch at its cwd, a
-worktree or ancestor directory named after the ticket, the tmux window
-label, the latest user prompt, and finally the LLM summary, in that order
-of trust. Well-known lookalikes (`UTF-8`, `SHA-256`, `ISO-8601`, …) are
-never mistaken for keys.
+The tail of each row is the session's Jira key. The best way to get it
+right is not to guess at all: export `EPHOR_TICKET=DR-8222` before
+launching the agent and the hook records it, which beats every heuristic
+below and survives branch switches, sessions sitting on `main`, and
+shared checkouts. Failing that, press `p` on a row and type the key —
+pins are stored by session id and persist across restarts.
+
+When neither is set, ephor harvests from whichever signal the session
+actually offers, in this order of trust:
+
+| Signal | Why it ranks there |
+|---|---|
+| git branch at the session's cwd | the worktree-per-ticket case |
+| the branch's upstream | rescues a detached HEAD, and a local `work` branch pushed as `origin/DR-8222-x` |
+| path, from cwd up to the **worktree root** | `~/projects/work/aim-myt/DR-8222`; stopping at the root keeps an unrelated `~/DR-100-scratch/` ancestor from claiming the session |
+| the branch's own commit subjects and bodies | catches `fix/some-descriptive-name` whose commits say `feat(DR-8222): …` |
+| the pull request's title, body and head ref | free — `gh` was already called for the link |
+| tmux window label | set by a start-work flow, but a label a human can rename |
+| the latest user prompt | "implement DR-8222" is how most of these start |
+| the LLM summary | generated text, and partly circular — it is last for a reason |
+
+The first six are facts; the last three are readings of prose, and a key
+that came from one of those is drawn amber and italic rather than green,
+so a lucky regex hit never looks like a branch name. Well-known
+lookalikes (`UTF-8`, `SHA-256`, `ISO-8601`, …) are never mistaken for
+keys — and setting `EPHOR_TICKET_PROJECTS=DR,ABC` replaces that denylist
+with an allowlist of your own project prefixes, which is strictly more
+precise.
 
 The key is a link. ephor resolves the session's pull request in the
 background with `gh` — first the PR whose head is the checked-out branch,
@@ -108,7 +131,9 @@ ephor looks it up on the spot.
 
 A session that outlives its answers re-harvests on its own: a "no PR
 yet" is re-probed every 90s, so a branch you push mid-session gains its
-link without a restart. Resolved PRs are held for an hour — press `r` to
+link without a restart. PRs are cached per checkout *branch*, so
+switching branches in a shared checkout gets a fresh lookup rather than
+the previous branch's review. Resolved PRs are held for an hour — press `r` to
 force the issue. That drops every memoized ticket *and* PR and re-runs
 `git` and `gh` from scratch for every visible session, which is what you
 want after switching a session's branch or merging its PR. Pressing `o`
@@ -118,9 +143,127 @@ push-then-press-again loop works.
 Requires `gh` installed and authenticated. Without it the column still
 shows tickets — it just never gains links.
 
-3. **`ephor list`** — script-friendly one-line-per-session status, for
+### The work column
+
+Right of the ticket sits what the ticket's pull request is actually doing:
+
+```
+DR-8222  #143 v?    CI green, waiting on a reviewer
+DR-8231  #147 x     CI failing — and the session went IDLE twenty minutes ago
+DR-8199  #139 v!    reviewer asked for changes
+DR-8150  #131 v>    branch no longer merges cleanly
+DR-8101  #128 v+~   approved and merged, but the ticket still says In Progress
+```
+
+`v`/`x`/`~` is the rolled-up CI verdict, `+`/`!`/`?` the review verdict,
+`>` a merge conflict, and a trailing `~` means the ticket and its PR have
+drifted apart. All of it comes from the same `gh` round trip that already
+resolved the link — `statusCheckRollup`, `reviewDecision`,
+`mergeStateStatus`.
+
+This is the column that changes what the dashboard is for. The status
+machine can only say what the *agent* is doing, so a session that finished
+its work and left red CI behind renders as a calm grey IDLE row — the
+quietest thing on a board where it is the most urgent. Those rows now light
+up, and `n` (next-attention) walks them alongside the sessions blocked on a
+permission prompt.
+
+### Work items
+
+A ticket outlives the sessions that work on it, so ephor keeps a record
+that does too: one file per key under `$XDG_STATE_HOME/ephor/work/`,
+holding the branch, the worktree, the PR, the Jira status and every session
+id that has touched it. It is what makes `ephor work` and `ephor log
+DR-8222` answerable at all, and it feeds two things back into the board:
+
+- **Promotion.** The moment any fact-tier probe (branch, path, commits, PR)
+  establishes a key, it is written down. A session whose branch is later
+  deleted — or whose worktree is cleaned up — keeps its settled green key
+  instead of decaying back into an amber guess.
+- **Grouping.** Because the record is keyed by ticket rather than session,
+  `g` can fold the list by ticket (or by repo): several sessions attempting
+  one ticket collapse under one header that counts how many are working and
+  how many need you.
+
+### Jira, if you want it
+
+Set `EPHOR_JIRA_URL`, `EPHOR_JIRA_EMAIL` and `EPHOR_JIRA_TOKEN` and ephor
+reads each ticket's real status, summary and assignee. The subline gains a
+`«In Progress»` tag, and ephor starts flagging **drift** — "PR merged,
+ticket still In Progress", or "ticket Done, PR still open". That one costs
+a week at a time and nothing else in the toolchain notices it.
+
+Unset, no request is made. ephor stays a local tool until told otherwise.
+
+### Managing twenty-five sessions
+
+| Key | Does |
+|---|---|
+| `space` | mark a row (on a group header: the whole group) |
+| `c` | clear every mark |
+| `g` / `z` | cycle grouping (none → ticket → repo) / fold the group at the cursor |
+| `a` / `d` | allow / deny the marked sessions' permission request |
+| `A` / `D` | standing allow for a session / revoke a decision |
+| `N` / `R` | start another session on this ticket / reopen this session |
+| `x`, `s`, `o` | kill, summarize, open PR — all act on the marked set |
+
+**Marking is what makes an action a batch action.** With nothing marked
+every key behaves exactly as it did before, on the cursor row.
+
+#### The permission inbox
+
+`a` and `d` write a decision into `$XDG_STATE_HOME/ephor/pending/`, which
+the hook handler has always known how to read and emit — so answering from
+the dashboard is the existing auto-approve mechanism, not keystroke
+injection into a pane.
+
+There is a caveat worth stating plainly, because ephor states it in the
+toast rather than letting you discover it: the hook runs *before* the agent
+draws its dialog, so by default your answer lands on that session's **next**
+request, not the one on screen. Set `EPHOR_PERMISSION_WAIT_SEC=10` and the
+handler will instead write its WAITING_PERMISSION state and then wait up to
+ten seconds for you to answer, which is what makes `a` unblock the prompt
+you are looking at. The trade is real and that is why it is off by default:
+while the handler waits, the agent has not drawn its prompt, so the pane
+cannot be answered either.
+
+`A` (standing allow) sidesteps the whole question — "yes, this session may
+keep doing what it is doing" is one judgement, made once, instead of
+re-litigated at every prompt. It applies until `D` revokes it, and it is
+per session, never global.
+
+#### Shared-worktree collisions
+
+Two agents editing one working tree interleave their writes and neither can
+tell. ephor already records every session's cwd, so it says so: a row whose
+worktree is shared with another live session replaces its subline with a red
+warning. It reports rather than prevents — a shared checkout is occasionally
+what you meant, and a locked-out agent is a worse failure than a warned one.
+
+#### When you are away from the desk
+
+Speak-back solves "which of these ten finished" when you are at the machine.
+`EPHOR_NOTIFY_URL` solves it when you are not: point it at an
+[ntfy](https://ntfy.sh) topic (or any webhook) and ephor pushes once when a
+session starts needing you — blocked on permission, erroring, or sitting on
+red CI. Once, not continuously: a session blocked for forty minutes is one
+event. Unset, nothing is sent.
+
+3. **`ephor start DR-8222 --title "add retry"`** — the other direction:
+   ephor creates the worktree, opens a tmux window named for the ticket,
+   symlinks the repo's `.env*` files in, and launches the agent with
+   `EPHOR_TICKET` already set. Nothing is inferred, because nothing has to
+   be. `ephor resume <sid>` reopens a finished session in its original
+   directory.
+4. **`ephor work`** — the ticket-shaped view: one row per piece of work,
+   with its branch, its PR, its Jira status and how many of its sessions
+   are still alive. Survives every one of those sessions dying.
+5. **`ephor log [DR-8222]`** — what *happened*, as opposed to what is true
+   now. Status transitions, PR links, CI flips, permission answers.
+   `--since 2h` for the overnight recap.
+6. **`ephor list`** — script-friendly one-line-per-session status, for
    tmux status-right widgets or shell scripts.
-4. **`ephor doctor`** — checks dependencies and, per agent, whether its
+7. **`ephor doctor`** — checks dependencies and, per agent, whether its
    CLI is installed and ephor's hooks are registered.
 
 See [`docs/getting-started.md`](docs/getting-started.md) for a longer
@@ -151,7 +294,11 @@ walkthrough.
   `--arg` everywhere, per-session flock, and fail-OPEN error handling
   (a buggy hook never blocks your agent).
 - **Auto-approve via hook return value**, not keystroke injection.
-  Rules engine answers permission prompts before the dialog renders.
+  Rules engine answers permission prompts before the dialog renders, and
+  the dashboard's own `a`/`d` keys ride the same mechanism.
+- **Work outlives sessions.** One record per ticket — branch, worktree, PR,
+  CI, Jira status, every session that touched it — so `ephor log DR-8222`
+  can answer what happened overnight.
 - **Spoken one-line summaries.** When a session finishes, ephor can read
   back a ≤70-char summary of what Claude just did — so you can keep your
   eyes on one window and still know the other nine are done. See
@@ -272,10 +419,17 @@ TUI reads it. There is no daemon.
 
 ## Privacy & security
 
-`ephor` is a local tool. Nothing leaves your machine except for one
-authenticated call to `https://api.anthropic.com/api/oauth/usage` to
+`ephor` is a local tool. By default the only thing that leaves your machine
+is one authenticated call to `https://api.anthropic.com/api/oauth/usage` to
 compute per-account usage anchors (Claude Code only; skipped for other
-agents). Full surface area in [`SECURITY.md`](SECURITY.md).
+agents).
+
+Two integrations can add egress, and both are off until you configure them:
+the Jira read (`EPHOR_JIRA_*`) talks to the site you name, and push
+notification (`EPHOR_NOTIFY_URL`) talks to the URL you name. Neither sends
+prompts, replies or transcript content — and the Jira client refuses to send
+credentials over plain `http://`. Full surface area in
+[`SECURITY.md`](SECURITY.md).
 
 ## Requirements
 

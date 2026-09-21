@@ -1,8 +1,9 @@
 """CLI entrypoint for `ephor`.
 
-Subcommands: list / status / tmux-widget (read-only views), init / uninstall /
-doctor (hook management, `--provider` aware), kill / refresh-tmux, tui, and the
-speech-playback controls.
+Subcommands: list / status / tmux-widget / work / log (read-only views),
+start / resume (launch work), init / uninstall / doctor (hook management,
+`--provider` aware), kill / refresh-tmux, tui, and the speech-playback
+controls.
 """
 
 from __future__ import annotations
@@ -12,11 +13,15 @@ import os
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from ephor import __version__
 from ephor.constants import STATUS_DISPLAY, AgentStatus
 from ephor.providers import PROVIDER_ORDER
 from ephor.state.manager import StateManager
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ephor.state.models import AgentState
 
 # --provider choices: each supported agent, plus "all" for bulk operations.
 _PROVIDER_CHOICES = (*PROVIDER_ORDER, "all")
@@ -70,6 +75,39 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("list", help="List all known coding-agent sessions")
     subparsers.add_parser("status", help="One-line summary for scripts")
     subparsers.add_parser("tmux-widget", help="Output for tmux status-right")
+
+    start_p = subparsers.add_parser(
+        "start",
+        help="Start work on a ticket: worktree + tmux window + agent, with the key declared",
+    )
+    start_p.add_argument("ticket", help="Jira key, e.g. DR-8222")
+    start_p.add_argument("--title", default="", help="Short summary; becomes the branch slug")
+    start_p.add_argument(
+        "--provider", default="claude", help="Coding agent to launch (default: claude)"
+    )
+    start_p.add_argument(
+        "--base", default="origin/main", help="Base ref for the new branch (default: origin/main)"
+    )
+    start_p.add_argument("--prompt", default="", help="Opening prompt to hand the agent")
+    start_p.add_argument(
+        "--dry-run", action="store_true", help="Show what would happen; touch nothing"
+    )
+
+    resume_p = subparsers.add_parser(
+        "resume", help="Reopen a finished session in a new tmux window, in its original cwd"
+    )
+    resume_p.add_argument("sid", help="Session id (a unique prefix is enough)")
+
+    log_p = subparsers.add_parser("log", help="Replay logged session and work events")
+    log_p.add_argument("ticket", nargs="?", default=None, help="Only this ticket's events")
+    log_p.add_argument("--session", default=None, help="Only this session's events")
+    log_p.add_argument("--since", default=None, help="Only events newer than e.g. 2h, 45m, 7d")
+    log_p.add_argument("--limit", type=int, default=50, help="Keep the newest N (default: 50)")
+
+    work_p = subparsers.add_parser("work", help="List work items — ticket, PR, CI, Jira status")
+    work_p.add_argument(
+        "--prune", action="store_true", help="Drop records untouched for 30 days and exit"
+    )
 
     kill_p = subparsers.add_parser(
         "kill", help="Kill a session (signals agent_pid, kills tmux window, removes state)"
@@ -187,6 +225,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_refresh_tmux()
     if args.command == "kill":
         return _cmd_kill(args.sid)
+    if args.command == "start":
+        return _cmd_start(
+            args.ticket,
+            title=args.title,
+            provider=args.provider,
+            base=args.base,
+            prompt=args.prompt,
+            dry_run=bool(args.dry_run),
+        )
+    if args.command == "resume":
+        return _cmd_resume(args.sid)
+    if args.command == "log":
+        return _cmd_log(
+            ticket=args.ticket,
+            session=args.session,
+            since=args.since,
+            limit=args.limit,
+        )
+    if args.command == "work":
+        return _cmd_work(prune=bool(args.prune))
     if args.command == "doctor":
         return _cmd_doctor(provider=args.provider)
     if args.command == "tui":
@@ -668,6 +726,38 @@ def _cmd_doctor(*, provider: str = "all") -> int:
             "EPHOR_SUMMARY_API_BASE/MODEL to use a local model",
         )
 
+    # 7. Opt-in integrations. Each of these is off until configured, so "not
+    #    configured" is a normal, healthy state and is reported as such —
+    #    the check exists to show *which* of them this shell can actually
+    #    see, which is the usual reason one of them appears not to work.
+    from ephor import jira_api, notify, permissions, work_items
+
+    if jira_api.is_configured():
+        creds = jira_api.credentials()
+        ok("jira: configured", creds.base_url if creds else "")
+    else:
+        ok(
+            "jira: not configured",
+            "set EPHOR_JIRA_URL / _EMAIL / _TOKEN for ticket status and drift detection",
+        )
+
+    if notify.is_configured():
+        ok("notifications: configured", notify.notify_url())
+    else:
+        ok("notifications: not configured", "set EPHOR_NOTIFY_URL (e.g. an ntfy topic)")
+
+    wait = permissions.hook_wait_sec()
+    if wait:
+        ok(f"permission inbox: live ({wait}s wait)", "a/d answer the prompt on screen")
+    else:
+        ok(
+            "permission inbox: queued only",
+            "set EPHOR_PERMISSION_WAIT_SEC=10 to answer the prompt on screen",
+        )
+
+    recorded = len(work_items.load_all())
+    ok(f"work items: {recorded} recorded", str(work_items.work_dir()))
+
     # Render results.
     icons = {"ok": "[ ok ]", "warn": "[warn]", "fail": "[FAIL]"}
     fails = sum(1 for level, _, _ in checks if level == "fail")
@@ -729,3 +819,172 @@ def _human_age(iso_ts: str) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --- start / resume --------------------------------------------------------
+
+
+def _cmd_start(
+    ticket: str,
+    *,
+    title: str,
+    provider: str,
+    base: str,
+    prompt: str,
+    dry_run: bool,
+) -> int:
+    """Create the worktree, open the window, launch the agent."""
+    from ephor import launcher
+
+    result = launcher.start(
+        ticket,
+        title=title,
+        provider=provider,
+        base=base,
+        prompt=prompt,
+        dry_run=dry_run,
+    )
+    stream = sys.stdout if result.ok else sys.stderr
+    print(f"ephor: {result.message}", file=stream)
+    if result.ok and not dry_run:
+        print(f"  ticket:   {ticket.upper()}", file=stream)
+        print(f"  branch:   {result.branch}", file=stream)
+        print(f"  worktree: {result.worktree}", file=stream)
+    return 0 if result.ok else 1
+
+
+def _resolve_sid(prefix: str) -> AgentState | None:
+    """The one session whose id starts with ``prefix``, or None if ambiguous."""
+    matches = [a for a in StateManager().scan() if a.session_id.startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        print(f"ephor: no session matching {prefix!r}", file=sys.stderr)
+    else:
+        print(
+            f"ephor: {prefix!r} matches {len(matches)} sessions — use a longer prefix",
+            file=sys.stderr,
+        )
+    return None
+
+
+def _cmd_resume(prefix: str) -> int:
+    """Reopen a session in a fresh tmux window."""
+    from ephor import jira, launcher
+
+    agent = _resolve_sid(prefix)
+    if agent is None:
+        return 1
+    match = jira.match_for_agent(agent)
+    result = launcher.resume(
+        agent.session_id,
+        provider=agent.provider or "claude",
+        cwd=agent.cwd,
+        ticket=match.key if match else "",
+    )
+    print(f"ephor: {result.message}", file=sys.stdout if result.ok else sys.stderr)
+    return 0 if result.ok else 1
+
+
+# --- log -------------------------------------------------------------------
+
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def _parse_duration(raw: str | None) -> float | None:
+    """Seconds in a ``45m`` / ``2h`` / ``7d`` string, or None when unparseable."""
+    if not raw:
+        return None
+    text = raw.strip().lower()
+    unit = _DURATION_UNITS.get(text[-1:])
+    if unit is None:
+        return None
+    try:
+        return float(text[:-1]) * unit
+    except ValueError:
+        return None
+
+
+def _cmd_log(*, ticket: str | None, session: str | None, since: str | None, limit: int) -> int:
+    """Replay the event log — what happened, rather than what is true now."""
+    from rich.console import Console
+    from rich.table import Table
+
+    from ephor import eventlog
+
+    if since and _parse_duration(since) is None:
+        print(f"ephor: cannot read {since!r} as a duration (try 2h, 45m, 7d)", file=sys.stderr)
+        return 2
+
+    events = eventlog.read(
+        ticket=ticket,
+        session_id=session,
+        since_sec=_parse_duration(since),
+        limit=max(0, limit),
+    )
+    if not events:
+        print("ephor: no matching events", file=sys.stderr)
+        return 0
+
+    console = Console(highlight=False)
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("when", style="dim", no_wrap=True)
+    table.add_column("ticket", no_wrap=True)
+    table.add_column("session", style="dim", no_wrap=True)
+    table.add_column("event", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+    for event in events:
+        table.add_row(
+            event.at.replace("T", " ").removesuffix("+00:00"),
+            event.ticket or "—",
+            event.session_id[:8] if event.session_id else "—",
+            str(event.kind),
+            event.detail,
+        )
+    console.print(table)
+    return 0
+
+
+# --- work ------------------------------------------------------------------
+
+
+def _cmd_work(*, prune: bool) -> int:
+    """List work items — the ticket-shaped view of what the fleet is doing."""
+    from rich.console import Console
+    from rich.table import Table
+
+    from ephor import work_items
+
+    if prune:
+        removed = work_items.prune()
+        print(f"ephor: pruned {removed} work record(s)")
+        return 0
+
+    items = sorted(work_items.load_all().values(), key=lambda w: w.last_seen, reverse=True)
+    if not items:
+        print("ephor: no work items recorded yet (try `ephor start DR-1234`)", file=sys.stderr)
+        return 0
+
+    live = {a.session_id for a in StateManager().scan() if a.status is not AgentStatus.DEAD}
+    console = Console(highlight=False)
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("ticket", no_wrap=True)
+    table.add_column("branch", overflow="ellipsis", max_width=32)
+    table.add_column("PR", no_wrap=True)
+    table.add_column("jira", no_wrap=True)
+    table.add_column("sessions", no_wrap=True)
+    table.add_column("last seen", style="dim", no_wrap=True)
+    for item in items:
+        active = sum(1 for sid in item.session_ids if sid in live)
+        pr = f"#{item.pr_number} {item.pr_state.lower()}" if item.pr_number else "—"
+        table.add_row(
+            item.key,
+            item.branch or "—",
+            pr,
+            item.jira_status or "—",
+            f"{active} live / {len(item.session_ids)}",
+            item.last_seen.replace("T", " ").removesuffix("+00:00"),
+        )
+    console.print(table)
+    return 0

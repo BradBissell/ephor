@@ -46,6 +46,10 @@ class AgentState:
     last_summary: str = ""  # v2: latest user prompt, truncated to 70 chars
     provider: str = ""  # v3: coding-agent CLI that wrote this file (claude/gemini/codex/grok)
     last_reply: str = ""  # v3: latest assistant reply captured at turn-end (non-Claude summaries)
+    # v4: Jira key declared by the launcher via $EPHOR_TICKET, which the hook
+    # inherits from the agent process. A declaration beats every heuristic in
+    # ephor.jira, so this is what the dashboard prefers when it is set.
+    ticket: str = ""
     schema_version: int = SCHEMA_VERSION
 
     def to_json(self) -> str:
@@ -79,6 +83,8 @@ class AgentState:
         #   v2→v3: `claude_pid` renamed to `agent_pid` and `provider` added.
         #          Read the legacy `claude_pid` key so pre-v3 files (or a
         #          stray old writer) still map their pid correctly.
+        #   v3→v4: `ticket` added; absent in older files, which just fall
+        #          back to the inference chain as they always did.
         agent_pid = data.get("agent_pid")
         if agent_pid is None:
             agent_pid = data.get("claude_pid")
@@ -101,6 +107,7 @@ class AgentState:
             last_summary=data.get("last_summary", ""),
             provider=data.get("provider", ""),
             last_reply=data.get("last_reply", ""),
+            ticket=data.get("ticket", ""),
             schema_version=version,
         )
 

@@ -17,7 +17,9 @@ import pytest
 from ephor.config import hook_handler_path
 
 HANDLER = hook_handler_path()
-SCHEMA_VERSION = 3
+# Stated independently of ephor.config on purpose: the shell handler carries
+# its own copy of the number, and this is what catches the two drifting apart.
+SCHEMA_VERSION = 4
 
 
 @pytest.fixture
@@ -1061,3 +1063,133 @@ def test_grok_subagent_suppression_survives_an_odd_cwd(state_env: dict[str, str]
     _write_grok_prompt_context(state_env, cwd, sid, "subagent")
     _fire_grok_native(state_env, sid, cwd)
     assert not _state_file(state_env, sid).exists()
+
+
+# --- permission inbox: standing decisions and the opt-in wait ---------------
+
+
+def test_standing_decision_is_emitted_and_kept(state_env: dict[str, str]) -> None:
+    """A standing answer survives the request it answered, unlike a one-shot."""
+    sid = "test-standing-1"
+    always = Path(state_env["EPHOR_PENDING_DIR"]) / f"{sid}.always.json"
+    always.parent.mkdir(parents=True, exist_ok=True)
+    always.write_text(json.dumps({"permissionDecision": "allow"}))
+
+    for _ in range(2):
+        result = _fire_hook(
+            {
+                "session_id": sid,
+                "hook_event_name": "PermissionRequest",
+                "cwd": "/tmp/x",
+                "tool_name": "Bash",
+            },
+            state_env,
+        )
+        assert json.loads(result.stdout)["permissionDecision"] == "allow"
+    assert always.exists(), "a standing decision must not be consumed"
+
+
+def test_one_shot_decision_wins_over_a_standing_one(state_env: dict[str, str]) -> None:
+    """A deliberate answer to this request beats the blanket policy."""
+    sid = "test-standing-2"
+    pending_dir = Path(state_env["EPHOR_PENDING_DIR"])
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    (pending_dir / f"{sid}.always.json").write_text(json.dumps({"permissionDecision": "allow"}))
+    (pending_dir / f"{sid}.json").write_text(json.dumps({"permissionDecision": "deny"}))
+
+    result = _fire_hook(
+        {"session_id": sid, "hook_event_name": "PermissionRequest", "cwd": "/tmp/x"},
+        state_env,
+    )
+    assert json.loads(result.stdout)["permissionDecision"] == "deny"
+
+
+def test_no_decision_means_no_output(state_env: dict[str, str]) -> None:
+    """With nothing queued the agent must show its own dialog, unmodified."""
+    result = _fire_hook(
+        {"session_id": "test-nodecision", "hook_event_name": "PermissionRequest", "cwd": "/tmp/x"},
+        state_env,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+
+
+def test_wait_is_off_by_default_and_returns_immediately(state_env: dict[str, str]) -> None:
+    """The latency budget survives: no EPHOR_PERMISSION_WAIT_SEC, no waiting."""
+    started = time.monotonic()
+    _fire_hook(
+        {"session_id": "test-nowait", "hook_event_name": "PermissionRequest", "cwd": "/tmp/x"},
+        state_env,
+    )
+    assert time.monotonic() - started < 1.0
+
+
+def test_wait_window_picks_up_a_decision_written_while_it_waits(
+    state_env: dict[str, str],
+) -> None:
+    """This is what lets the dashboard answer the prompt that is on screen."""
+    import threading
+
+    sid = "test-wait-1"
+    pending_file = Path(state_env["EPHOR_PENDING_DIR"]) / f"{sid}.json"
+    pending_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def answer_late() -> None:
+        time.sleep(0.4)
+        pending_file.write_text(json.dumps({"permissionDecision": "allow"}))
+
+    writer = threading.Thread(target=answer_late)
+    writer.start()
+    try:
+        result = _fire_hook(
+            {"session_id": sid, "hook_event_name": "PermissionRequest", "cwd": "/tmp/x"},
+            {**state_env, "EPHOR_PERMISSION_WAIT_SEC": "5"},
+        )
+    finally:
+        writer.join()
+    assert json.loads(result.stdout)["permissionDecision"] == "allow"
+
+
+def test_wait_window_gives_up_and_falls_through(state_env: dict[str, str]) -> None:
+    """A wait that times out must leave the agent's own dialog intact."""
+    started = time.monotonic()
+    result = _fire_hook(
+        {"session_id": "test-wait-2", "hook_event_name": "PermissionRequest", "cwd": "/tmp/x"},
+        {**state_env, "EPHOR_PERMISSION_WAIT_SEC": "1"},
+    )
+    elapsed = time.monotonic() - started
+    assert result.stdout.strip() == ""
+    assert 0.8 < elapsed < 4.0
+
+
+def test_a_nonsense_wait_value_disables_the_wait(state_env: dict[str, str]) -> None:
+    """A typo in the env var must not hang every permission prompt."""
+    started = time.monotonic()
+    _fire_hook(
+        {"session_id": "test-wait-3", "hook_event_name": "PermissionRequest", "cwd": "/tmp/x"},
+        {**state_env, "EPHOR_PERMISSION_WAIT_SEC": "forever"},
+    )
+    assert time.monotonic() - started < 1.0
+
+
+def test_the_state_file_is_written_before_the_wait_begins(state_env: dict[str, str]) -> None:
+    """The dashboard has to *see* the blocked session in order to answer it."""
+    sid = "test-wait-4"
+    import threading
+
+    seen: list[bool] = []
+
+    def check_midwait() -> None:
+        time.sleep(0.5)
+        seen.append(_state_file({"EPHOR_STATE_DIR": state_env["EPHOR_STATE_DIR"]}, sid).exists())
+
+    watcher = threading.Thread(target=check_midwait)
+    watcher.start()
+    try:
+        _fire_hook(
+            {"session_id": sid, "hook_event_name": "PermissionRequest", "cwd": "/tmp/x"},
+            {**state_env, "EPHOR_PERMISSION_WAIT_SEC": "2"},
+        )
+    finally:
+        watcher.join()
+    assert seen == [True]
