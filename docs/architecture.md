@@ -99,10 +99,12 @@ src/ephor/
 ├── tui/widgets/speech_bar.py  ← bottom bar mirroring the speech engine
 ├── work_items.py              ← per-ticket record: branch, worktree, PR, Jira, sessions
 ├── eventlog.py                ← append-only NDJSON tape of transitions (`ephor log`)
+├── audit.py                   ← session cost/speed joined to outcome (`ephor audit`)
 ├── launcher.py                ← `ephor start` / `ephor resume`: worktree + tmux + $EPHOR_TICKET
 ├── permissions.py             ← writes the decisions the hook handler emits
 ├── jira_api.py                ← opt-in Jira read: status, summary, assignee, drift
-└── notify.py                  ← opt-in push (ntfy/webhook) for sessions needing a human
+└── notify.py                  ← opt-in push (ntfy/webhook); policy engine that decides
+                               what is worth interrupting you for
 ```
 
 ## Work items: the second axis

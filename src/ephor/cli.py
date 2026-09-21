@@ -21,6 +21,10 @@ from ephor.providers import PROVIDER_ORDER
 from ephor.state.manager import StateManager
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from rich.console import Console
+    from rich.table import Table
+
+    from ephor.audit import SessionAudit, Summary
     from ephor.state.models import AgentState
 
 # --provider choices: each supported agent, plus "all" for bulk operations.
@@ -109,6 +113,27 @@ def _build_parser() -> argparse.ArgumentParser:
     log_p.add_argument("--session", default=None, help="Only this session's events")
     log_p.add_argument("--since", default=None, help="Only events newer than e.g. 2h, 45m, 7d")
     log_p.add_argument("--limit", type=int, default=50, help="Keep the newest N (default: 50)")
+
+    audit_p = subparsers.add_parser(
+        "audit", help="Audit sessions — speed, cost, tokens, and whether work shipped"
+    )
+    audit_p.add_argument("ticket", nargs="?", default=None, help="Only this ticket's sessions")
+    audit_p.add_argument("--since", default="30d", help="Only sessions newer than e.g. 7d, 24h")
+    audit_p.add_argument(
+        "--sessions", action="store_true", help="Per-session detail instead of the summary"
+    )
+    audit_p.add_argument("--csv", action="store_true", help="Emit CSV for spreadsheets")
+    audit_p.add_argument(
+        "--save", action="store_true", help="Snapshot these audits so they outlive the transcripts"
+    )
+    audit_p.add_argument(
+        "--compact", action="store_true", help="Collapse the snapshot store to one line per session"
+    )
+    audit_p.add_argument(
+        "--judge",
+        action="store_true",
+        help="Ask a model whether merged work met its ticket (spends money; merged PRs only)",
+    )
 
     work_p = subparsers.add_parser("work", help="List work items — ticket, PR, CI, Jira status")
     work_p.add_argument(
@@ -253,6 +278,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.command == "work":
         return _cmd_work(prune=bool(args.prune))
+    if args.command == "audit":
+        return _cmd_audit(
+            ticket=args.ticket,
+            since=args.since,
+            per_session=bool(args.sessions),
+            as_csv=bool(args.csv),
+            save=bool(args.save),
+            do_compact=bool(args.compact),
+            do_judge=bool(args.judge),
+        )
     if args.command == "doctor":
         return _cmd_doctor(provider=args.provider)
     if args.command == "tui":
@@ -751,6 +786,12 @@ def _cmd_doctor(*, provider: str = "all") -> int:
 
     if notify.is_configured():
         ok("notifications: configured", notify.notify_url())
+        # The destination is the easy half. The reason a notifier gets muted
+        # or ignored is always the policy, so print the policy.
+        for name, value in notify.describe_config():
+            ok(f"  {name}", value)
+        if notify.notify_level() == "off":
+            ok("  (muted)", "EPHOR_NOTIFY_LEVEL=off — nothing will be sent")
     else:
         ok("notifications: not configured", "set EPHOR_NOTIFY_URL (e.g. an ntfy topic)")
 
@@ -965,6 +1006,266 @@ def _cmd_log(*, ticket: str | None, session: str | None, since: str | None, limi
 
 
 # --- work ------------------------------------------------------------------
+
+
+def _fmt_dur(seconds: float | None) -> str:
+    """Compact human duration. Em dash for "we do not know", never "0s"."""
+    if seconds is None:
+        return "—"
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def _fmt_tokens(count: int) -> str:
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.0f}k"
+    return str(count)
+
+
+def _audit_csv(audits: list[SessionAudit]) -> int:
+    """Emit one row per session, for a spreadsheet or a diff between weeks."""
+    import csv
+
+    writer = csv.writer(sys.stdout)
+    writer.writerow(
+        [
+            "session_id",
+            "ticket",
+            "outcome",
+            "pr_number",
+            "pr_state",
+            "equiv_cost_usd",
+            "turns",
+            "output_tokens",
+            "cache_read_tokens",
+            "input_tokens",
+            "cache_write_tokens",
+            "cache_hit_ratio",
+            "active_sec",
+            "wall_clock_sec",
+            "review_rounds",
+            "ci_failures",
+            "time_to_pr_sec",
+            "time_to_merge_sec",
+            "models",
+            "first_at",
+            "last_at",
+        ]
+    )
+    for a in audits:
+        writer.writerow(
+            [
+                a.session_id,
+                a.ticket,
+                a.outcome,
+                a.pr_number or "",
+                a.pr_state,
+                f"{a.equiv_cost_usd:.4f}",
+                a.turns,
+                a.output_tokens,
+                a.cache_read_tokens,
+                a.input_tokens,
+                a.cache_write_tokens,
+                f"{a.cache_hit_ratio:.4f}",
+                f"{a.active_sec:.0f}",
+                f"{a.wall_clock_sec:.0f}",
+                a.review_rounds,
+                a.ci_failures,
+                a.time_to_pr_sec or "",
+                a.time_to_merge_sec or "",
+                " ".join(a.models),
+                a.first_at,
+                a.last_at,
+            ]
+        )
+    return 0
+
+
+_OUTCOME_STYLE = {
+    "shipped_clean": "green",
+    "shipped_rework": "yellow",
+    "open": "cyan",
+    "stalled": "magenta",
+    "closed": "red",
+    "abandoned": "red",
+    "unknown": "dim",
+}
+
+
+def _cmd_audit(
+    *,
+    ticket: str | None,
+    since: str | None,
+    per_session: bool,
+    as_csv: bool,
+    save: bool,
+    do_compact: bool,
+    do_judge: bool,
+) -> int:
+    """Audit session performance — speed, cost, tokens, and what shipped."""
+    from rich.console import Console
+    from rich.table import Table
+
+    from ephor import audit as auditing
+
+    if do_compact:
+        kept = auditing.compact()
+        print(f"ephor: audit store compacted to {kept} record(s)")
+        return 0
+
+    since_sec = _parse_duration(since) if since else None
+    if since and since_sec is None:
+        print(f"ephor: cannot read {since!r} as a duration (try 24h, 7d)", file=sys.stderr)
+        return 2
+
+    audits = auditing.collect(since_sec=since_sec, ticket=ticket)
+    if not audits:
+        print("ephor: no auditable sessions found", file=sys.stderr)
+        return 0
+
+    if do_judge:
+        audits = _run_judge(audits)
+
+    if save:
+        written = auditing.record_all(audits)
+        print(f"ephor: snapshotted {written} audit record(s)", file=sys.stderr)
+
+    if as_csv:
+        return _audit_csv(audits)
+
+    console = Console(highlight=False)
+    if per_session or ticket:
+        _print_session_table(console, Table, audits)
+    _print_audit_summary(console, Table, auditing.summarize(audits), scope=ticket)
+    return 0
+
+
+def _run_judge(audits: list[SessionAudit]) -> list[SessionAudit]:
+    """Judge the merged work only, and say plainly that it costs money."""
+    from dataclasses import replace as _replace
+
+    from ephor import audit as auditing
+
+    targets = [a for a in audits if a.shipped]
+    if not targets:
+        print("ephor: nothing merged in range — skipping judge", file=sys.stderr)
+        return audits
+    print(f"ephor: judging {len(targets)} merged PR(s) — this spends money", file=sys.stderr)
+    judged: dict[str, SessionAudit] = {}
+    for item in targets:
+        verdict = auditing.judge(item)
+        judged[item.session_id] = _replace(
+            item,
+            judged_met=verdict.met if verdict.ok else None,
+            judged_note=verdict.note,
+        )
+    return [judged.get(a.session_id, a) for a in audits]
+
+
+def _print_session_table(
+    console: Console, table_cls: type[Table], audits: list[SessionAudit]
+) -> None:
+    table = table_cls(show_header=True, header_style="bold", box=None, pad_edge=False)
+    # Short headers on purpose: eleven columns have to survive an 80-column
+    # terminal, and a truncated header ("acti…") is worse than a terse one.
+    for column in ("session", "ticket", "outcome", "PR", "cost", "turns", "out", "hit", "act"):
+        table.add_column(column, no_wrap=True)
+    table.add_column("→PR", no_wrap=True)
+    table.add_column("→merge", no_wrap=True)
+    for a in audits:
+        style = _OUTCOME_STYLE.get(a.outcome, "")
+        verdict = ""
+        if a.judged_met is True:
+            verdict = " ✓"
+        elif a.judged_met is False:
+            verdict = " ✗"
+        table.add_row(
+            a.session_id[:8],
+            a.ticket or "—",
+            f"[{style}]{a.outcome}[/{style}]{verdict}" if style else a.outcome + verdict,
+            f"#{a.pr_number}" if a.pr_number else "—",
+            f"${a.equiv_cost_usd:,.2f}",
+            str(a.turns),
+            _fmt_tokens(a.output_tokens),
+            f"{a.cache_hit_ratio * 100:.0f}%",
+            _fmt_dur(a.active_sec),
+            _fmt_dur(a.time_to_pr_sec),
+            _fmt_dur(a.time_to_merge_sec),
+        )
+    console.print(table)
+    notes = [a for a in audits if a.judged_note]
+    if notes:
+        console.print()
+        for a in notes:
+            console.print(f"  [dim]{a.session_id[:8]}[/dim] {a.judged_note}")
+    console.print()
+
+
+def _print_audit_summary(
+    console: Console, table_cls: type[Table], summary: Summary, *, scope: str | None
+) -> None:
+    label = scope.upper() if scope else "fleet"
+    table = table_cls(show_header=False, box=None, pad_edge=False)
+    table.add_column("k", style="dim", no_wrap=True)
+    table.add_column("v", overflow="fold")
+
+    per_pr = summary.cost_per_merged_pr
+    fleet_per_pr = summary.fleet_cost_per_merged_pr
+    attributed = summary.sessions - summary.unknown
+    table.add_row(
+        "sessions",
+        f"{summary.sessions} · {attributed} on {summary.tickets} ticket(s), "
+        f"{summary.unknown} unattributed",
+    )
+    table.add_row("equiv API cost", f"${summary.equiv_cost_usd:,.2f}  [dim](not a bill)[/dim]")
+    table.add_row(
+        "cost per merged PR",
+        f"[bold]${per_pr:,.2f}[/bold] [dim]of work that shipped[/dim]"
+        if per_pr is not None
+        else "— [dim]nothing merged in range[/dim]",
+    )
+    table.add_row(
+        "fleet burn per PR",
+        f"${fleet_per_pr:,.2f} [dim]all spend ÷ merged; includes work still in flight[/dim]"
+        if fleet_per_pr is not None
+        else "—",
+    )
+    table.add_row(
+        "rework rate",
+        f"{summary.rework_rate * 100:.0f}%" if summary.rework_rate is not None else "—",
+    )
+    table.add_row(
+        "active / wall", f"{_fmt_dur(summary.active_sec)} of {_fmt_dur(summary.wall_clock_sec)}"
+    )
+    table.add_row(
+        "tokens",
+        f"out {_fmt_tokens(summary.output_tokens)} · "
+        f"cache-read {_fmt_tokens(summary.cache_read_tokens)} · "
+        f"in {_fmt_tokens(summary.input_tokens)} · "
+        f"cache-write {_fmt_tokens(summary.cache_write_tokens)}",
+    )
+    table.add_row("cache hit", f"{summary.cache_hit_ratio * 100:.1f}%")
+    table.add_row(
+        "outcomes",
+        f"[green]{summary.shipped_clean} clean[/green] · "
+        f"[yellow]{summary.shipped_rework} rework[/yellow] · "
+        f"[cyan]{summary.open_} open[/cyan] · "
+        f"[magenta]{summary.stalled} stalled[/magenta] · "
+        f"[red]{summary.closed} closed · {summary.abandoned} abandoned[/red] · "
+        f"[dim]{summary.unknown} unattributed[/dim]",
+    )
+    console.print(f"[bold]{label}[/bold]")
+    console.print(table)
+    if summary.unpriced_models:
+        console.print(
+            f"[yellow]note[/yellow] tokens counted but not priced for: "
+            f"{', '.join(summary.unpriced_models)}"
+        )
 
 
 def _cmd_work(*, prune: bool) -> int:
