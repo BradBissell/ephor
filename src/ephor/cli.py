@@ -89,6 +89,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--base", default="origin/main", help="Base ref for the new branch (default: origin/main)"
     )
     start_p.add_argument("--prompt", default="", help="Opening prompt to hand the agent")
+    start_p.add_argument("--name", default="", help="tmux window name (default: the ticket key)")
+    start_p.add_argument(
+        "--no-agent",
+        action="store_true",
+        help="Open the window on a plain shell instead of launching the agent",
+    )
     start_p.add_argument(
         "--dry-run", action="store_true", help="Show what would happen; touch nothing"
     )
@@ -232,6 +238,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             provider=args.provider,
             base=args.base,
             prompt=args.prompt,
+            window_name=args.name,
+            launch_agent=not args.no_agent,
             dry_run=bool(args.dry_run),
         )
     if args.command == "resume":
@@ -831,9 +839,16 @@ def _cmd_start(
     provider: str,
     base: str,
     prompt: str,
+    window_name: str = "",
+    launch_agent: bool = True,
     dry_run: bool,
 ) -> int:
-    """Create the worktree, open the window, launch the agent."""
+    """Create the worktree, open the window, launch the agent.
+
+    The fields are printed one per line and machine-readably (``key: value``)
+    because the callers that matter are scripts and skills, which need the
+    window id to rename it and the worktree path to cd into.
+    """
     from ephor import launcher
 
     result = launcher.start(
@@ -842,6 +857,8 @@ def _cmd_start(
         provider=provider,
         base=base,
         prompt=prompt,
+        window_name=window_name,
+        launch_agent=launch_agent,
         dry_run=dry_run,
     )
     stream = sys.stdout if result.ok else sys.stderr
@@ -850,6 +867,7 @@ def _cmd_start(
         print(f"  ticket:   {ticket.upper()}", file=stream)
         print(f"  branch:   {result.branch}", file=stream)
         print(f"  worktree: {result.worktree}", file=stream)
+        print(f"  window:   {result.window}", file=stream)
     return 0 if result.ok else 1
 
 

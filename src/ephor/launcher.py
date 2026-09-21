@@ -23,6 +23,7 @@ everything else.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shlex
@@ -102,6 +103,45 @@ def repo_root(cwd: str | Path | None = None) -> Path | None:
     return Path(root) if root else None
 
 
+def fetch_base(root: Path, base: str) -> bool:
+    """Fetch the remote tip ``base`` names, so branching off it is not stale.
+
+    This is the difference between a PR whose diff is the ticket and a PR
+    whose diff is the ticket plus three weeks of other people's commits.
+    ``origin/main`` in a checkout that has not fetched today points at
+    whatever main was the last time it did, and ``git worktree add`` will
+    branch off that quite happily.
+
+    A local ref (``HEAD``, a branch name, a sha) has nothing to fetch and is
+    not an error. Neither is an offline fetch — the caller verifies where the
+    branch actually landed, which is the check that matters.
+    """
+    remote, _, ref = base.partition("/")
+    if not ref or remote not in _remotes(root):
+        return False
+    _run(["/usr/bin/env", "git", "-C", str(root), "fetch", remote, ref])
+    return True
+
+
+def _remotes(root: Path) -> set[str]:
+    code, out, _ = _run(["/usr/bin/env", "git", "-C", str(root), "remote"])
+    if code != 0:
+        return set()
+    return {line.strip() for line in out.splitlines() if line.strip()}
+
+
+def _rev(root: Path, ref: str) -> str:
+    code, out, _ = _run(["/usr/bin/env", "git", "-C", str(root), "rev-parse", ref])
+    return out.strip() if code == 0 else ""
+
+
+def branch_exists(root: Path, branch: str) -> bool:
+    code, _, _ = _run(
+        ["/usr/bin/env", "git", "-C", str(root), "rev-parse", "--verify", f"refs/heads/{branch}"]
+    )
+    return code == 0
+
+
 def ensure_worktree(
     root: Path, ticket: str, *, title: str = "", base: str = "origin/main"
 ) -> tuple[Path | None, str]:
@@ -110,40 +150,110 @@ def ensure_worktree(
     Reuse is the common case on a second ``ephor start`` for the same ticket —
     a resumed chunk of work belongs in the tree that already holds its commits,
     not in a fresh one branched off today's trunk.
+
+    Three things happen in a deliberate order, and each one exists because
+    skipping it produces a PR nobody wants to review:
+
+    1. **Fetch the base** before branching, so ``origin/main`` means today's
+       main rather than the last time this checkout synced.
+    2. **Never reset an existing branch.** An abandoned branch from a previous
+       attempt may hold commits that were never pushed; adopting it is
+       recoverable, resetting it onto the base is not.
+    3. **Verify where the branch landed.** If HEAD is not the base, say so and
+       refuse, rather than handing back a worktree rooted somewhere else.
     """
     target = worktree_path(root, ticket)
     if target.is_dir():
         return target, f"reusing existing worktree {target}"
+
     branch = branch_name(ticket, title)
-    # `-B` so an abandoned branch from a previous attempt is reset onto the
-    # base rather than failing the command; the worktree itself is new, so
-    # there is no uncommitted work to lose.
+    fetched = fetch_base(root, base)
+    base_sha = _rev(root, base)
+    if not base_sha:
+        return None, f"base ref {base!r} does not resolve — is it fetched, and spelled right?"
+
+    if branch_exists(root, branch):
+        # Adopt it. The branch may carry unpushed commits from an earlier
+        # attempt, and `-B` would silently throw them away.
+        code, _, err = _run(
+            ["/usr/bin/env", "git", "-C", str(root), "worktree", "add", str(target), branch]
+        )
+        if code != 0:
+            return None, f"git worktree add failed: {err or 'unknown error'}"
+        return target, f"created worktree {target} on the existing branch {branch}"
+
     code, _, err = _run(
-        ["/usr/bin/env", "git", "-C", str(root), "worktree", "add", "-B", branch, str(target), base]
+        [
+            "/usr/bin/env",
+            "git",
+            "-C",
+            str(root),
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(target),
+            base,
+        ]
     )
     if code != 0:
         return None, f"git worktree add failed: {err or 'unknown error'}"
-    return target, f"created worktree {target} on {branch}"
+
+    head = _rev(target, "HEAD")
+    if head and head != base_sha:
+        return None, (
+            f"worktree {target} is on {head[:8]}, not {base} ({base_sha[:8]}) — "
+            "refusing a branch rooted on the wrong base"
+        )
+    note = "" if fetched else " (local base, nothing to fetch)"
+    return target, f"created worktree {target} on {branch} @ {base_sha[:8]}{note}"
+
+
+def env_link_paths() -> tuple[str, ...]:
+    """Extra repo-relative paths to symlink into a new worktree.
+
+    The top-level ``.env*`` glob covers a single-package repo and nothing
+    else. A monorepo keeps its environment files next to the applications
+    that read them — ``applications/api/.env``, ``applications/ui/.env`` —
+    and a worktree missing those fails on the agent's first test run, which
+    is a slow and confusing way to find out.
+
+    ``$EPHOR_ENV_LINKS`` is a comma-separated list of those paths.
+    """
+    raw = os.environ.get("EPHOR_ENV_LINKS") or ""
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def link_env_files(root: Path, target: Path) -> int:
-    """Symlink the repo's top-level ``.env*`` files into a new worktree.
+    """Symlink the repo's environment files into a new worktree.
 
     A fresh worktree has no untracked files, which means no ``.env`` — and an
-    agent whose first action is to run the test suite discovers that the
-    slow way. Symlinks rather than copies so a later edit to the real file is
+    agent whose first action is to run the test suite discovers that the slow
+    way. Symlinks rather than copies so a later edit to the real file is
     picked up by every worktree at once.
+
+    Covers the top-level ``.env*`` glob plus whatever :func:`env_link_paths`
+    names. Returns how many links were made; already-present destinations are
+    left alone, so a second call adds nothing.
     """
+    sources: list[tuple[Path, Path]] = []
+    with contextlib.suppress(OSError):
+        sources.extend((p, target / p.name) for p in root.glob(".env*") if p.is_file())
+    for relative in env_link_paths():
+        # A path that climbs out of the repo is a configuration mistake, not
+        # an instruction to link something outside it.
+        if relative.startswith("/") or ".." in Path(relative).parts:
+            continue
+        source = root / relative
+        if source.is_file():
+            sources.append((source, target / relative))
+
     linked = 0
-    try:
-        candidates = [p for p in root.glob(".env*") if p.is_file()]
-    except OSError:
-        return 0
-    for source in candidates:
-        destination = target / source.name
+    for source, destination in sources:
         if destination.exists() or destination.is_symlink():
             continue
         try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
             destination.symlink_to(source)
         except OSError:
             continue
@@ -189,9 +299,16 @@ def start(
     base: str = "origin/main",
     cwd: str | Path | None = None,
     prompt: str = "",
+    window_name: str = "",
+    launch_agent: bool = True,
     dry_run: bool = False,
 ) -> StartResult:
-    """Create the worktree, open the window, launch the agent, record the work."""
+    """Create the worktree, open the window, launch the agent, record the work.
+
+    ``launch_agent=False`` opens the window on a plain shell instead. That is
+    what an operator wants when they are going to drive the work themselves
+    in this pane and just need somewhere to run a dev server and tail logs.
+    """
     ticket = normalize_ticket(ticket_raw)
     if ticket is None:
         return StartResult(False, f"{ticket_raw!r} is not a ticket key (expected e.g. DR-8222)")
@@ -209,9 +326,10 @@ def start(
 
     if dry_run:
         target = worktree_path(root, ticket)
+        what = agent.binary if launch_agent else "a shell"
         return StartResult(
             True,
-            f"would create {target} on {branch_name(ticket, title)} and run {agent.binary}",
+            f"would create {target} on {branch_name(ticket, title)} and run {what}",
             worktree=str(target),
             branch=branch_name(ticket, title),
         )
@@ -221,12 +339,17 @@ def start(
         return StartResult(False, message)
     link_env_files(root, target)
 
-    command = agent.binary
-    if prompt:
-        command = f"{agent.binary} {shlex.quote(prompt)}"
-    window, window_message = open_window(
-        ticket, target, command, {"EPHOR_TICKET": ticket, "EPHOR_PROVIDER": agent.name}
-    )
+    if launch_agent:
+        command = agent.binary
+        if prompt:
+            command = f"{agent.binary} {shlex.quote(prompt)}"
+        env = {"EPHOR_TICKET": ticket, "EPHOR_PROVIDER": agent.name}
+    else:
+        # A login shell, so the operator lands in their normal environment
+        # with EPHOR_TICKET already exported for whatever they start by hand.
+        command = os.environ.get("SHELL") or "/bin/sh"
+        env = {"EPHOR_TICKET": ticket}
+    window, window_message = open_window(window_name or ticket, target, command, env)
     if window is None:
         return StartResult(False, window_message, worktree=str(target))
 

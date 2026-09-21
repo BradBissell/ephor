@@ -250,11 +250,18 @@ red CI. Once, not continuously: a session blocked for forty minutes is one
 event. Unset, nothing is sent.
 
 3. **`ephor start DR-8222 --title "add retry"`** — the other direction:
-   ephor creates the worktree, opens a tmux window named for the ticket,
-   symlinks the repo's `.env*` files in, and launches the agent with
-   `EPHOR_TICKET` already set. Nothing is inferred, because nothing has to
-   be. `ephor resume <sid>` reopens a finished session in its original
-   directory.
+   ephor fetches the base ref, creates the worktree off it (verifying it
+   landed there), symlinks the environment files in, opens a tmux window
+   named for the ticket, and launches the agent with `EPHOR_TICKET` already
+   set. Nothing is inferred, because nothing has to be.
+
+   `--no-agent` leaves the window on a plain shell, `--name` overrides the
+   window label, `--prompt` hands the agent an opening instruction, and
+   `--base` picks a different starting ref. An existing branch is *adopted*,
+   never reset — an abandoned attempt may hold commits that were never
+   pushed. `EPHOR_ENV_LINKS=applications/api/.env,applications/ui/.env`
+   covers a monorepo that keeps its env files next to the apps that read
+   them. `ephor resume <sid>` reopens a finished session in place.
 4. **`ephor work`** — the ticket-shaped view: one row per piece of work,
    with its branch, its PR, its Jira status and how many of its sessions
    are still alive. Survives every one of those sessions dying.
