@@ -7,7 +7,7 @@ from ephor.github import PullRequest
 from ephor.state.models import AgentState
 from ephor.tui.widgets.session_row import (
     RowContext,
-    render_subline,
+    render_detail,
     render_work_cell,
 )
 
@@ -56,48 +56,51 @@ def test_drift_adds_a_marker() -> None:
     assert "~" in render_work_cell(pr, drift="PR merged, ticket still In Progress")
 
 
-def test_subline_shows_the_prompt_by_default() -> None:
-    line = render_subline(_agent(last_summary="implement the retry"), RowContext())
+def test_detail_shows_the_prompt_by_default() -> None:
+    line = render_detail(_agent(last_summary="implement the retry"), RowContext(), 60)
     assert "implement the retry" in line
-    assert "↳" in line
 
 
 def test_a_collision_displaces_the_prompt() -> None:
     """News beats context you already have — you typed the prompt."""
-    line = render_subline(
-        _agent(last_summary="implement the retry"), RowContext(collisions=("s2", "s3"))
+    line = render_detail(
+        _agent(last_summary="implement the retry"), RowContext(collisions=("s2", "s3")), 60
     )
-    assert "shares its worktree with 2 other sessions" in line
+    assert "shares worktree with 2 others" in line
     assert "implement the retry" not in line
 
 
-def test_warning_precedence_is_collision_then_drift_then_ci() -> None:
+def test_warning_precedence_is_collision_then_ci_then_drift() -> None:
     agent = _agent(last_summary="p")
     both = RowContext(collisions=("s2",), drift="d", failing_checks=("ci",))
-    assert "shares its worktree" in render_subline(agent, both)
-    assert "d" in render_subline(agent, RowContext(drift="d", failing_checks=("ci",)))
-    assert "CI failing" in render_subline(agent, RowContext(failing_checks=("ci",)))
+    assert "shares worktree" in render_detail(agent, both, 60)
+    # CI now outranks drift: a red check means the thing you think is done
+    # is not, whereas drift is a bookkeeping mismatch.
+    assert "CI failing" in render_detail(agent, RowContext(drift="d", failing_checks=("ci",)), 60)
+    assert "d" in render_detail(agent, RowContext(drift="d"), 60)
 
 
 def test_failing_check_names_are_listed_and_capped() -> None:
     """Three names is enough to act on; the rest would just wrap off-screen."""
-    line = render_subline(_agent(), RowContext(failing_checks=("unit", "lint", "e2e", "typecheck")))
+    line = render_detail(
+        _agent(), RowContext(failing_checks=("unit", "lint", "e2e", "typecheck")), 60
+    )
     assert "unit, lint, e2e" in line
     assert "typecheck" not in line
 
 
 def test_jira_status_tags_the_prompt() -> None:
-    line = render_subline(_agent(last_summary="p"), RowContext(jira_status="In Review"))
+    line = render_detail(_agent(last_summary="p"), RowContext(jira_status="In Review"), 60)
     assert "«In Review»" in line
 
 
 def test_jira_title_fills_in_when_there_is_no_prompt() -> None:
-    line = render_subline(_agent(), RowContext(jira_title="Add retry to upload client"))
+    line = render_detail(_agent(), RowContext(jira_title="Add retry to upload client"), 60)
     assert "Add retry to upload client" in line
 
 
 def test_a_queued_decision_is_announced() -> None:
-    line = render_subline(_agent(), RowContext(decision_queued="allow"))
+    line = render_detail(_agent(), RowContext(decision_queued="allow"), 60)
     assert "allow queued" in line
 
 
@@ -119,3 +122,22 @@ def test_rendering_without_a_context_still_works() -> None:
     row = SessionRow()
     row.update_agent(_agent(project_name="ephor", last_summary="doing a thing"))
     assert "doing a thing" in str(row.render())
+
+
+def test_work_cell_is_exactly_its_column_width() -> None:
+    """One column of overflow here pushes every row past the pane edge."""
+    import re as _re
+
+    from ephor.tui.widgets.session_row import _WORK_W
+
+    def visible(markup: str) -> str:
+        return _re.sub(r"\[[^\]]*\]", "", markup)
+
+    cases = [
+        render_work_cell(None),
+        render_work_cell(PullRequest(number=7, url="u", state="OPEN")),
+        render_work_cell(PullRequest(number=1026, url="u", state="OPEN")),
+        render_work_cell(PullRequest(number=99999, url="u", state="MERGED")),
+        render_work_cell(PullRequest(number=1026, url="u", state="OPEN"), drift="d"),
+    ]
+    assert {len(visible(cell)) for cell in cases} == {_WORK_W}
