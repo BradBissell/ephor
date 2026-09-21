@@ -46,6 +46,11 @@ integrations described under **Network egress**. For full transparency:
   `0600`). One line per state transition: session id, ticket, and a short
   label such as `IDLE → WORKING` or `#143: PASSING → FAILING`. No prompts,
   no transcript content. Rotated at 8 MiB, one generation kept.
+- **Write** audit snapshots at `$XDG_STATE_HOME/ephor/audit.ndjson` (mode
+  `0600`, parent dir `0700`). One line per audited session: token counts by
+  class, equivalent-cost figures, timings, tool *names* and call counts, the
+  PR number and outcome. No prompts, no tool arguments, no transcript
+  content. Append-only; `ephor audit --compact` collapses it.
 - **Write** permission decisions at
   `$XDG_STATE_HOME/ephor/pending/<session>.json` (mode `0600`). Contains an
   allow/deny verdict and a fixed reason string — never tool arguments.
@@ -73,17 +78,22 @@ If any of the above surprises you, that's a doc bug — please report it.
 
 ## Network Egress
 
-Three requests can leave your machine, and two of them do not exist until
-you configure them:
+Five requests can leave your machine. Three of them do not exist until you
+configure them or ask for them:
 
 | When | Where | What is sent |
 |---|---|---|
 | Always (Claude accounts) | `https://api.anthropic.com/api/oauth/usage` | your Claude Code OAuth token |
+| Whenever a PR is resolved | GitHub, via the `gh` CLI | a branch name or ticket key, under **your** existing `gh` auth |
 | Only if `EPHOR_JIRA_*` is set | the Jira site **you** name | HTTP Basic auth (your email + API token), and a ticket key in the path |
-| Only if `EPHOR_NOTIFY_URL` is set | the URL **you** name | a session's ticket/project name and why it needs you |
+| Only if `EPHOR_NOTIFY_URL` is set | the URL **you** name | a session's ticket/project name and why it needs you (and a PR URL, when the reason came from one) |
+| Only on `ephor audit --judge` | GitHub (`gh`), then Anthropic (`claude -p`) | a merged PR's title, description and changed **file names** |
 
 No prompt text, no assistant replies and no transcript content are sent to
 any of them.
+
+`ephor audit` **without** `--judge` makes no network request: it reads
+transcripts, work records and the event log off local disk.
 
 Two guards are worth naming:
 
@@ -92,7 +102,16 @@ Two guards are worth naming:
 - The notifier sends a ticket key and a project name — not a summary, and
   never the conversation. If your ticket keys or repository names are
   themselves sensitive, leave `EPHOR_NOTIFY_URL` unset; a public ntfy topic
-  is readable by anyone who guesses its name.
+  is readable by anyone who guesses its name. Its dedupe ledger
+  (`notify.json`, beside the session state) records session ids and reason
+  names so a dashboard restart does not re-announce a board you have already
+  seen; it holds no ticket text and is written `0600`.
+- `ephor audit --judge` is the only part of auditing that sends anything
+  anywhere, it runs **only** when you pass that flag, and it grades merged
+  PRs only. It is deliberately never shown the transcript — the agent's own
+  account of what it did is the least trustworthy evidence for the question
+  being asked — and never the patch, only the list of changed file names. If
+  a PR description or a filename is sensitive, do not pass `--judge`.
 
 ### `EPHOR_PERMISSION_WAIT_SEC`
 

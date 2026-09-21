@@ -22,7 +22,7 @@ from ephor.tui.widgets.header_bar import format_header
 from ephor.tui.widgets.session_row import (
     _SPARK_GLYPHS,
     _SPARK_WIDTH,
-    _TICKET_COL_WIDTH,
+    _TICKET_W,
     render_sparkline,
     render_ticket_cell,
 )
@@ -395,7 +395,7 @@ def test_ticket_cell_pads_to_a_stable_width() -> None:
         len(visible(render_ticket_cell("DR-1", "sid-1", pr))),
         len(visible(render_ticket_cell("—", "sid-1"))),
     }
-    assert widths == {_TICKET_COL_WIDTH}
+    assert widths == {_TICKET_W}
 
 
 def test_ticket_cell_markup_parses_into_a_click_span() -> None:
@@ -418,3 +418,93 @@ def test_ticket_cell_markup_parses_into_a_click_span() -> None:
     assert span.style == "@click=app.open_pr('sid-1')"
     # The hit area is the key itself, not the alignment padding.
     assert content.plain[span.start : span.end] == "DR-8222"
+
+
+# ---- responsive row layout ------------------------------------------------
+
+
+def _visible(markup: str) -> str:
+    """Strip Textual markup so a rendered row can be measured in columns."""
+    import re as _re
+
+    return _re.sub(r"\[[^\]]*\]", "", markup)
+
+
+def test_layout_fills_every_width_exactly() -> None:
+    """A row that under-fills leaves a ragged edge; one that over-fills wraps."""
+    from ephor.tui.widgets.session_row import MIN_WIDTH, plan_row
+
+    for width in range(MIN_WIDTH, 220):
+        assert plan_row(width).visible_width == width, f"ragged at {width}"
+
+
+def test_layout_clamps_below_the_floor_rather_than_going_negative() -> None:
+    from ephor.tui.widgets.session_row import MIN_WIDTH, plan_row
+
+    layout = plan_row(10)
+    assert layout.visible_width == MIN_WIDTH
+    assert layout.project > 0
+    assert layout.detail > 0
+
+
+def test_half_a_27_inch_screen_keeps_the_cells_that_matter() -> None:
+    """80 columns is the tight case: identity and outcome must survive."""
+    from ephor.tui.widgets.session_row import plan_row
+
+    layout = plan_row(80)
+    assert layout.project >= 12  # which session is this
+    assert layout.detail >= 14  # what is it doing / what is wrong
+    assert layout.ticket > 0 and layout.work > 0  # is it finished
+    assert layout.visible_width == 80
+
+
+def test_decoration_is_dropped_before_substance_as_width_shrinks() -> None:
+    """The sparkline goes before the detail text does. That ordering is the design."""
+    from ephor.tui.widgets.session_row import plan_row
+
+    wide, narrow = plan_row(160), plan_row(72)
+    assert wide.spark > 0 and narrow.spark == 0
+    assert narrow.ticket == wide.ticket
+    assert narrow.work == wide.work
+
+
+def test_detail_absorbs_surplus_so_wide_panes_are_not_wasted() -> None:
+    from ephor.tui.widgets.session_row import plan_row
+
+    assert plan_row(200).detail > plan_row(120).detail
+
+
+def test_session_row_renders_exactly_one_line(tmp_path: Path) -> None:
+    """The card was two lines; a fleet of twenty made forty lines of mush."""
+    from ephor.tui.widgets.session_row import SessionRow
+
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(tmp_path))
+    agent.last_summary = "implement the retry"
+    row.update_agent(agent, summary="doing things")
+    assert "\n" not in str(row.render())
+
+
+def test_rendered_row_never_exceeds_its_planned_width(tmp_path: Path) -> None:
+    """Padding is applied against visible width; markup tags are zero-width."""
+    from ephor.tui.widgets.session_row import DEFAULT_WIDTH, SessionRow
+
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(tmp_path))
+    agent.project_name = "a-very-long-project-name-that-would-overflow"
+    agent.last_summary = "x" * 400
+    row.update_agent(agent, summary="y" * 400)
+    assert len(_visible(str(row.render()))) == DEFAULT_WIDTH
+
+
+def test_a_collision_still_reaches_the_single_line(tmp_path: Path) -> None:
+    """Losing the subline must not lose the warning that justified it."""
+    from ephor.tui.widgets.session_row import RowContext, SessionRow
+
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(tmp_path))
+    agent.last_summary = "implement the retry"
+    row.update_agent(agent, context=RowContext(collisions=("s2", "s3")))
+    rendered = _visible(str(row.render()))
+    assert "shares worktree with 2 others" in rendered
+    assert "implement the retry" not in rendered

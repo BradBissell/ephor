@@ -244,26 +244,77 @@ what you meant, and a locked-out agent is a worse failure than a warned one.
 
 Speak-back solves "which of these ten finished" when you are at the machine.
 `EPHOR_NOTIFY_URL` solves it when you are not: point it at an
-[ntfy](https://ntfy.sh) topic (or any webhook) and ephor pushes once when a
-session starts needing you — blocked on permission, erroring, or sitting on
-red CI. Once, not continuously: a session blocked for forty minutes is one
-event. Unset, nothing is sent.
+[ntfy](https://ntfy.sh) topic (or any webhook) and ephor pushes when a
+session needs you. Unset, nothing is sent.
+
+The interesting part is everything it *doesn't* send. A notifier only fails
+by becoming noise, and the dashboard observes twice a second, so the default
+policy is deliberately narrow:
+
+- **Only blocked agents.** By default a push means *an agent has stopped and
+  cannot continue* — waiting on permission, waiting on an answer, errored.
+  Red CI and a stale review request are states of the work, not
+  interruptions; they show on the board and stay off your phone until you
+  ask for them with `EPHOR_NOTIFY_LEVEL=all`.
+- **Only if it lasted.** A condition must persist 45s before it is worth a
+  push, so anything you were present for and answered never leaves the
+  machine.
+- **Flapping is one event.** An agent that asks five permissions in a minute
+  is one notification, not five: a cleared condition is remembered for five
+  minutes rather than forgotten the instant it clears.
+- **One session, one push.** At most one notification per session per ten
+  minutes whatever the reason, re-nudged after 30 minutes if it is still
+  stuck.
+- **A busy board is one message.** Three or more sessions coming due
+  together collapse into a single "4 sessions need you" digest.
+- **Quiet hours.** `EPHOR_NOTIFY_QUIET=22:00-07:00` holds everything but a
+  live permission prompt until morning — held, not dropped.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `EPHOR_NOTIFY_URL` | *(unset)* | Destination. Nothing is sent without it. |
+| `EPHOR_NOTIFY_TOKEN` | *(unset)* | Optional bearer token. |
+| `EPHOR_NOTIFY_LEVEL` | `blocked` | `off`, `blocked`, or `all`. |
+| `EPHOR_NOTIFY_REASONS` | *(unset)* | Explicit list, overrides the level — e.g. `WAITING_PERMISSION,CI_FAILED`. |
+| `EPHOR_NOTIFY_DWELL_SEC` | `45` | How long a condition must last first. |
+| `EPHOR_NOTIFY_SETTLE_SEC` | `300` | How long a cleared condition is remembered. |
+| `EPHOR_NOTIFY_COOLDOWN_SEC` | `600` | Floor between two pushes for one session. |
+| `EPHOR_NOTIFY_REARM_SEC` | `1800` | Re-nudge interval for a still-stuck session. |
+| `EPHOR_NOTIFY_BATCH_THRESHOLD` | `3` | Sessions due at once before digesting. |
+| `EPHOR_NOTIFY_QUIET` | *(unset)* | `HH:MM-HH:MM`, wraps past midnight. |
+| `EPHOR_NOTIFY_QUIET_STRICT` | `0` | `1` silences permission prompts too. |
+
+`ephor doctor` prints the policy in force, which is usually the answer when
+notifications seem too loud or too quiet.
 
 3. **`ephor start DR-8222 --title "add retry"`** — the other direction:
-   ephor creates the worktree, opens a tmux window named for the ticket,
-   symlinks the repo's `.env*` files in, and launches the agent with
-   `EPHOR_TICKET` already set. Nothing is inferred, because nothing has to
-   be. `ephor resume <sid>` reopens a finished session in its original
-   directory.
+   ephor fetches the base ref, creates the worktree off it (verifying it
+   landed there), symlinks the environment files in, opens a tmux window
+   named for the ticket, and launches the agent with `EPHOR_TICKET` already
+   set. Nothing is inferred, because nothing has to be.
+
+   `--no-agent` leaves the window on a plain shell, `--name` overrides the
+   window label, `--prompt` hands the agent an opening instruction, and
+   `--base` picks a different starting ref. An existing branch is *adopted*,
+   never reset — an abandoned attempt may hold commits that were never
+   pushed. `EPHOR_ENV_LINKS=applications/api/.env,applications/ui/.env`
+   covers a monorepo that keeps its env files next to the apps that read
+   them. `ephor resume <sid>` reopens a finished session in place.
 4. **`ephor work`** — the ticket-shaped view: one row per piece of work,
    with its branch, its PR, its Jira status and how many of its sessions
    are still alive. Survives every one of those sessions dying.
 5. **`ephor log [DR-8222]`** — what *happened*, as opposed to what is true
    now. Status transitions, PR links, CI flips, permission answers.
    `--since 2h` for the overnight recap.
-6. **`ephor list`** — script-friendly one-line-per-session status, for
+6. **`ephor audit`** — was any of it worth it? Joins each session's
+   transcript (tokens, equivalent cost, active time) to its outcome (PR
+   merged, CI failures, review rounds). Headline is **cost per merged PR**,
+   not cost per session. `--sessions` for per-session detail, `--csv` to
+   export, `--save` to snapshot so the numbers outlive the transcripts.
+   Reads local disk only; `--judge` is opt-in and does make a model call.
+7. **`ephor list`** — script-friendly one-line-per-session status, for
    tmux status-right widgets or shell scripts.
-7. **`ephor doctor`** — checks dependencies and, per agent, whether its
+8. **`ephor doctor`** — checks dependencies and, per agent, whether its
    CLI is installed and ephor's hooks are registered.
 
 See [`docs/getting-started.md`](docs/getting-started.md) for a longer

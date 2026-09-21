@@ -82,10 +82,12 @@ HeaderBar > .badge {
     border-left: thick $primary;
 }
 
-/* SessionRow: 2-row card. The inner Static carries rich markup colors. */
+/* SessionRow: one line per session. The inner Static carries rich markup
+ * colors, and the row budgets its own columns against the measured width
+ * (see session_row.plan_row) so a half-width pane degrades rather than wraps. */
 
 SessionRow {
-    height: 2;
+    height: 1;
     padding: 0 1;
     background: transparent;
     color: $ink;

@@ -8,7 +8,7 @@ Layout (matches docs/stitch-handoff.md):
 
   Header (Textual)
   HeaderBar (PERM/WAIT/ERR/WORK/IDLE/DEAD counters)
-  Sessions (ListView of SessionRow cards, 2 lines each)
+  Sessions (ListView of SessionRow rows, 1 line each)
   Summary line (active count / token total / aggregate spark)
   StatusToast (ephemeral last-action message)
   Footer (key hints)
