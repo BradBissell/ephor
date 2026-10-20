@@ -3,7 +3,7 @@
 Subcommands: list / status / tmux-widget / work / log (read-only views),
 start / resume (launch work), init / uninstall / doctor (hook management,
 `--provider` aware), kill / refresh-tmux, tui, and the speech-playback
-controls.
+controls, plus `title`, which names the calling session's row.
 """
 
 from __future__ import annotations
@@ -107,6 +107,22 @@ def _build_parser() -> argparse.ArgumentParser:
     work_p = subparsers.add_parser("work", help="List work items — ticket, PR, CI, Jira status")
     work_p.add_argument(
         "--prune", action="store_true", help="Drop records untouched for 30 days and exit"
+    )
+
+    title_p = subparsers.add_parser(
+        "title",
+        help="Set the dashboard title of the session this runs in (for agent slash commands)",
+    )
+    title_p.add_argument("title", nargs="*", help="The title; words are joined with spaces")
+    title_p.add_argument(
+        "--clear",
+        action="store_true",
+        help="Drop the title so the dashboard summarizes the session again",
+    )
+    title_p.add_argument(
+        "--session",
+        default=None,
+        help="Session id or unique prefix (default: the session this runs in)",
     )
 
     kill_p = subparsers.add_parser(
@@ -225,6 +241,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_refresh_tmux()
     if args.command == "kill":
         return _cmd_kill(args.sid)
+    if args.command == "title":
+        return _cmd_title(" ".join(args.title), clear=bool(args.clear), session=args.session)
     if args.command == "start":
         return _cmd_start(
             args.ticket,
@@ -609,6 +627,48 @@ def _cmd_kill(sid_or_prefix: str) -> int:
         return 0
     print(f"ephor: kill failed: {outcome.detail}", file=sys.stderr)
     return 1
+
+
+# --- title ----------------------------------------------------------------
+
+
+def _cmd_title(raw_title: str, *, clear: bool, session: str | None) -> int:
+    """Write (or clear) the summary-column title for one session."""
+    from ephor.session_title import ancestor_pids, normalize_title, resolve_current_session
+    from ephor.summary_store import SummaryStore
+
+    agents = StateManager().scan()
+    if session:
+        matches = [a for a in agents if a.session_id.startswith(session)]
+        if len(matches) != 1:
+            problem = "no session matches" if not matches else "ambiguous session prefix"
+            print(f"ephor: {problem} '{session}'", file=sys.stderr)
+            return 1
+        agent: AgentState | None = matches[0]
+    else:
+        agent = resolve_current_session(agents, ancestors=ancestor_pids(), env=os.environ)
+    if agent is None:
+        print(
+            "ephor: can't tell which session this is — no state file matches an "
+            "ancestor process, CLAUDE_CODE_SESSION_ID or TMUX_PANE. Pass --session.",
+            file=sys.stderr,
+        )
+        return 1
+
+    store = SummaryStore()
+    sid = agent.session_id
+    if clear:
+        store.delete(sid)
+        print(f"cleared title for {sid[:8]}; the dashboard will summarize it again")
+        return 0
+
+    title = normalize_title(raw_title)
+    if not title:
+        print('ephor: give a title, e.g. ephor title "DR-1234: fix cart rounding"', file=sys.stderr)
+        return 2
+    store.set(sid, title)
+    print(f'{sid[:8]} → "{title}"')
+    return 0
 
 
 # --- doctor ---------------------------------------------------------------

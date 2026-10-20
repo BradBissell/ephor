@@ -265,9 +265,39 @@ event. Unset, nothing is sent.
    tmux status-right widgets or shell scripts.
 7. **`ephor doctor`** — checks dependencies and, per agent, whether its
    CLI is installed and ephor's hooks are registered.
+8. **`ephor title "DR-8222: fix cart rounding"`** — names the row of the
+   session it runs in, overriding the generated summary. Run it from inside
+   the session; it finds its own row by walking up to the agent's PID.
+   `--clear` hands the row back to the summarizer, and `--session <sid>`
+   targets another row.
 
 See [`docs/getting-started.md`](docs/getting-started.md) for a longer
 walkthrough.
+
+### Letting the agent name its own row
+
+`ephor title` is built to be called by the agent itself, so a slash command
+can have the session's model write the title. Save this as
+`~/.claude/commands/ephor-title.md` (Claude Code and Grok both load it) and
+again as `~/.config/opencode/commands/ephor-title.md` without the
+`allowed-tools` line:
+
+```markdown
+---
+description: Name this session in the ephor dashboard with an AI-written title
+argument-hint: "[hint | --clear]"
+allowed-tools: Bash(ephor title:*)
+---
+
+Arguments: `$ARGUMENTS`. If they are `--clear`, run `ephor title --clear`
+and stop. Otherwise write a title for this conversation: 60 characters or
+fewer, plain text, describing what the session is doing now, led by the
+ticket key if there is one. Treat any arguments as a hint. Then run exactly
+`ephor title '<title>'` and reply with its output.
+```
+
+Then `/ephor-title` in any of those agents renames its row. Pressing `s` on
+the row regenerates the summary and replaces the title.
 
 ## Highlights
 
