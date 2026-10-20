@@ -141,3 +141,24 @@ def test_work_cell_is_exactly_its_column_width() -> None:
         render_work_cell(PullRequest(number=1026, url="u", state="OPEN"), drift="d"),
     ]
     assert {len(visible(cell)) for cell in cases} == {_WORK_W}
+
+
+def test_a_title_is_shown_ahead_of_the_prompt() -> None:
+    line = render_detail(_agent(last_summary="the prompt"), RowContext(), 60, title="DR-1: retry")
+    assert "DR-1: retry" in line
+    assert "the prompt" not in line
+
+
+def test_a_warning_badges_the_title_instead_of_hiding_it() -> None:
+    """The title is how you tell rows apart; a collision must not erase it."""
+    line = render_detail(
+        _agent(), RowContext(collisions=("s2", "s3")), 60, title="DR-1: fix cart rounding"
+    )
+    assert line.startswith("[bold #f85149]![/] ")
+    assert "DR-1: fix cart rounding" in line
+
+
+def test_a_cell_too_narrow_for_badge_and_title_shows_the_warning() -> None:
+    line = render_detail(_agent(), RowContext(collisions=("s2",)), 12, title="DR-1: fix it")
+    assert "shares" in line
+    assert "DR-1" not in line

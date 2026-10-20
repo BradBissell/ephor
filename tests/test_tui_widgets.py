@@ -508,3 +508,25 @@ def test_a_collision_still_reaches_the_single_line(tmp_path: Path) -> None:
     rendered = _visible(str(row.render()))
     assert "shares worktree with 2 others" in rendered
     assert "implement the retry" not in rendered
+
+
+def test_detail_outranks_the_provider_at_narrow_widths() -> None:
+    """The title tells rows apart; the provider label rarely changes."""
+    from ephor.tui.widgets.session_row import plan_row
+
+    layout = plan_row(80)
+    assert layout.provider == 0
+    assert layout.detail >= 30
+
+
+def test_a_collision_keeps_the_title_on_the_single_line(tmp_path: Path) -> None:
+    from ephor.tui.widgets.session_row import RowContext, SessionRow
+
+    row = SessionRow()
+    agent = _agent_for_row(cwd=str(tmp_path))
+    row.update_agent(
+        agent, summary="DR-1: fix cart rounding", context=RowContext(collisions=("s2",))
+    )
+    rendered = _visible(str(row.render()))
+    assert "! DR-1: fix cart rounding" in rendered
+    assert "DR-1: fix cart rounding" in rendered

@@ -65,7 +65,7 @@ _TOKENS_W = 6
 _PROVIDER_W = 8
 _MIN_PROJECT, _MAX_PROJECT = 12, 18
 _MIN_DETAIL = 14
-_DETAIL_GROWTH = 18  # how much detail gets before the decorative cells bid
+_DETAIL_GROWTH = 32  # how much detail gets before the decorative cells bid
 _SPARK_MIN, _SPARK_MAX = 8, _SPARK_WIDTH
 
 # The floor layout — every essential cell at its minimum, with the two
@@ -127,11 +127,13 @@ def plan_row(total: int) -> RowLayout:
     grow = min(_MAX_PROJECT - _MIN_PROJECT, max(0, surplus))
     project += grow
     surplus -= grow
-    if afford(_PROVIDER_W + 1):
-        provider = _PROVIDER_W
+    # Detail (the session title) grows before the provider is bought: the
+    # title is what tells two rows apart, the provider rarely changes.
     grow = min(_DETAIL_GROWTH, max(0, surplus))
     detail += grow
     surplus -= grow
+    if afford(_PROVIDER_W + 1):
+        provider = _PROVIDER_W
     if afford(_SPARK_MIN + 1):
         spark = _SPARK_MIN
         spark += min(_SPARK_MAX - _SPARK_MIN, max(0, surplus))
@@ -344,37 +346,74 @@ def render_work_cell(
     )
 
 
+def _warning(context: RowContext, stale: bool) -> tuple[str, str, str] | None:
+    """The most urgent warning for a row as ``(long, short, style)``, or None.
+
+    Ordered by how much it costs to not notice: a shared worktree corrupts
+    work silently, a stalled heartbeat means the session is dead but looks
+    alive, and red CI means the thing you think is finished is not. The
+    short form is the badge drawn ahead of a session title.
+    """
+    if context.collisions:
+        others = len(context.collisions)
+        plural = "s" if others != 1 else ""
+        # A bare red "!" ahead of the title: the title is the point of the
+        # cell, and the full sentence shows whenever there is no title.
+        return (
+            f"! shares worktree with {others} other{plural}",
+            "!",
+            "bold #f85149",
+        )
+    if stale:
+        return ("! STALE — no hook events, session may be hung", "! STALE", "bold #f85149")
+    if context.failing_checks:
+        names = ", ".join(context.failing_checks[:3])
+        return (f"x CI failing: {names}", "x CI failing", "#f85149")
+    if context.drift:
+        return (f"~ {context.drift}", "~ drift", "#bc8cff")
+    if context.decision_queued:
+        return (
+            f"> {context.decision_queued} queued — sent next prompt",
+            f"> {context.decision_queued} queued",
+            "#7ee787",
+        )
+    return None
+
+
+# Narrower than this and a title squeezed beside a badge is unreadable, so the
+# warning takes the whole cell instead.
+_MIN_TITLE_BESIDE_BADGE = 12
+
+
 def render_detail(
     agent: AgentState,
     context: RowContext,
     width: int = 40,
     stale: bool = False,
+    title: str = "",
 ) -> str:
-    """The flexible middle cell: a warning if there is one, else what was asked.
+    """The flexible middle cell: the session's title, prompt, and any warning.
 
-    Precedence is the point. Warnings **displace** the prompt rather than
-    sharing the cell with it, because the prompt is context you already have
-    — you typed it — whereas "two sessions are editing this worktree" is
-    news, and news that scrolls off the right edge is news nobody reads.
+    A session **title** (set with ``ephor-title`` or written by the
+    summarizer) is how you tell rows apart, so a warning never hides it: the
+    warning shrinks to a short badge in front of the title instead.
 
-    Ordered by how much it costs to not notice: a shared worktree corrupts
-    work silently, a stalled heartbeat means the session is dead but looks
-    alive, and red CI means the thing you think is finished is not.
+    Without a title, a warning **displaces** the prompt rather than sharing
+    the cell with it, because the prompt is context you already have — you
+    typed it — whereas "two sessions are editing this worktree" is news, and
+    news that scrolls off the right edge is news nobody reads.
     """
-    if context.collisions:
-        others = len(context.collisions)
-        plural = "s" if others != 1 else ""
-        return _cell(f"! shares worktree with {others} other{plural}", width, "bold #f85149")
-    if stale:
-        return _cell("! STALE — no hook events, session may be hung", width, "bold #f85149")
-    if context.failing_checks:
-        names = ", ".join(context.failing_checks[:3])
-        return _cell(f"x CI failing: {names}", width, "#f85149")
-    if context.drift:
-        return _cell(f"~ {context.drift}", width, "#bc8cff")
-    if context.decision_queued:
-        return _cell(f"> {context.decision_queued} queued — sent next prompt", width, "#7ee787")
+    warning = _warning(context, stale)
+    title = title.strip()
+    if warning is not None:
+        long, short, style = warning
+        if not title or width - len(short) - 1 < _MIN_TITLE_BESIDE_BADGE:
+            return _cell(long, width, style)
+        badge = _cell(short, len(short), style)
+        return f"{badge} {_cell(title, width - len(short) - 1, '#dbe4e3')}"
 
+    if title:
+        return _cell(title, width, "#dbe4e3")
     prompt = getattr(agent, "last_summary", "") or ""
     if context.jira_status and prompt:
         return _cell(f"«{context.jira_status}» {prompt}", width, "dim italic")
@@ -463,7 +502,7 @@ class SessionRow(Static):
         if layout.provider:
             parts.append(_cell(agent.provider or "—", layout.provider, "#8b949e") + " ")
         parts.append(_cell(agent.project_name or "—", layout.project, f"bold {color}") + " ")
-        parts.append(render_detail(agent, ctx, layout.detail, stale) + " ")
+        parts.append(render_detail(agent, ctx, layout.detail, stale, row.summary or "") + " ")
         if layout.tokens:
             from ephor.tui.tokens import format_tokens
 
