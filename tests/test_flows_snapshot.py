@@ -175,17 +175,41 @@ def _drop(current: Snapshot, *, now: datetime = T0) -> Snapshot:
     return current
 
 
-def test_a_dropped_ticket_leaves_a_tombstone_and_returns_with_a_new_seq() -> None:
+def test_a_dropped_ticket_returning_elsewhere_gets_a_new_seq() -> None:
     first, _ = snap.advance(None, [_issue("DR-1", "To Do", "1")], now=T0)
     second, _ = snap.advance(first, [_issue("DR-1", "Peer Review", "10")], now=T0)
     gone = _drop(second)
     assert "DR-1" not in gone.tickets
     assert gone.dropped["DR-1"].seq == 1
     assert gone.dropped["DR-1"].dropped_at == "2026-10-01T12:00:00+00:00"
-    back, moves = snap.advance(gone, [_issue("DR-1", "Peer Review", "10")], now=T0)
+    assert (gone.dropped["DR-1"].status, gone.dropped["DR-1"].status_id) == ("Peer Review", "10")
+    back, moves = snap.advance(gone, [_issue("DR-1", "QA", "11")], now=T0)
     assert back.tickets["DR-1"].seq == 2
     assert [(m.appeared, m.seq) for m in moves] == [(True, 2)]
     assert "DR-1" not in back.dropped
+
+
+def test_a_dropped_ticket_returning_in_the_same_status_resumes_its_visit() -> None:
+    first, _ = snap.advance(None, [_issue("DR-1", "To Do", "1")], now=T0)
+    second, _ = snap.advance(first, [_issue("DR-1", "Done", "30")], now=T0)
+    gone = _drop(second)
+    back, moves = snap.advance(gone, [_issue("DR-1", "Done", "30")], now=T0)
+    assert moves == []
+    assert back.tickets["DR-1"].seq == 1
+    assert "DR-1" not in back.dropped
+
+
+def test_a_tombstone_without_a_status_still_counts_a_return_as_a_visit() -> None:
+    """Tombstones written before the status was kept read as they always did."""
+    first, _ = snap.advance(None, [_issue("DR-1", "Done", "30")], now=T0)
+    old_style = replace(
+        first,
+        tickets={},
+        dropped={"DR-1": snap.DroppedTicket.from_dict({"seq": 4, "dropped_at": "x"})},
+    )
+    back, moves = snap.advance(old_style, [_issue("DR-1", "Done", "30")], now=T0)
+    assert back.tickets["DR-1"].seq == 5
+    assert [(m.appeared, m.seq) for m in moves] == [(True, 5)]
 
 
 def test_old_tombstones_are_pruned() -> None:

@@ -367,11 +367,17 @@ def test_tmux_session_must_be_addressable() -> None:
 # --- repo resolution -------------------------------------------------------
 
 
+def _linked(path: Path, main: Path) -> Path:
+    """Make ``path`` look like a linked worktree of ``main`` (its .git is a pointer file)."""
+    path.mkdir(parents=True, exist_ok=True)
+    (path / ".git").write_text(f"gitdir: {main}/.git/worktrees/{path.name}\n")
+    return path
+
+
 def test_resolve_repo_prefers_the_worktree_then_the_project_map(tmp_path: Path) -> None:
-    worktree = tmp_path / "repo-DR-1"
-    worktree.mkdir()
     repo = tmp_path / "repo"
     repo.mkdir()
+    worktree = _linked(tmp_path / "repo-DR-1", repo)
     config = board.BoardConfig(path=tmp_path / "b.toml", repos={"DR": str(repo)})
 
     path, how = config.resolve_repo("DR-1", WorkItem(key="DR-1", worktree=str(worktree)))
@@ -383,6 +389,46 @@ def test_resolve_repo_prefers_the_worktree_then_the_project_map(tmp_path: Path) 
     # A worktree that has since been removed falls through to the map.
     gone = WorkItem(key="DR-1", worktree=str(tmp_path / "deleted"))
     assert config.resolve_repo("DR-1", gone) == (repo, "repos.DR")
+
+
+def test_resolve_repo_never_takes_a_main_checkout_for_the_tickets_worktree(
+    tmp_path: Path,
+) -> None:
+    """A worktree = false flow ran in the repo root, and promotion recorded it."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)  # a main working tree: .git is a directory
+    config = board.BoardConfig(path=tmp_path / "b.toml", repos={"DR": str(repo)})
+    assert config.resolve_repo("DR-1", WorkItem(key="DR-1", worktree=str(repo))) == (
+        repo,
+        "repos.DR",
+    )
+    # A plain directory, or a submodule's checkout, is not a linked worktree either.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert config.resolve_repo("DR-1", WorkItem(key="DR-1", worktree=str(plain)))[1] == "repos.DR"
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / ".git").write_text(f"gitdir: {repo}/.git/modules/sub\n")
+    assert config.resolve_repo("DR-1", WorkItem(key="DR-1", worktree=str(sub)))[1] == "repos.DR"
+
+
+def test_resolve_repo_ignores_a_worktree_record_naming_the_configured_root(
+    tmp_path: Path,
+) -> None:
+    main = tmp_path / "main"
+    main.mkdir()
+    tree = _linked(tmp_path / "tree", main)
+    config = board.BoardConfig(path=tmp_path / "b.toml", repos={"DR": str(tree)})
+    path, how = config.resolve_repo("DR-1", WorkItem(key="DR-1", worktree=str(tree)))
+    assert (path, how) == (tree, "repos.DR")
+
+
+def test_relative_repo_paths_are_rejected() -> None:
+    config = board.parse({"board": {"projects": ["DR"]}, "repos": {"DR": "aim-myt"}})
+    assert config.flow_errors == ("[repos] DR: must be an absolute path (or start with ~)",)
+    assert config.repos == {}
+    ok = board.parse({"board": {"projects": ["DR"]}, "repos": {"DR": "~/code", "OPS": "/srv/x"}})
+    assert ok.errors == ()
 
 
 def test_resolve_repo_refuses_rather_than_guessing(tmp_path: Path) -> None:

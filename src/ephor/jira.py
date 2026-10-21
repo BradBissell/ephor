@@ -365,6 +365,18 @@ def ticket_for_agent(
     return match.key if match is not None else None
 
 
+def confident_ticket_for_agent(agent: AgentState) -> str:
+    """The session's ticket when a fact says so (pin, EPHOR_TICKET, branch …), else "".
+
+    For callers that *act* on the answer — the flows tick's launch guard and
+    its ``on_session`` triggers. A prose guess ("get-peer-reviews: DR-3 and
+    DR-4 are waiting") is fine for a dashboard label, but it must not hold a
+    review back, or fire ``died`` for a ticket the session only mentioned.
+    """
+    match = match_for_agent(agent)
+    return match.key.upper() if match is not None and match.confident else ""
+
+
 # session_id -> promoted ticket, rebuilt on a short TTL. Without this the
 # render path re-reads every work record for every session twice a second;
 # with it, a repaint of 25 sessions costs one directory scan per TTL window.
@@ -416,11 +428,16 @@ def promote(match: TicketMatch | None, agent: AgentState) -> None:
         return
     global _promotion_index_expires
     ctx = gitinfo.context(agent.cwd)
+    # Only a linked worktree belongs to the ticket. A session in the main
+    # checkout (a worktree = false flow sets EPHOR_TICKET there) must not
+    # make the repo root, and whatever branch it has out, the ticket's own:
+    # the flow tick would then run a worktree = true flow in the main tree.
+    owned = gitinfo.is_linked_worktree(ctx.toplevel)
     work_items.record(
         match.key,
         session_id=getattr(agent, "session_id", None),
-        branch=ctx.branch or "",
-        worktree=ctx.toplevel or "",
+        branch=(ctx.branch or "") if owned else "",
+        worktree=(ctx.toplevel or "") if owned else "",
         repo=Path(ctx.toplevel).name if ctx.toplevel else "",
         confirmed=True,
     )

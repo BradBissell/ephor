@@ -29,7 +29,7 @@ from ephor.flows import printable, runs, ticket_sort_key
 from ephor.flows import snapshot as board_snapshot
 from ephor.flows import tick as flows_tick
 from ephor.flows.snapshot import Snapshot, TicketState
-from ephor.jira import ticket_for_agent
+from ephor.jira import confident_ticket_for_agent
 from ephor.state.manager import StateManager
 
 
@@ -111,9 +111,9 @@ def _live_sessions_by_ticket(snap: Snapshot) -> dict[str, int]:
     """How many live sessions each board ticket has, from state files and work records."""
     live = [a for a in StateManager().scan() if a.status is not AgentStatus.DEAD]
     live_ids = {a.session_id for a in live}
-    # The dashboard's resolver (pins, branch name, the state file's ticket),
-    # so this command and the TUI's lanes agree on which session is whose.
-    by_agent = {a.session_id: (ticket_for_agent(a) or "").upper() for a in live}
+    # The facts only (pins, EPHOR_TICKET, branch name …), as the flows tick
+    # counts them: a session that merely mentions a ticket is not on it.
+    by_agent = {a.session_id: confident_ticket_for_agent(a) for a in live}
     counts: dict[str, int] = {}
     for key in snap.on_board():
         sids = {sid for sid, ticket in by_agent.items() if ticket == key}
@@ -351,7 +351,8 @@ def cmd_ls(*, show_all: bool) -> int:
         return 0
     for run in listed:
         age = _age(runs.age_sec(run.updated_at, now)).replace(" old", "")
-        stale = " stale" if run.stale else ""
+        # A stale run's reason usually says so already; say it once.
+        stale = " stale" if run.stale and "stale" not in run.reason.lower() else ""
         reason = f"  {printable(run.reason, 70)}" if run.reason else ""
         print(f"{run.state:<16} {run.run_id:<40} {age:>4}{stale}{reason}")
     awaiting = sum(1 for r in listed if r.state is runs.RunState.AWAITING_CONFIRM)
@@ -387,7 +388,17 @@ def cmd_resume() -> int:
     if not runs.resume():
         print(f"ephor: could not remove {runs.paused_path()}", file=sys.stderr)
         return 1
-    print("flows resumed")
+    # A pause holds runs rather than dropping them; say what is about to go.
+    held = [
+        r for r in runs.list_runs() if r.state in (runs.RunState.CLAIMED, runs.RunState.BLOCKED)
+    ]
+    if held:
+        print(
+            f"flows resumed — {len(held)} held run(s) dispatch on the next tick "
+            "(any held past confirm_ttl expire instead; `ephor flows ls` to see them)"
+        )
+    else:
+        print("flows resumed")
     return 0
 
 
@@ -416,14 +427,24 @@ def cmd_check() -> int:
                 f"  flow {rule.name}: {rule.trigger}={rule.value!r} assignee={rule.assignee} "
                 f"mode={rule.mode} {what}"
             )
-    if not jira_api.is_configured():
-        print("jira: not configured (set EPHOR_JIRA_URL, EPHOR_JIRA_EMAIL, EPHOR_JIRA_TOKEN)")
+    # Before the Jira probe, which can end the check early.
+    if runs.is_paused():
+        print("flows: PAUSED — `ephor flows resume` to dispatch again")
+    missing = jira_api.missing_credentials()
+    if missing:
+        print(f"jira: not configured — missing {missing}")
         return 1
     account = jira_api.myself()
     if account is None:
         print("jira: /myself did not answer — check the URL and token")
         return 1
     print(f"jira: ok — accountId {account}")
-    if runs.is_paused():
-        print("flows: PAUSED")
+    if config.lanes_ok and config.board.projects:
+        # The board's own search, one result: a JQL Jira rejects (a field the
+        # site does not have) otherwise only shows up as a tick that fails.
+        found = jira_api.search(config.board.search_jql(), ("status",), page_size=1, max_pages=1)
+        if found is None:
+            print("jira: the board search failed — check [board] jql and projects")
+            return 1
+        print("jira: board search ok")
     return status

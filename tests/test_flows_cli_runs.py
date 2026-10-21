@@ -42,7 +42,7 @@ def jira(monkeypatch: pytest.MonkeyPatch) -> dict[str, Issue]:
     monkeypatch.setenv("EPHOR_JIRA_EMAIL", "me@example.com")
     monkeypatch.setenv("EPHOR_JIRA_TOKEN", "t")
     issues: dict[str, Issue] = {}
-    monkeypatch.setattr(jira_api, "search", lambda jql, fields=(): list(issues.values()))
+    monkeypatch.setattr(jira_api, "search", lambda jql, fields=(), **_: list(issues.values()))
     monkeypatch.setattr(jira_api, "fetch_fresh", lambda key: issues.get(key))
     monkeypatch.setattr(jira_api, "myself", lambda: "acct-me")
     monkeypatch.setattr(runners, "live_panes", lambda: None)
@@ -374,3 +374,78 @@ assignee = "any"
     out = capsys.readouterr().out
     assert "pr        DR-1       PR #7 opened" in out
     assert "dispatched DR-1.ping.pr7" in out
+
+
+def test_ls_says_stale_once(capsys: pytest.CaptureFixture[str]) -> None:
+    _awaiting()
+    path = runs.run_path("DR-1.review.10-1")
+    run = runs.load("DR-1.review.10-1")
+    assert run is not None
+    from dataclasses import replace
+
+    path.write_text(
+        replace(run, stale=True, reason="stale: created after a gap in ticks").to_json()
+    )
+    main(["flows", "ls"])
+    line = next(x for x in capsys.readouterr().out.splitlines() if "DR-1.review" in x)
+    assert line.count("stale") == 1
+
+
+def test_resume_says_how_many_held_runs_will_go(capsys: pytest.CaptureFixture[str]) -> None:
+    _awaiting("DR-1.review.10-1", RunState.BLOCKED)
+    _awaiting("DR-2.review.10-1", RunState.CLAIMED)
+    _awaiting("DR-3.review.10-1")
+    main(["flows", "pause"])
+    capsys.readouterr()
+    assert main(["flows", "resume"]) == 0
+    assert "2 held run(s) dispatch on the next tick" in capsys.readouterr().out
+
+
+def test_check_reports_paused_even_without_jira(capsys: pytest.CaptureFixture[str]) -> None:
+    _write_board()
+    runs.pause()
+    assert main(["flows", "check"]) == 1
+    out = capsys.readouterr().out
+    assert "flows: PAUSED" in out
+    assert out.index("flows: PAUSED") < out.index("jira: not configured")
+
+
+def test_check_names_the_missing_jira_variable(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_board()
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    assert main(["flows", "check"]) == 1
+    out = capsys.readouterr().out
+    assert "missing email (EPHOR_JIRA_EMAIL, JIRA_EMAIL or JIRA_USERNAME)" in out
+    assert "url" not in out.split("missing", 1)[1] and "token" not in out.split("missing", 1)[1]
+
+
+def test_jira_username_is_an_email_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net/")
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    monkeypatch.setenv("JIRA_USERNAME", "me@example.com")
+    creds = jira_api.credentials()
+    assert creds is not None and creds.email == "me@example.com"
+    assert jira_api.missing_credentials() == ""
+    monkeypatch.setenv("JIRA_EMAIL", "other@example.com")
+    assert jira_api.credentials().email == "other@example.com"  # type: ignore[union-attr]
+
+
+def test_check_runs_the_board_search(
+    jira: dict[str, Issue], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_board()
+    asked: list[tuple[str, dict[str, Any]]] = []
+
+    def search(jql: str, fields: tuple[str, ...] = (), **kw: Any) -> list[Issue] | None:
+        asked.append((jql, kw))
+        return None
+
+    monkeypatch.setattr(jira_api, "search", search)
+    assert main(["flows", "check"]) == 1
+    assert "board search failed" in capsys.readouterr().out
+    ((jql, kw),) = asked
+    assert "project in (DR)" in jql
+    assert kw == {"page_size": 1, "max_pages": 1}

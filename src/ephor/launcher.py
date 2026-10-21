@@ -421,12 +421,16 @@ def start(
         worktree=str(target),
         confirmed=True,
     )
+    # A flow's launch carries its run id, so a later tick that lost the
+    # launched write can still find the agent this attempt started.
+    flow_run = (extra_env or {}).get("EPHOR_FLOW_RUN", "")
     eventlog.append(
         eventlog.EventKind.SESSION_STARTED,
         ticket=ticket,
         detail=f"{agent.display_name} in {target.name}",
         provider=agent.name,
         worktree=str(target),
+        **({"run_id": flow_run} if flow_run else {}),
     )
     return StartResult(
         True,

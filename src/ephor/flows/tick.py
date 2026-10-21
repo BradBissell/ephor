@@ -35,16 +35,30 @@ already on this ticket, or one was started in the last ten minutes, or its
 work record was touched in the last ten minutes, or this same tick already
 launched one there). Then the ticket is re-read
 from Jira, uncached: a search is eventually consistent, and an agent must
-not start on a status the ticket has already left. A guard that says "not
-now" parks the run as ``blocked``; it is tried again on every tick for as
-long as the event that fired it is still the ticket's latest.
+not start on a status the ticket has already left (a re-read with no status
+is unknown, and blocks). A guard that says "not now" parks the run as
+``blocked``; it is tried again on every tick for as long as the event that
+fired it is still the ticket's latest — but not for ever: a run held longer
+than ``confirm_ttl`` (from its approval, or from its creation for an auto
+run) expires, so a yes given days ago, or an event that arrived during a
+long pause, does not act today.
 
-**A retry looks before it launches.** A claimed run with an attempt behind
-it and no recorded window may still have one: the tick that opened it died,
-or could not write ``launched``. Before trying again, the tick folds in an
-exit file that attempt left, or adopts its window (found by the run id in
-the pane's start command); only when tmux confirms there is none does it
-open another.
+**A run launches the flow that made it.** Each run records what its rule
+ran (kind, template, provider, worktree). If ``board.toml`` now says
+something else, the run is superseded instead of launched, and a rule that
+needs a confirmation (every ``start =``, and ``mode = "confirm"``) only
+launches a run somebody approved — an auto ``command =`` run can never be
+edited into an unconfirmed agent.
+
+**A retry looks before it launches.** A run with an attempt behind it and no
+recorded window may still have one: the tick that opened it died, could not
+write ``launched``, or tmux reported a failure after opening the window.
+Before trying again, the tick folds in an exit file that attempt left, or
+adopts its window (found by the run id in the pane's start command); only
+when tmux confirms there is none does it open another. An agent run is
+never relaunched on that alone: if a claimed ``start =`` run's earlier
+attempt left no window, the event log decides whether that agent ran
+(``done``) or nobody can tell (``stuck``).
 
 **Triggers.** ``on_enter`` and ``on_exit`` read the snapshot diff.
 ``on_pr`` and ``on_session`` read observations of their own — ``gh``'s PRs
@@ -124,25 +138,53 @@ def _sessions() -> list[AgentState]:
 
 
 def _ticket_of(agent: AgentState) -> str:
-    from ephor.jira import ticket_for_agent
+    """The session's ticket by fact only (see :func:`ephor.jira.confident_ticket_for_agent`)."""
+    from ephor.jira import confident_ticket_for_agent
 
-    return (ticket_for_agent(agent) or "").upper()
+    return confident_ticket_for_agent(agent)
+
+
+def _is_launch(event: eventlog.Event) -> bool:
+    """True for a SESSION_STARTED written by a launch, not by a dashboard seeing a session.
+
+    ``launcher.start``, ``launcher.resume`` and the flow runners all record
+    what they started (a provider, a worktree, a run id). The dashboard's
+    first sight of a session carries none of those, and is tagged
+    ``observed`` besides — a dashboard restart starts nothing.
+    """
+    extra = event.extra or {}
+    if extra.get("observed"):
+        return False
+    return bool(extra.get("run_id") or extra.get("worktree") or extra.get("provider"))
 
 
 def _recent_starts(since_sec: float) -> dict[str, str]:
-    """ticket -> time of its newest SESSION_STARTED within ``since_sec``."""
+    """ticket -> time of its newest launched SESSION_STARTED within ``since_sec``."""
     found: dict[str, str] = {}
     for event in eventlog.read(since_sec=since_sec):
-        if event.kind is eventlog.EventKind.SESSION_STARTED and event.ticket:
+        if event.kind is eventlog.EventKind.SESSION_STARTED and event.ticket and _is_launch(event):
             found[event.ticket.upper()] = event.at
     return found
+
+
+_EVIDENCE_KINDS = frozenset(
+    {eventlog.EventKind.SESSION_STARTED, eventlog.EventKind.FLOW_DISPATCHED}
+)
+
+
+def _launch_evidence(run_id: str, since_sec: float) -> bool:
+    """True when the event log says an agent was started for ``run_id``."""
+    for event in eventlog.read(since_sec=since_sec):
+        if event.kind in _EVIDENCE_KINDS and (event.extra or {}).get("run_id") == run_id:
+            return True
+    return False
 
 
 def _work_item(key: str) -> WorkItem | None:
     return work_items.load(key)
 
 
-def _live_panes() -> set[str] | None:
+def _live_panes() -> runners.LivePanes | None:
     return runners.live_panes()
 
 
@@ -168,8 +210,9 @@ class TickDeps:
     sessions: Callable[[], list[AgentState]] = _sessions
     ticket_of: Callable[[AgentState], str] = _ticket_of
     recent_starts: Callable[[float], dict[str, str]] = _recent_starts
+    launch_evidence: Callable[[str, float], bool] = _launch_evidence
     work_item: Callable[[str], WorkItem | None] = _work_item
-    live_panes: Callable[[], set[str] | None] = _live_panes
+    live_panes: Callable[[], runners.LivePanes | None] = _live_panes
     flow_panes: Callable[[], dict[str, str] | None] = _flow_panes
     find_prs: Callable[[Path, str], list[PullRequest] | None] = _find_prs
     pid_alive: Callable[[int], bool] = _pid_alive
@@ -398,7 +441,7 @@ def _tick_locked(
     if config.dispatch_ok:
         if runs.is_paused():
             notes.insert(0, "paused (ephor flows resume)")
-        _dispatch(ledger, config, snap, context)
+        _dispatch(ledger, config, snap, context, watching_sessions=watching_sessions)
     dispatch_note = "; ".join(notes)
 
     if not dry_run:
@@ -551,6 +594,7 @@ def _create_run(
         stale=stale,
         reason="stale: created after a gap in ticks" if stale else "",
         kind="start" if rule.launches_agent else "command",
+        action=rule.action_fingerprint,
         title=record.title,
         from_status=move.from_status,
         to_status=move.to_status,
@@ -584,6 +628,7 @@ def _create_event_run(
         stale=stale,
         reason="stale: created after a gap in ticks" if stale else "",
         kind="start" if rule.launches_agent else "command",
+        action=rule.action_fingerprint,
         title=record.title,
         # The ticket's status when the event fired: what {status} renders as.
         to_status=record.status,
@@ -654,7 +699,7 @@ def _tend(
     watching_sessions: bool,
 ) -> None:
     """Expire, supersede and finish runs, before anything new is dispatched."""
-    panes: set[str] | None = None
+    panes: runners.LivePanes | None = None
     panes_read = False
     for run in sorted(ledger.runs.values(), key=lambda r: (r.created_at, r.run_id)):
         if run.state is RunState.AWAITING_CONFIRM:
@@ -662,10 +707,55 @@ def _tend(
         elif run.state in (RunState.CLAIMED, RunState.BLOCKED):
             if not _current(run, snap, watching_sessions=watching_sessions):
                 _cancel(ledger, run, RunState.SUPERSEDED, _moved_reason(run, snap))
+            elif _held_too_long(run, config, ledger.now):
+                _cancel(ledger, run, RunState.EXPIRED, HELD_TOO_LONG)
         elif run.state is RunState.LAUNCHED:
             if not panes_read:
                 panes, panes_read = deps.live_panes(), True
             _tend_launched(ledger, run, panes)
+
+
+HELD_TOO_LONG = "held past confirm_ttl"
+
+
+def _held_too_long(run: Run, config: BoardConfig, now: datetime) -> bool:
+    """True when a run waiting to launch has waited longer than ``confirm_ttl``.
+
+    A guard can hold a run for days — a session that never quite leaves the
+    ticket, a long pause — and the event that fired it, or the yes it was
+    given, is not a reason to act days later. Age counts from the approval
+    for a confirmed run, from creation for an auto one. A claimed run whose
+    launch is already under way is left to the retry logic, which knows how
+    to look for its window.
+    """
+    if run.state is RunState.CLAIMED and run.attempts > 0:
+        return False
+    age = runs.age_sec(run.approved_at or run.created_at, now)
+    return age is not None and age > config.flows.confirm_ttl
+
+
+FLOW_CHANGED = "flow changed since this run was created"
+
+
+def _rule_changed(run: Run, rule: FlowRule, *, approved_needed: bool) -> str:
+    """Why ``rule`` is no longer the flow that created ``run``, or "".
+
+    A run launches what its rule says *now*, so a run made by one rule must
+    not go out as another: an auto ``command =`` run edited into ``start =``
+    would be an agent nobody approved, and an approval was for the flow that
+    was shown. ``approved_needed`` adds the dispatch-time half: a rule that
+    now wants a confirmation (any ``start =``, any ``mode = "confirm"``)
+    only launches a run somebody approved.
+    """
+    kind = "start" if rule.launches_agent else "command"
+    if run.kind and run.kind != kind:
+        return FLOW_CHANGED
+    if run.action and run.action != rule.action_fingerprint:
+        return FLOW_CHANGED
+    needs_yes = rule.launches_agent or rule.mode is Mode.CONFIRM
+    if approved_needed and needs_yes and not run.approved_at:
+        return FLOW_CHANGED
+    return ""
 
 
 def _moved_reason(run: Run, snap: Snapshot) -> str:
@@ -687,8 +777,13 @@ def _tend_awaiting(
         _cancel(ledger, run, RunState.EXPIRED, "not confirmed within confirm_ttl")
     elif not _current(run, snap, watching_sessions=watching_sessions):
         _cancel(ledger, run, RunState.EXPIRED, _moved_reason(run, snap))
-    elif config.dispatch_ok and config.rule(run.flow) is None:
-        _cancel(ledger, run, RunState.EXPIRED, "flow no longer in board.toml")
+    elif config.dispatch_ok:
+        rule = config.rule(run.flow)
+        if rule is None:
+            _cancel(ledger, run, RunState.EXPIRED, "flow no longer in board.toml")
+        elif changed := _rule_changed(run, rule, approved_needed=False):
+            # Approving it now would approve something nobody was shown.
+            _cancel(ledger, run, RunState.EXPIRED, changed)
 
 
 def _cancel(ledger: _Ledger, run: Run, state: RunState, reason: str) -> None:
@@ -698,12 +793,12 @@ def _cancel(ledger: _Ledger, run: Run, state: RunState, reason: str) -> None:
         ledger.event(eventlog.EventKind.FLOW_CANCELLED, updated, reason)
 
 
-def _tend_launched(ledger: _Ledger, run: Run, panes: set[str] | None) -> None:
+def _tend_launched(ledger: _Ledger, run: Run, panes: runners.LivePanes | None) -> None:
     code = runs.read_exit(run.run_id) if run.kind == "command" else None
     if code is not None:
         state = RunState.DONE if code == 0 else RunState.FAILED
         reason = f"exited {code}"
-    elif panes is not None and run.pane and run.pane not in panes:
+    elif panes is not None and run.pane and not panes.has(run.pane, run.tmux_server):
         if run.kind == "command":
             state, reason = RunState.FAILED, "window closed without an exit status"
         else:
@@ -785,21 +880,45 @@ def _launches_within(
     return count
 
 
-def _dispatch(ledger: _Ledger, config: BoardConfig, snap: Snapshot, context: _Context) -> None:
+def _dispatch(
+    ledger: _Ledger,
+    config: BoardConfig,
+    snap: Snapshot,
+    context: _Context,
+    *,
+    watching_sessions: bool,
+) -> None:
     ready = [r for r in ledger.runs.values() if r.state in (RunState.CLAIMED, RunState.BLOCKED)]
     for run in sorted(ready, key=lambda r: (r.created_at, r.run_id)):
         current = ledger.runs.get(run.run_id, run)
         if current.state not in (RunState.CLAIMED, RunState.BLOCKED):
             continue
-        _dispatch_one(ledger, config, snap, context, current)
+        _dispatch_one(ledger, config, snap, context, current, watching_sessions=watching_sessions)
 
 
 def _dispatch_one(
-    ledger: _Ledger, config: BoardConfig, snap: Snapshot, context: _Context, run: Run
+    ledger: _Ledger,
+    config: BoardConfig,
+    snap: Snapshot,
+    context: _Context,
+    run: Run,
+    *,
+    watching_sessions: bool,
 ) -> None:
     rule = config.rule(run.flow)
     if rule is None:
         _cancel(ledger, run, RunState.SUPERSEDED, "flow no longer in board.toml")
+        return
+    changed = _rule_changed(run, rule, approved_needed=True)
+    if changed:
+        _cancel(ledger, run, RunState.SUPERSEDED, changed)
+        return
+    # _tend has already superseded runs whose event is over, but a run can
+    # reach here without passing it: an approve that lands while the tick is
+    # expiring that very run is re-read as claimed. Every launch path is
+    # gated on currency here, whatever order the tick did things in.
+    if not _current(run, snap, watching_sessions=watching_sessions):
+        _cancel(ledger, run, RunState.SUPERSEDED, _moved_reason(run, snap))
         return
 
     if run.state is RunState.CLAIMED and run.attempts > 0:
@@ -809,25 +928,40 @@ def _dispatch_one(
         if waited is not None and waited < runs.CLAIM_TIMEOUT_SEC:
             ledger.note(run.run_id, "waiting", "a launch is in progress")
             return
-    if _unrecorded_attempt(run) and _recover_attempt(ledger, context, run):
-        return
+    if _unrecorded_attempt(run):
+        if _recover_attempt(ledger, context, run):
+            return
+        if run.kind == "start" and run.state is RunState.CLAIMED:
+            # An agent attempt that never recorded how it went, and no
+            # window left to show for it. Never open a second agent on one
+            # approval on the strength of "probably did not start".
+            _settle_unaccounted_agent(ledger, config, context, run)
+            return
     if run.attempts >= MAX_ATTEMPTS:
         _finish(ledger, run, RunState.STUCK, f"{run.attempts} launch attempts without a window")
         return
 
-    reason = _guard(ledger, config, context, run, rule)
+    key, reason = _guard(ledger, config, context, run, rule)
     if reason:
-        _block(ledger, run, reason)
+        _block(ledger, run, reason, key=key)
         return
 
     repo, how = config.resolve_repo(run.ticket, context.deps.work_item(run.ticket))
     if rule.launches_agent and repo is None:
-        _block(ledger, run, how)
+        _block(ledger, run, how, key="no_repo")
         return
 
     fresh = context.deps.fetch_fresh(run.ticket)
     if fresh is None:
         _block(ledger, run, "Jira re-check did not answer")
+        return
+    if fresh.key.strip().upper() != run.ticket.upper():
+        _block(ledger, run, f"Jira re-check returned {fresh.key or 'no ticket'}, not {run.ticket}")
+        return
+    if not (fresh.status_id or fresh.status.strip()):
+        # A partial answer, not a status: unknown never means unmet, so it
+        # can neither launch the run nor end it.
+        _block(ledger, run, "Jira re-check returned no status")
         return
     moved = _recheck(run, rule, fresh, snap.myself)
     if moved:
@@ -838,24 +972,40 @@ def _dispatch_one(
 
 
 # Why a retry is parked when tmux cannot say whether the last attempt's
-# window exists. A run blocked for this reason is checked again, like a
-# claimed one, before it may be relaunched.
+# window exists.
 _TMUX_UNKNOWN = "tmux did not answer — cannot tell whether the last attempt is running"
+UNACCOUNTED = "earlier attempt unaccounted for"
 
 
 def _unrecorded_attempt(run: Run) -> bool:
     """True when an earlier attempt may have opened a window nobody recorded.
 
-    A claimed run with attempts > 0 is one: the attempt was counted before
-    its window was opened, and ``launched`` was never written. A blocked run
-    is one only when it was parked because tmux could not be asked — every
-    other block after an attempt follows a launch known to have failed.
+    Any run with an attempt behind it that has not reached ``launched``. A
+    claimed one counted its attempt before opening the window and never
+    wrote ``launched``; a blocked one may follow a launch tmux *reported*
+    as failed — a ``new-window`` that timed out, or printed no ids — after
+    the window had in fact opened. Either way, look before launching again.
     """
-    if run.attempts <= 0:
-        return False
-    if run.state is RunState.CLAIMED:
-        return True
-    return run.state is RunState.BLOCKED and run.reason == _TMUX_UNKNOWN
+    return run.attempts > 0 and run.state in (RunState.CLAIMED, RunState.BLOCKED)
+
+
+def _settle_unaccounted_agent(
+    ledger: _Ledger, config: BoardConfig, context: _Context, run: Run
+) -> None:
+    """End a start= run whose earlier attempt left no window and no record.
+
+    If the event log shows that attempt starting an agent, the agent ran
+    and its window has since closed: the run is done. If it does not, the
+    attempt may have died before tmux was asked, or after the window opened
+    but before anything was written — there is no telling which, so the run
+    is stuck rather than relaunched. A human can start the flow again.
+    """
+    if context.deps.launch_evidence(run.run_id, max(config.flows.confirm_ttl, _HOUR)):
+        _finish(
+            ledger, run, RunState.DONE, "agent window closed (an attempt that was never recorded)"
+        )
+    else:
+        _finish(ledger, run, RunState.STUCK, UNACCOUNTED)
 
 
 def _recover_attempt(ledger: _Ledger, context: _Context, run: Run) -> bool:
@@ -886,6 +1036,7 @@ def _recover_attempt(ledger: _Ledger, context: _Context, run: Run) -> bool:
         state=RunState.LAUNCHED,
         window=runners.window_name(run.ticket, run.flow),
         pane=pane,
+        tmux_server=_server_of(context, pane),
         payload_path=str(payload) if payload.exists() else run.payload_path,
         reason=reason,
     )
@@ -897,49 +1048,83 @@ def _recover_attempt(ledger: _Ledger, context: _Context, run: Run) -> bool:
     return True
 
 
+_CLEAR = ("", "")
+
+
 def _guard(
     ledger: _Ledger, config: BoardConfig, context: _Context, run: Run, rule: FlowRule
-) -> str:
-    """The first guard that says "not now", or ""."""
+) -> tuple[str, str]:
+    """The first guard that says "not now", as (key, reason); ("", "") when none does.
+
+    The key names the guard without the numbers in its reason (counts and
+    ages change every tick), so a run parked on one guard is written once.
+    """
     settings = config.flows
     if runs.is_paused():
-        return "paused"
+        return "paused", "paused"
     hourly = _launches_within(ledger, _HOUR, exclude=run.run_id)
     if hourly >= settings.max_runs_per_hour:
-        return f"max_runs_per_hour: {hourly} launches in the last hour"
+        return "max_runs_per_hour", f"max_runs_per_hour: {hourly} launches in the last hour"
     per_ticket = _launches_within(ledger, _HOUR, exclude=run.run_id, ticket=run.ticket)
     if per_ticket >= settings.ticket_breaker:
-        return f"ticket_breaker: {per_ticket} launches for {run.ticket} in the last hour"
+        return (
+            "ticket_breaker",
+            f"ticket_breaker: {per_ticket} launches for {run.ticket} in the last hour",
+        )
     if not rule.launches_agent:
-        return ""
+        return _CLEAR
+    if context.all_sessions() is None:
+        # Unknown never means unmet: a scan that failed is not zero agents.
+        return "scan_failed", "session scan failed — cannot count live agents"
     # The session scan is from before this tick launched anything, so the
     # agents it has started since count on top of it.
     active = len(context.live_sessions()) + len(context.launched)
     if active >= settings.max_active_agents:
-        return f"max_active_agents: {active} sessions running"
+        return "max_active_agents", f"max_active_agents: {active} sessions running"
     return _launch_guard(ledger, context, run.ticket)
 
 
-def _launch_guard(ledger: _Ledger, context: _Context, ticket: str) -> str:
-    """Why an agent is (or may already be) on ``ticket``, or ""."""
+def _ago(raw: str, now: datetime) -> str:
+    age = runs.age_sec(raw, now)
+    return "just now" if age is None or age < 60 else f"{int(age // 60)}m ago"
+
+
+def _launch_guard(ledger: _Ledger, context: _Context, ticket: str) -> tuple[str, str]:
+    """Why an agent is (or may already be) on ``ticket``, as (key, reason); or ("", "")."""
     if ticket in context.launched:
-        return f"launch guard: an agent was launched on {ticket} this tick"
+        return (
+            "launch_guard:this_tick",
+            f"launch guard: an agent was launched on {ticket} this tick",
+        )
     for agent in context.live_sessions():
         bound = (agent.ticket or "").upper() or context.deps.ticket_of(agent)
         if bound == ticket:
-            return f"launch guard: session {agent.session_id[:8]} is live on {ticket}"
+            return (
+                f"launch_guard:session:{agent.session_id}",
+                f"launch guard: session {agent.session_id[:8]} is live on {ticket}",
+            )
     started = context.recent_starts().get(ticket)
     if started:
-        return f"launch guard: a session was started on {ticket} at {started}"
+        return (
+            "launch_guard:started",
+            f"launch guard: a session was started on {ticket} {_ago(started, ledger.now)}",
+        )
     item = context.deps.work_item(ticket)
     if item is not None:
-        age = runs.age_sec(item.last_seen, ledger.now)
-        if age is not None and age < LAUNCH_GUARD_SEC:
-            return f"launch guard: {ticket}'s work record was updated {int(age // 60)}m ago"
+        if (age := runs.age_sec(item.last_seen, ledger.now)) is not None and (
+            age < LAUNCH_GUARD_SEC
+        ):
+            return (
+                "launch_guard:work_record",
+                f"launch guard: {ticket}'s work record was updated {_ago(item.last_seen, ledger.now)}",
+            )
         live_ids = {a.session_id for a in context.live_sessions()}
         if any(sid in live_ids for sid in item.session_ids):
-            return f"launch guard: a live session is recorded on {ticket}"
-    return ""
+            return (
+                "launch_guard:recorded_session",
+                f"launch guard: a live session is recorded on {ticket}",
+            )
+    return _CLEAR
 
 
 def _recheck(run: Run, rule: FlowRule, fresh: Issue, myself: str) -> str:
@@ -958,12 +1143,24 @@ def _recheck(run: Run, rule: FlowRule, fresh: Issue, myself: str) -> str:
     return ""
 
 
-def _block(ledger: _Ledger, run: Run, reason: str) -> None:
-    if run.state is RunState.BLOCKED and run.reason == reason:
+def _block(ledger: _Ledger, run: Run, reason: str, *, key: str = "") -> None:
+    """Park ``run`` as blocked. Once per guard: a re-block for the same key writes nothing.
+
+    ``key`` defaults to the reason itself, which suits reasons that never
+    change. The tick's own note carries the fresh reason either way.
+    """
+    key = key or reason
+    if run.state is RunState.BLOCKED and (
+        run.block_key == key or (not run.block_key and run.reason == reason)
+    ):
         ledger.note(run.run_id, "blocked", reason)
         return
     updated = ledger.update(
-        run, expect={RunState.CLAIMED, RunState.BLOCKED}, state=RunState.BLOCKED, reason=reason
+        run,
+        expect={RunState.CLAIMED, RunState.BLOCKED},
+        state=RunState.BLOCKED,
+        reason=reason,
+        block_key=key,
     )
     if updated is not None:
         ledger.note(run.run_id, "blocked", reason)
@@ -1014,6 +1211,14 @@ def _pr_state_of(run: Run, snap: Snapshot) -> str:
     return ""
 
 
+def _server_of(context: _Context, pane: str) -> str:
+    """The tmux server ``pane`` lives on (see :class:`runners.LivePanes`), or "" if unknown."""
+    if not pane:
+        return ""
+    live = context.deps.live_panes()
+    return live.server if live is not None and pane in live.panes else ""
+
+
 def _launch(
     ledger: _Ledger,
     config: BoardConfig,
@@ -1057,7 +1262,8 @@ def _launch(
     if claimed is None:
         return
     # This attempt must be judged by its own exit status, never by one an
-    # earlier attempt left behind.
+    # earlier attempt left behind. Safe to clear only now: _dispatch_one has
+    # already folded in any exit status an earlier attempt recorded.
     runs.clear_exit(claimed.run_id)
     payload = runs.write_payload(claimed.run_id, payload_for(claimed, snap, repo))
     if payload is None:
@@ -1091,6 +1297,7 @@ def _launch(
         state=RunState.LAUNCHED,
         window=outcome.window,
         pane=outcome.pane,
+        tmux_server=_server_of(context, outcome.pane),
         payload_path=str(payload),
         reason=f"launched{where}",
     )

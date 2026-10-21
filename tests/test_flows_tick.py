@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -17,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from ephor import board, eventlog
+from ephor import board, eventlog, work_items
 from ephor.board import BoardConfig
 from ephor.filelock import locked
 from ephor.flows import runners, runs
@@ -182,6 +183,8 @@ class World:
         self.starts: dict[str, str] = {}
         self.work: dict[str, WorkItem] = {}
         self.panes: set[str] | None = set()
+        # The tmux server those panes are on (pid.start_time).
+        self.server = "100.1"
         # run id -> pane of the flow windows tmux reports; None = tmux silent.
         self.flow_panes: dict[str, str] | None = {}
         # ticket -> what `gh pr list --search` says; a missing key is "no PRs".
@@ -203,7 +206,11 @@ class World:
             ticket_of=lambda agent: agent.ticket.upper(),
             recent_starts=lambda _since: dict(self.starts),
             work_item=self.work.get,
-            live_panes=lambda: None if self.panes is None else set(self.panes),
+            live_panes=lambda: (
+                None
+                if self.panes is None
+                else runners.LivePanes(self.server, frozenset(self.panes))
+            ),
             flow_panes=lambda: None if self.flow_panes is None else dict(self.flow_panes),
             find_prs=self.find_prs,
             pid_alive=lambda pid: pid not in self.dead_pids,
@@ -521,6 +528,7 @@ def test_a_ticket_with_its_own_worktree_opens_there(
 ) -> None:
     tree = tmp_path / "repo-DR-1"
     tree.mkdir()
+    (tree / ".git").write_text(f"gitdir: {repo}/.git/worktrees/repo-DR-1\n")
     world.work["DR-1"] = WorkItem(
         key="DR-1", worktree=str(tree), last_seen="2026-01-01T00:00:00+00:00"
     )
@@ -529,6 +537,50 @@ def test_a_ticket_with_its_own_worktree_opens_there(
     world.tick(config, T0 + timedelta(minutes=2))
     assert world.launch.starts == []
     assert world.launch.windows[0]["cwd"] == tree
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+def test_a_repo_root_session_never_becomes_the_tickets_worktree(
+    world: World, tmp_path: Path
+) -> None:
+    """worktree = false launches in the repo root; a later worktree = true flow still forks."""
+    from ephor import jira
+    from tests.test_gitinfo import _repo
+
+    root = _repo(tmp_path / "aim")
+    # What the review flow's agent looks like to the dashboard: in the repo
+    # root, EPHOR_TICKET set — a confident (declared) match, so it is promoted.
+    agent = AgentState.from_dict(
+        {
+            "session_id": "sess-review",
+            "cwd": str(root),
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "status": "IDLE",
+            "ticket": "DR-1",
+            "schema_version": 4,
+        }
+    )
+    match = jira.match_for_agent(agent)
+    assert match is not None and match.key == "DR-1" and match.confident
+    jira.promote(match, agent)
+    item = work_items.load("DR-1")
+    assert item is not None and item.confirmed
+    assert (item.worktree, item.branch) == ("", "")
+    assert "sess-review" in item.session_ids
+
+    implement = {"name": "impl", "on_enter": "Peer Review", "start": "/impl {ticket}"}
+    config = _config({**implement, "worktree": True}, repos={"DR": str(root)})
+    world.work["DR-1"] = replace(item, worktree=str(root), last_seen="2026-01-01T00:00:00+00:00")
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    approved, _ = runs.approve("DR-1.impl.10-1")
+    assert approved is not None
+    world.tick(config, T0 + timedelta(minutes=2))
+    # Even with a stale record naming the repo root, the flow goes through
+    # launcher.start (a fresh worktree), never straight into the main tree.
+    (call,) = world.launch.starts
+    assert call["cwd"] == root
+    assert world.launch.windows == []
 
 
 def test_a_start_flow_with_no_repo_is_blocked(world: World) -> None:
@@ -778,24 +830,28 @@ def test_a_runs_own_failed_attempt_does_not_count_against_its_caps(world: World)
     assert (run.state, run.attempts) == (RunState.LAUNCHED, 2)
 
 
-def _crashed_mid_launch(world: World, config: BoardConfig, attempts: int, at: datetime) -> Run:
-    """A claimed run whose launch began at ``at`` and never reported a window."""
+def _crashed_mid_launch(
+    world: World, config: BoardConfig, attempts: int, at: datetime, *, flow: str = "review"
+) -> Run:
+    """A claimed (and approved) run whose launch began at ``at`` and never reported a window."""
     _baseline(world, config)
     _move_to_review(world, config, T0 + timedelta(minutes=1))
     run = runs.update(
-        "DR-1.review.10-1",
-        expect={RunState.AWAITING_CONFIRM},
+        f"DR-1.{flow}.10-1",
+        expect={RunState.AWAITING_CONFIRM, RunState.CLAIMED, RunState.LAUNCHED},
         state=RunState.CLAIMED,
         attempts=attempts,
         launched_at=runs.iso(at),
+        approved_at=runs.iso(T0 + timedelta(minutes=1)),
+        pane="",
     )
     assert run is not None
     return run
 
 
-def test_a_claim_without_a_window_waits_then_retries(world: World, repo: Path) -> None:
-    config = _config(REVIEW, repos={"DR": str(repo)})
-    _crashed_mid_launch(world, config, 1, T0 + timedelta(minutes=1))
+def test_a_command_claim_without_a_window_waits_then_retries(world: World) -> None:
+    config = _config({**NOTIFY, "mode": "confirm"})
+    _crashed_mid_launch(world, config, 1, T0 + timedelta(minutes=1), flow="notify")
     result = world.tick(config, T0 + timedelta(minutes=5))
     assert [a.verb for a in result.actions] == ["waiting"]
     assert world.launch.windows == []
@@ -804,9 +860,47 @@ def test_a_claim_without_a_window_waits_then_retries(world: World, repo: Path) -
     assert (run.state, run.attempts) == (RunState.LAUNCHED, 2)
 
 
-def test_a_claim_out_of_attempts_is_stuck(world: World, repo: Path) -> None:
+def test_an_agent_claim_without_a_window_or_a_record_is_stuck_not_relaunched(
+    world: World, repo: Path
+) -> None:
     config = _config(REVIEW, repos={"DR": str(repo)})
-    _crashed_mid_launch(world, config, 3, T0 + timedelta(minutes=1))
+    _crashed_mid_launch(world, config, 1, T0 + timedelta(minutes=1))
+    world.tick(config, T0 + timedelta(minutes=12))
+    run = _only_run()
+    assert (run.state, run.reason) == (RunState.STUCK, flows_tick.UNACCOUNTED)
+    assert world.launch.windows == [] and world.launch.starts == []
+
+
+def test_an_agent_whose_launch_was_never_recorded_is_done_not_relaunched(
+    world: World, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The LAUNCHED write is lost, the agent's window closes, the guards lapse."""
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _approved_review(world, config)
+    real = runs.update
+    lost = {"n": 0}
+
+    def flaky(run_id: str, *, expect: Any, now: Any = None, **changes: Any) -> Run | None:
+        if changes.get("state") is RunState.LAUNCHED and lost["n"] == 0:
+            lost["n"] += 1
+            return None  # runs/.lock held for > 2s, or the disk refused the write
+        return real(run_id, expect=expect, now=now, **changes)
+
+    monkeypatch.setattr(runs, "update", flaky)
+    world.tick(config, T0 + timedelta(minutes=2))
+    assert len(world.launch.windows) == 1
+    assert _only_run().state is RunState.CLAIMED
+    world.flow_panes = {}
+    world.starts = {}
+    world.tick(config, T0 + timedelta(minutes=14))
+    run = _only_run()
+    assert run.state is RunState.DONE
+    assert len(world.launch.windows) == 1
+
+
+def test_a_claim_out_of_attempts_is_stuck(world: World) -> None:
+    config = _config({**NOTIFY, "mode": "confirm"})
+    _crashed_mid_launch(world, config, 3, T0 + timedelta(minutes=1), flow="notify")
     world.tick(config, T0 + timedelta(minutes=12))
     run = _only_run()
     assert run.state is RunState.STUCK
@@ -1054,8 +1148,8 @@ def test_a_dry_run_counts_would_be_agents_against_the_launch_guard(
 # --- a ticket that leaves the board and comes back -----------------------------------------------
 
 
-def test_a_ticket_that_drops_off_and_returns_fires_again(world: World) -> None:
-    config = _config(NOTIFY)
+def _dropped_from_review(world: World, config: BoardConfig) -> datetime:
+    """DR-9 appears in Peer Review (firing once), then leaves the search for good."""
     world.panes = None  # the first window's fate is not what this is about
     _baseline(world, config)
     at = T0 + timedelta(minutes=1)
@@ -1069,16 +1163,38 @@ def test_a_ticket_that_drops_off_and_returns_fires_again(world: World) -> None:
     stored = snap.load()
     assert stored is not None and "DR-9" not in stored.tickets
     assert stored.dropped["DR-9"].seq == 0
-    # Reassigned back, still in the same status: a new visit, a new run.
+    assert stored.dropped["DR-9"].status_id == "10"
+    return at
+
+
+def test_a_ticket_that_returns_in_the_status_it_left_in_does_not_fire_again(
+    world: World,
+) -> None:
+    config = _config(NOTIFY)
+    at = _dropped_from_review(world, config)
+    # Back in the search (an edit to an old ticket), still in Peer Review:
+    # it never moved, so the visit it is on already fired.
     world.jira.put("DR-9", "Peer Review", "10")
     result = world.tick(config, at + timedelta(minutes=1))
-    assert "created" in [a.verb for a in result.actions if a.run_id == "DR-9.notify.10-1"]
-    returned = runs.load("DR-9.notify.10-1")
-    assert returned is not None and returned.state is RunState.LAUNCHED
-    assert len(world.launch.windows) == 2
+    assert [a.verb for a in result.actions if a.verb == "created"] == []
+    assert [t.key for t in result.transitions] == []
+    assert [r.run_id for r in runs.list_runs()] == ["DR-9.notify.10-0"]
+    assert len(world.launch.windows) == 1
     stored = snap.load()
     assert stored is not None and "DR-9" not in stored.dropped
-    assert stored.tickets["DR-9"].seq == 1
+    assert stored.tickets["DR-9"].seq == 0
+
+
+def test_a_ticket_that_returns_in_another_status_is_a_new_visit(world: World) -> None:
+    config = _config(NOTIFY)
+    at = _dropped_from_review(world, config)
+    world.jira.put("DR-9", "In Progress", "3")
+    world.tick(config, at + timedelta(minutes=1))
+    world.jira.put("DR-9", "Peer Review", "10")
+    world.tick(config, at + timedelta(minutes=2))
+    # seq 0 was the dropped visit; the return to In Progress is 1, Peer Review 2.
+    assert "DR-9.notify.10-2" in {r.run_id for r in runs.list_runs()}
+    assert len(world.launch.windows) == 2
 
 
 def test_a_lost_snapshot_does_not_reuse_the_seq_of_runs_on_disk(world: World) -> None:
@@ -1231,23 +1347,55 @@ def test_a_retry_waits_while_tmux_cannot_say_what_is_running(world: World) -> No
     assert len(world.launch.windows) == 2
 
 
-def test_a_relaunch_clears_an_exit_file_left_by_an_earlier_attempt(world: World) -> None:
+def test_a_relaunch_clears_a_half_written_exit_file(world: World) -> None:
     config = _config(NOTIFY)
     world.launch.fail = "tmux: no server"
     _baseline(world, config)
     _move_to_review(world, config, T0 + timedelta(minutes=1))
     run = _only_run()
     assert (run.state, run.attempts) == (RunState.BLOCKED, 1)
-    runs.exit_path(run.run_id).write_text("0\n")
     runs.exit_tmp_path(run.run_id).write_text("0\n")
     world.launch.fail = ""
     world.tick(config, T0 + timedelta(minutes=2))
-    assert not runs.exit_path(run.run_id).exists()
     assert not runs.exit_tmp_path(run.run_id).exists()
     relaunched = _only_run()
+    assert relaunched.state is RunState.LAUNCHED
     world.panes = {relaunched.pane}
     world.tick(config, T0 + timedelta(minutes=3))
     assert _only_run().state is RunState.LAUNCHED
+
+
+def test_a_reported_failure_that_left_an_exit_status_is_not_relaunched(world: World) -> None:
+    """tmux said the launch failed, but the command ran: one execution per event."""
+    config = _config(NOTIFY)
+    world.launch.fail = "tmux new-window failed: timed out after 20 seconds"
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    run = _only_run()
+    runs.exit_path(run.run_id).write_text("0\n")
+    world.launch.fail = ""
+    world.tick(config, T0 + timedelta(minutes=2))
+    finished = _only_run()
+    assert (finished.state, finished.exit_code) == (RunState.DONE, 0)
+    assert len(world.launch.windows) == 1
+
+
+def test_a_reported_failure_whose_window_opened_is_adopted(world: World) -> None:
+    config = _config(NOTIFY)
+    world.launch.fail = "tmux new-window failed: timed out after 20 seconds"
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    run = _only_run()
+    assert (run.state, run.attempts) == (RunState.BLOCKED, 1)
+    # tmux now reports the window the "failed" attempt did open.
+    world.flow_panes = {run.run_id: "%7"}
+    world.panes = {"%7"}
+    world.launch.fail = ""
+    world.tick(config, T0 + timedelta(minutes=2))
+    adopted = _only_run()
+    assert (adopted.state, adopted.pane) == (RunState.LAUNCHED, "%7")
+    assert adopted.tmux_server == world.server
+    assert len(world.launch.windows) == 1
 
 
 # --- on_pr --------------------------------------------------------------------------
@@ -1707,3 +1855,314 @@ def test_a_broken_board_does_not_expire_a_waiting_idle_run(world: World, repo: P
     assert broken.errors
     world.tick(broken, T0 + timedelta(minutes=11))
     assert _only_run().state is RunState.AWAITING_CONFIRM
+
+
+# --- final review: a run launches the flow that made it -------------------------------
+
+
+def test_an_auto_command_run_edited_into_a_start_flow_never_launches_unapproved(
+    world: World, repo: Path
+) -> None:
+    v1 = _config({**NOTIFY, "name": "review"}, repos={"DR": str(repo)})
+    _baseline(world, v1)
+    runs.pause()
+    _move_to_review(world, v1, T0 + timedelta(minutes=1))
+    run = _only_run()
+    assert (run.state, run.reason, run.kind) == (RunState.BLOCKED, "paused", "command")
+    v2 = _config(REVIEW, repos={"DR": str(repo)})
+    runs.resume()
+    world.tick(v2, T0 + timedelta(minutes=2))
+    assert world.launch.windows == [] and world.launch.starts == []
+    run = _only_run()
+    assert (run.state, run.reason) == (RunState.SUPERSEDED, flows_tick.FLOW_CHANGED)
+
+
+def test_an_auto_run_whose_rule_now_wants_a_confirmation_does_not_launch(world: World) -> None:
+    _baseline(world, _config(NOTIFY))
+    runs.pause()
+    _move_to_review(world, _config(NOTIFY), T0 + timedelta(minutes=1))
+    runs.resume()
+    world.tick(_config({**NOTIFY, "mode": "confirm"}), T0 + timedelta(minutes=2))
+    assert world.launch.windows == []
+    assert _only_run().state is RunState.SUPERSEDED
+
+
+def test_an_approved_run_whose_template_changed_does_not_launch(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _approved_review(world, config)
+    edited = _config({**REVIEW, "start": "/implement {ticket}"}, repos={"DR": str(repo)})
+    world.tick(edited, T0 + timedelta(minutes=2))
+    assert world.launch.windows == []
+    assert (_only_run().state, _only_run().reason) == (
+        RunState.SUPERSEDED,
+        flows_tick.FLOW_CHANGED,
+    )
+
+
+def test_an_awaiting_run_whose_flow_changed_expires_before_it_can_be_approved(
+    world: World,
+) -> None:
+    config = _config(REVIEW)
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    world.tick(_config({**REVIEW, "start": "/implement {ticket}"}), T0 + timedelta(minutes=2))
+    run = _only_run()
+    assert (run.state, run.reason) == (RunState.EXPIRED, flows_tick.FLOW_CHANGED)
+
+
+def test_a_start_run_never_approved_does_not_launch(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    # Claimed by something other than `approve` (a hand-edited run file).
+    forged = runs.update(
+        "DR-1.review.10-1", expect={RunState.AWAITING_CONFIRM}, state=RunState.CLAIMED
+    )
+    assert forged is not None and not forged.approved_at
+    world.tick(config, T0 + timedelta(minutes=2))
+    assert world.launch.windows == []
+    assert _only_run().state is RunState.SUPERSEDED
+
+
+def test_approve_records_when(world: World) -> None:
+    config = _config(REVIEW)
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    approved, _ = runs.approve("DR-1.review.10-1", now=T0 + timedelta(minutes=3))
+    assert approved is not None and approved.approved_at == runs.iso(T0 + timedelta(minutes=3))
+
+
+# --- final review: held runs age out --------------------------------------------------------
+
+
+def test_an_approval_held_past_confirm_ttl_expires_instead_of_launching(
+    world: World, repo: Path
+) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)}, confirm_ttl="1h", max_event_age="3h")
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    runs.approve("DR-1.review.10-1", now=T0 + timedelta(minutes=2))
+    world.sessions = [_agent("s1", "DR-1")]
+    for minute in (3, 40, 61):
+        world.tick(config, T0 + timedelta(minutes=minute))
+        assert _only_run().state is RunState.BLOCKED
+    world.sessions = []  # the guard clears, more than an hour after the yes
+    world.tick(config, T0 + timedelta(minutes=63))
+    run = _only_run()
+    assert (run.state, run.reason) == (RunState.EXPIRED, flows_tick.HELD_TOO_LONG)
+    assert world.launch.windows == []
+
+
+def test_an_auto_run_held_by_a_long_pause_expires_on_resume(world: World) -> None:
+    config = _config(NOTIFY, confirm_ttl="1h", max_event_age="3h")
+    _baseline(world, config)
+    runs.pause()
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    world.tick(config, T0 + timedelta(minutes=50))
+    assert _only_run().state is RunState.BLOCKED
+    runs.resume()
+    world.tick(config, T0 + timedelta(minutes=62))
+    assert (_only_run().state, _only_run().reason) == (RunState.EXPIRED, flows_tick.HELD_TOO_LONG)
+    assert world.launch.windows == []
+
+
+def test_a_short_pause_still_dispatches_on_resume(world: World) -> None:
+    config = _config(NOTIFY)
+    _baseline(world, config)
+    runs.pause()
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    runs.resume()
+    world.tick(config, T0 + timedelta(minutes=5))
+    assert _only_run().state is RunState.LAUNCHED
+
+
+# --- final review: unknown never means unmet ------------------------------------------------
+
+
+def test_a_failed_session_scan_blocks_agent_launches(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)}, max_active_agents=1)
+    _approved_review(world, config)
+
+    def boom() -> list[AgentState]:
+        raise PermissionError("state dir unreadable")
+
+    deps = replace(world.deps(), sessions=boom)
+    flows_tick.run(config, deps=deps, now=T0 + timedelta(minutes=2))
+    run = _only_run()
+    assert (run.state, run.reason) == (
+        RunState.BLOCKED,
+        "session scan failed — cannot count live agents",
+    )
+    assert world.launch.windows == []
+
+
+@pytest.mark.parametrize("trigger", ["on_enter", "on_exit"])
+def test_a_statusless_recheck_blocks_rather_than_deciding(world: World, trigger: str) -> None:
+    rule = {"name": "x", trigger: "Peer Review", "command": "x.sh", "mode": "auto"}
+    config = _config({**rule, "assignee": "any"})
+    if trigger == "on_enter":
+        _baseline(world, config)
+        world.jira.put("DR-1", "Peer Review", "10")
+    else:
+        world.jira.put("DR-1", "Peer Review", "10")
+        world.tick(config, T0)
+        world.jira.put("DR-1", "In Progress", "3")
+    world.jira.fresh["DR-1"] = Issue(key="DR-1", status="", status_id="")
+    world.tick(config, T0 + timedelta(minutes=1))
+    run = _only_run()
+    assert (run.state, run.reason) == (RunState.BLOCKED, "Jira re-check returned no status")
+    assert world.launch.windows == []
+
+
+def test_a_recheck_answering_for_another_ticket_blocks(world: World) -> None:
+    config = _config(NOTIFY)
+    _baseline(world, config)
+    world.jira.fresh["DR-1"] = Issue(key="DR-2", status="Peer Review", status_id="10")
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    run = _only_run()
+    assert run.state is RunState.BLOCKED and "DR-2" in run.reason
+
+
+def test_an_approve_racing_expiry_is_still_checked_for_currency(
+    world: World, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = {"name": "triage", "on_pr": "opened", "command": "t.sh {ticket}"}
+    config = _config(triage, repos={"DR": str(repo)})
+    world.jira.put("DR-1", "In Progress", "3")
+    world.tick(config, T0)
+    world.prs["DR-1"] = []
+    world.tick(config, T0 + timedelta(minutes=6))
+    world.prs["DR-1"] = [_pr(5)]
+    world.tick(config, T0 + timedelta(minutes=12))
+    assert _only_run().state is RunState.AWAITING_CONFIRM
+    world.prs["DR-1"] = [_pr(5, state="CLOSED")]
+    real = flows_tick._tend_awaiting
+
+    def racing(ledger: Any, cfg: Any, snapshot: Any, r: Run, *, watching_sessions: bool) -> None:
+        runs.approve(r.run_id)  # y pressed in the f screen at this very moment
+        real(ledger, cfg, snapshot, r, watching_sessions=watching_sessions)
+
+    monkeypatch.setattr(flows_tick, "_tend_awaiting", racing)
+    world.tick(config, T0 + timedelta(minutes=18))
+    run = _only_run()
+    assert run.state is RunState.SUPERSEDED
+    assert world.launch.windows == []
+
+
+# --- final review: one event per block, not one per tick ------------------------------------
+
+
+def test_a_block_whose_reason_counts_up_logs_one_event(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _approved_review(world, config)
+    world.work["DR-1"] = WorkItem(key="DR-1", last_seen=(T0 + timedelta(minutes=1)).isoformat())
+    for minute in range(3, 9):
+        result = world.tick(config, T0 + timedelta(minutes=minute))
+    run = _only_run()
+    assert run.state is RunState.BLOCKED
+    assert run.block_key == "launch_guard:work_record"
+    assert len(_events(eventlog.EventKind.FLOW_BLOCKED)) == 1
+    # The tick still reports the up-to-date reason.
+    (note,) = [a for a in result.actions if a.verb == "blocked"]
+    assert note.detail.endswith("updated 7m ago")
+
+
+def test_a_block_for_a_different_guard_is_logged(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _approved_review(world, config)
+    world.sessions = [_agent("s1", "DR-1")]
+    world.tick(config, T0 + timedelta(minutes=2))
+    world.sessions = []
+    runs.pause()
+    world.tick(config, T0 + timedelta(minutes=3))
+    assert [e.extra["reason"] for e in _events(eventlog.EventKind.FLOW_BLOCKED) if e.extra] == [
+        "launch guard: session s1 is live on DR-1",
+        "paused",
+    ]
+
+
+# --- final review: a pane belongs to a tmux server ------------------------------------------
+
+
+def test_a_launched_run_records_its_tmux_server(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _approved_review(world, config)
+    world.panes = {"%1"}
+    world.tick(config, T0 + timedelta(minutes=2))
+    assert (_only_run().pane, _only_run().tmux_server) == ("%1", "100.1")
+
+
+def test_a_pane_id_reused_by_a_new_tmux_server_is_not_the_runs_pane(
+    world: World, repo: Path
+) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _approved_review(world, config)
+    world.panes = {"%1"}
+    world.tick(config, T0 + timedelta(minutes=2))
+    # Reboot: a new server, and an unrelated pane that happens to be %1.
+    world.server = "200.2"
+    world.tick(config, T0 + timedelta(minutes=3))
+    assert (_only_run().state, _only_run().reason) == (RunState.DONE, "agent window closed")
+
+
+def test_no_tmux_server_at_all_finishes_launched_runs(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _approved_review(world, config)
+    world.panes = {"%1"}
+    world.tick(config, T0 + timedelta(minutes=2))
+    world.panes, world.server = set(), ""  # what live_panes reports for "no server running"
+    world.tick(config, T0 + timedelta(minutes=3))
+    assert _only_run().state is RunState.DONE
+
+
+# --- final review: only facts tie a session to a ticket -------------------------------------
+
+
+def test_a_session_that_only_mentions_a_ticket_is_not_on_it() -> None:
+    chatter = AgentState.from_dict(
+        {
+            "session_id": "other-session",
+            "cwd": "/nowhere",
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "status": "IDLE",
+            "last_summary": "get-peer-reviews: DR-3 and DR-4 are waiting for you",
+            "schema_version": 4,
+        }
+    )
+    assert flows_tick._ticket_of(chatter) == ""
+    declared = replace(chatter, ticket="DR-3")
+    assert flows_tick._ticket_of(declared) == "DR-3"
+
+
+def test_the_launch_guard_ignores_a_dashboard_seeing_a_session(world: World) -> None:
+    eventlog.append(
+        eventlog.EventKind.SESSION_STARTED,
+        session_id="s1",
+        ticket="DR-1",
+        detail="claude in aim",
+        observed=True,
+    )
+    eventlog.append(eventlog.EventKind.SESSION_STARTED, ticket="DR-2", detail="old dashboard")
+    eventlog.append(
+        eventlog.EventKind.SESSION_STARTED,
+        ticket="DR-3",
+        detail="Claude in aim-DR-3",
+        provider="claude",
+        worktree="/x/aim-DR-3",
+    )
+    eventlog.append(
+        eventlog.EventKind.SESSION_STARTED,
+        ticket="DR-4",
+        detail="flow review in aim",
+        provider="claude",
+        run_id="DR-4.review.10-1",
+    )
+    assert set(flows_tick._recent_starts(600.0)) == {"DR-3", "DR-4"}
+
+
+def test_the_launch_guard_says_how_long_ago_a_session_started(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _approved_review(world, config)
+    world.starts = {"DR-1": (T0 - timedelta(minutes=3)).isoformat()}
+    world.tick(config, T0 + timedelta(minutes=2))
+    assert _only_run().reason == "launch guard: a session was started on DR-1 5m ago"

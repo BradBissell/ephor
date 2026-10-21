@@ -13,7 +13,8 @@ requests name each ticket, in the ticket's own worktree or its project's
 ``[repos]`` checkout:
 
 * ``opened`` — a PR is open now that the ticket's previous observation did
-  not have open (new, or reopened);
+  not have open. Its run is keyed on the PR number, so it fires once per
+  PR: a PR closed and reopened later does not fire again;
 * ``merged`` — a PR is merged now that was not merged before.
 
 A ``gh`` call costs a second, so the lookups are spaced ``[flows]

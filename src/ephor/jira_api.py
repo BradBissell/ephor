@@ -112,18 +112,45 @@ def done_statuses() -> frozenset[str]:
     return custom or _DEFAULT_DONE
 
 
-def credentials() -> Credentials | None:
-    """Configured Jira credentials, or None when ephor should stay offline.
+# Where each credential is read from, first match wins. ``EPHOR_JIRA_*``
+# comes first, so pointing ephor at a second site does not disturb the
+# ``JIRA_*`` names other tools already set. ``JIRA_USERNAME`` is what the
+# Atlassian MCP server calls the account email, so a shell set up for it
+# works here too.
+CREDENTIAL_ENV: dict[str, tuple[str, ...]] = {
+    "url": ("EPHOR_JIRA_URL", "JIRA_URL"),
+    "email": ("EPHOR_JIRA_EMAIL", "JIRA_EMAIL", "JIRA_USERNAME"),
+    "token": ("EPHOR_JIRA_TOKEN", "JIRA_API_TOKEN"),
+}
 
-    ``EPHOR_JIRA_*`` wins over the ``JIRA_*`` names other tools already set,
-    so pointing ephor at a second site does not disturb them.
-    """
-    base = os.environ.get("EPHOR_JIRA_URL") or os.environ.get("JIRA_URL") or ""
-    email = os.environ.get("EPHOR_JIRA_EMAIL") or os.environ.get("JIRA_EMAIL") or ""
-    token = os.environ.get("EPHOR_JIRA_TOKEN") or os.environ.get("JIRA_API_TOKEN") or ""
+
+def _credential(part: str) -> str:
+    for name in CREDENTIAL_ENV[part]:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return ""
+
+
+def credentials() -> Credentials | None:
+    """Configured Jira credentials, or None when ephor should stay offline."""
+    base, email, token = (_credential(part) for part in ("url", "email", "token"))
     if not (base and email and token):
         return None
     return Credentials(base_url=base.rstrip("/"), email=email, token=token)
+
+
+def missing_credentials() -> str:
+    """What is missing from the Jira configuration, naming every variable read; "" if nothing.
+
+    ``"email (EPHOR_JIRA_EMAIL, JIRA_EMAIL or JIRA_USERNAME)"`` tells someone
+    whose shell has the URL and the token exactly which one to add.
+    """
+    gaps = []
+    for part, names in CREDENTIAL_ENV.items():
+        if not _credential(part):
+            gaps.append(f"{part} ({', '.join(names[:-1])} or {names[-1]})")
+    return "; ".join(gaps)
 
 
 def is_configured() -> bool:

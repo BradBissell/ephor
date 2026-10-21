@@ -33,9 +33,11 @@ therefore names one *visit* to a status: a ticket that leaves Peer Review
 and comes back is a new visit with a new name, while the same visit seen on a
 hundred ticks keeps one. That pair is what a flow's run is keyed on.
 A ticket forgotten after :data:`DROP_AFTER_UNSEEN` leaves a small tombstone
-(``dropped``: its last seq), and if it comes back it continues from there:
-the run of its earlier visit keeps its file for a month, and a returning
-ticket restarting at seq 0 would collide with it and never fire.
+(``dropped``: its last seq and status). If it comes back in that same status
+it never moved, and it resumes its old visit — no transition, nothing fires
+again. If it comes back anywhere else it continues from its old seq: the run
+of its earlier visit keeps its file for a month, and a returning ticket
+restarting at seq 0 would collide with it and never fire.
 
 **The board's scope is part of what was seen.** ``scope`` fingerprints the
 search itself (projects plus JQL). When it changes, the tickets the new
@@ -281,17 +283,40 @@ class SessionSeen:
 
 @dataclass(frozen=True)
 class DroppedTicket:
-    """A ticket forgotten after DROP_AFTER_UNSEEN: the seq it had, and when."""
+    """A ticket forgotten after DROP_AFTER_UNSEEN: the seq and status it had, and when.
+
+    The status is what tells a return apart from a move: a ticket that comes
+    back in the status it left in never moved (the default JQL drops a Done
+    ticket after a week, and any later edit brings it back), so it resumes
+    its old visit. Tombstones written before the status was kept have none,
+    and a return to one of those still counts as a new visit.
+    """
 
     seq: int
     dropped_at: str
+    status: str = ""
+    status_id: str = ""
+
+    @property
+    def status_identity(self) -> str:
+        return self.status_id or self.status.strip().lower()
 
     def to_dict(self) -> dict[str, Any]:
-        return {"seq": self.seq, "dropped_at": self.dropped_at}
+        return {
+            "seq": self.seq,
+            "dropped_at": self.dropped_at,
+            "status": self.status,
+            "status_id": self.status_id,
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> DroppedTicket:
-        return cls(seq=_int(data.get("seq")), dropped_at=_str(data.get("dropped_at")))
+        return cls(
+            seq=_int(data.get("seq")),
+            dropped_at=_str(data.get("dropped_at")),
+            status=_str(data.get("status")),
+            status_id=_str(data.get("status_id")),
+        )
 
 
 @dataclass(frozen=True)
@@ -526,6 +551,15 @@ def advance(
             # A ticket that was here before and was forgotten continues its
             # count: its earlier visit's run may still be on disk.
             tomb = dropped.pop(key, None)
+            if (
+                tomb is not None
+                and tomb.status_identity
+                and tomb.status_identity == fresh.status_identity
+            ):
+                # Back in the status it was dropped in: the same visit, so no
+                # transition, and nothing fires a second time for it.
+                tickets[key] = replace(fresh, seq=tomb.seq)
+                continue
             seq = tomb.seq + 1 if tomb is not None else floor.get(key, 0)
             tickets[key] = replace(fresh, seq=seq)
             if previous is not None:
@@ -564,7 +598,9 @@ def advance(
         if unseen <= DROP_AFTER_UNSEEN:
             tickets[key] = replace(old, unseen_ticks=unseen)
         else:
-            dropped[key] = DroppedTicket(seq=old.seq, dropped_at=stamp)
+            dropped[key] = DroppedTicket(
+                seq=old.seq, dropped_at=stamp, status=old.status, status_id=old.status_id
+            )
 
     keep = TOMBSTONE_KEEP_DAYS * 86400.0
     for key, tomb in list(dropped.items()):
@@ -620,11 +656,13 @@ class RefreshResult:
             count = len(self.snapshot.on_board()) if self.snapshot else 0
             moved = len(self.transitions)
             return f"{count} ticket(s) on the board, {moved} moved"
+        if self.status is RefreshStatus.JIRA_OFF:
+            missing = jira_api.missing_credentials()
+            return f"Jira is not configured — missing {missing}" if missing else "Jira is off"
         return {
             RefreshStatus.LOCKED: "another tick is running — it will update the snapshot",
             RefreshStatus.NO_CONFIG: "no board.toml",
             RefreshStatus.BOARD_INVALID: "board.toml [board] has errors",
-            RefreshStatus.JIRA_OFF: "Jira is not configured (set EPHOR_JIRA_URL/EMAIL/TOKEN)",
             RefreshStatus.SEARCH_FAILED: "Jira search failed — snapshot left as it was",
             RefreshStatus.WRITE_FAILED: "could not write the snapshot",
         }[self.status]

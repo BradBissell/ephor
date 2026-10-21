@@ -45,6 +45,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypeVar
 
+from ephor import gitinfo
 from ephor.config import config_dir, ticket_projects
 from ephor.launcher import valid_tmux_session
 from ephor.providers import PROVIDERS
@@ -201,6 +202,23 @@ class FlowRule:
         )
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
+    @property
+    def action_fingerprint(self) -> str:
+        """Identity of *what this rule runs*: kind, template, provider, worktree.
+
+        The other half of :attr:`fingerprint`. A run records it when it is
+        created, and the tick refuses to launch a run whose rule now runs
+        something else — an approval is for the flow that was shown, and an
+        auto ``command =`` run must never come out the other side of an edit
+        as an unconfirmed agent launch.
+        """
+        canonical = json.dumps(
+            ["start" if self.launches_agent else "command", self.template, self.provider]
+            + ([self.worktree] if self.launches_agent else []),
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
     def render(self, *, ticket: str, title: str = "", status: str = "") -> str:
         """The rule's template with ``{ticket}``, ``{title}`` and ``{status}`` filled in.
 
@@ -265,18 +283,36 @@ class BoardConfig:
         has nowhere sensible to run, and guessing is how an agent ends up
         editing an unrelated checkout.
         """
-        if work is not None and work.worktree:
-            path = Path(work.worktree).expanduser()
-            if path.is_dir():
-                return path, "worktree"
         project = (ticket or "").partition("-")[0].upper()
         configured = self.repos.get(project)
+        if work is not None and work.worktree:
+            path = Path(work.worktree).expanduser()
+            # Only a linked worktree is the ticket's own. A session that ran
+            # in the repo root (a worktree = false flow, a hand-started
+            # agent) gets its checkout written on the work record too, and
+            # trusting that would send a worktree = true flow straight into
+            # the main checkout.
+            if (
+                path.is_dir()
+                and gitinfo.is_linked_worktree(path)
+                and not _same_dir(path, configured)
+            ):
+                return path, "worktree"
         if configured:
             path = Path(configured).expanduser()
             if path.is_dir():
                 return path, f"repos.{project}"
             return None, f"no repo: repos.{project} = {configured} does not exist"
         return None, "no repo"
+
+
+def _same_dir(path: Path, configured: str | None) -> bool:
+    if not configured:
+        return False
+    try:
+        return path.resolve() == Path(configured).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return False
 
 
 _ORDER_BY_RE = re.compile(r"(?is)^(.*?)\s*\border\s+by\b(.*)$")
@@ -477,6 +513,13 @@ def _parse_repos(raw: object, errors: list[str]) -> dict[str, str]:
             continue
         if not isinstance(value, str) or not value.strip():
             errors.append(f"[repos] {project}: must be a path")
+            continue
+        # A relative path would resolve against whichever process runs the
+        # tick — the dashboard, `flows watch`, a systemd timer — each with
+        # its own cwd, so one board.toml could send a flow to different
+        # checkouts, or none.
+        if not Path(value.strip()).expanduser().is_absolute():
+            errors.append(f"[repos] {project}: must be an absolute path (or start with ~)")
             continue
         repos[project] = value.strip()
     return repos

@@ -577,3 +577,13 @@ async def test_board_refreshes_never_overlap(
         app._on_board_data(None)  # a failed worker still clears the flag
         app._refresh_board()
         assert started == [True, True]
+
+
+def test_a_badge_never_shifts_the_status_column() -> None:
+    """The badge sits after the fixed-width key and status, so badged rows stay aligned."""
+    record = _ticket("Peer Review", "Fix bug")
+    plain = Content.from_markup(ticket_row_markup("DR-2", record)).plain
+    badged = Content.from_markup(ticket_row_markup("DR-2", record, "⏸ review?")).plain
+    assert badged.index("Peer Review") == plain.index("Peer Review")
+    assert badged.index("⏸ review?") > badged.index("Peer Review")
+    assert badged.index("Fix bug") > badged.index("⏸ review?")

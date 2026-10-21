@@ -41,6 +41,7 @@ def _sandbox_user_paths(
         "JIRA_URL",
         "JIRA_EMAIL",
         "JIRA_API_TOKEN",
+        "JIRA_USERNAME",
         "EPHOR_NOTIFY_URL",
         "EPHOR_NOTIFY_TOKEN",
         "EPHOR_PERMISSION_WAIT_SEC",

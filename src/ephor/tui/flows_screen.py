@@ -7,6 +7,11 @@ is where you answer it — ``y`` approves, ``n`` denies, ``escape`` closes.
 The keys are deliberately not ``a`` / ``d``. Those answer *permission
 requests* on the dashboard, and a muscle-memory ``a`` meant for a flow must
 never grant a session permission to run a tool, nor the other way round.
+For the same reason no key inside this screen ever reaches a session: the
+dashboard's ``enter`` (jump to a session's pane) and ``space`` (mark one)
+are priority bindings that would otherwise still fire under a modal, and a
+row's Selected message would otherwise bubble up to the app's jump. Both
+are swallowed here.
 
 Approving only moves the run to ``claimed`` (a compare-and-set on its file:
 see :mod:`ephor.flows.runs`); the tick does the dispatching, guards and all.
@@ -115,6 +120,11 @@ class FlowsScreen(ModalScreen[None]):
         Binding("f", "close", "close", show=False),
         Binding("j", "cursor_down", "down", show=False),
         Binding("k", "cursor_up", "up", show=False),
+        # Priority, so they are this screen's before the app's priority
+        # jump / mark bindings: Enter on a run must not switch the tmux
+        # client to whichever session the dashboard cursor was on.
+        Binding("enter", "nothing", show=False, priority=True),
+        Binding("space", "nothing", show=False, priority=True),
     ]
 
     DEFAULT_CSS = """
@@ -152,15 +162,25 @@ class FlowsScreen(ModalScreen[None]):
         self._paused = paused
         self._rows: list[RunRow] = []
         self._status: Static | None = None
+        self._title: Static | None = None
+
+    def _title_markup(self) -> str:
+        """The title, with the awaiting count as the rows show it now."""
+        shown = [row.flow_run for row in self._rows] if self._rows else self._runs
+        awaiting = sum(1 for r in shown if r.state is RunState.AWAITING_CONFIRM)
+        paused = "  [bold #f85149]PAUSED[/]" if self._paused else ""
+        return (
+            f"[bold]Flows[/]  [dim]{awaiting} awaiting · y approve · n deny · esc close[/]{paused}"
+        )
+
+    def _refresh_title(self) -> None:
+        if self._title is not None:
+            self._title.update(self._title_markup())
 
     def compose(self) -> ComposeResult:
-        awaiting = sum(1 for r in self._runs if r.state is RunState.AWAITING_CONFIRM)
-        paused = "  [bold #f85149]PAUSED[/]" if self._paused else ""
         with Vertical(id="flows-panel"):
-            yield Static(
-                f"[bold]Flows[/]  [dim]{awaiting} awaiting · y approve · n deny · esc close[/]{paused}",
-                id="flows-title",
-            )
+            self._title = Static(self._title_markup(), id="flows-title")
+            yield self._title
             self._rows = [RunRow(run) for run in self._runs]
             items = [ListItem(row) for row in self._rows]
             if not items:
@@ -204,10 +224,20 @@ class FlowsScreen(ModalScreen[None]):
             current = runs.load(row.flow_run.run_id)
             if current is not None:
                 row.show(current)
+            self._refresh_title()
             return
         row.show(updated)
+        self._refresh_title()
         if self._on_change is not None:
             self._on_change(updated)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        # A click (or Enter) on a run row selects nothing in the dashboard
+        # behind this screen.
+        event.stop()
+
+    def action_nothing(self) -> None:
+        """Enter and space: deliberately inert here (see the module docstring)."""
 
     def action_approve(self) -> None:
         self._answer(approve=True)

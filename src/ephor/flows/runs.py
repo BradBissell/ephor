@@ -19,7 +19,9 @@ After the claim, the run moves through a small state machine::
           ├─deny──► denied          ▼  │ (retried while the generation is current)
           └─ttl / ticket moved──► expired      blocked
                                     │
-          generation moved on ──► superseded      too many attempts ──► stuck
+          generation moved on, or the flow was edited ──► superseded
+          held (claimed / blocked) past confirm_ttl ──► expired
+          too many attempts, or an agent attempt unaccounted for ──► stuck
 
 Every change after the claim is a **compare-and-set** under the
 ``runs/.lock`` sidecar: the file is re-read under the lock, its state checked
@@ -234,6 +236,22 @@ class Run:
     pr_url: str = ""
     head_sha: str = ""
     session_id: str = ""
+    # When a human approved it ("" for a run that never waited for one). A
+    # start= run must carry it to launch, and an approved run that is held
+    # past confirm_ttl counts its age from here.
+    approved_at: str = ""
+    # What the rule ran when this run was created (FlowRule.action_fingerprint).
+    # A run whose rule now runs something else is superseded rather than
+    # launched: an approval is for the thing that was shown, not whatever
+    # board.toml says at dispatch time.
+    action: str = ""
+    # The guard that is holding a blocked run, without its changing numbers
+    # ("max_active_agents", "launch_guard:work_record"). A re-block for the
+    # same key writes nothing, so a parked run is one event, not one a tick.
+    block_key: str = ""
+    # The tmux server (pid.start_time) the run's pane belongs to. Pane ids
+    # restart at %0 with a new server, so a pane id alone outlives its pane.
+    tmux_server: str = ""
     schema_version: int = RUN_SCHEMA_VERSION
 
     @property
@@ -301,6 +319,10 @@ class Run:
             pr_url=_str(data.get("pr_url")),
             head_sha=_str(data.get("head_sha")),
             session_id=_str(data.get("session_id")),
+            approved_at=_str(data.get("approved_at")),
+            action=_str(data.get("action")),
+            block_key=_str(data.get("block_key")),
+            tmux_server=_str(data.get("tmux_server")),
             schema_version=_int(data.get("schema_version")) or RUN_SCHEMA_VERSION,
         )
 
@@ -500,10 +522,20 @@ def resolve(ref: str, candidates: Iterable[Run] | None = None) -> tuple[Run | No
     return matches[0], ""
 
 
-def approve(run_id: str) -> tuple[Run | None, str]:
-    """``awaiting_confirm`` → ``claimed``; the next tick dispatches it."""
+def approve(run_id: str, *, now: datetime | None = None) -> tuple[Run | None, str]:
+    """``awaiting_confirm`` → ``claimed``; the next tick dispatches it.
+
+    The approval is stamped (``approved_at``): a start= run launches only
+    with one, and a held approval ages out after ``confirm_ttl``.
+    """
+    moment = now or _now()
     updated = update(
-        run_id, expect={RunState.AWAITING_CONFIRM}, state=RunState.CLAIMED, reason="approved"
+        run_id,
+        expect={RunState.AWAITING_CONFIRM},
+        now=moment,
+        state=RunState.CLAIMED,
+        reason="approved",
+        approved_at=iso(moment),
     )
     if updated is None:
         return None, _refusal(run_id, "approve")

@@ -59,7 +59,10 @@ A few rules make repeated ticks safe:
 ## Setup
 
 1. **Configure Jira.** Export `EPHOR_JIRA_URL`, `EPHOR_JIRA_EMAIL` and
-   `EPHOR_JIRA_TOKEN` (an API token) in the shell that runs `ephor`.
+   `EPHOR_JIRA_TOKEN` (an API token) in the shell that runs `ephor`. The
+   names other tools use work too: `JIRA_URL`, `JIRA_EMAIL` (or
+   `JIRA_USERNAME`) and `JIRA_API_TOKEN`. `ephor flows check` says which
+   one is missing.
 2. **Write `~/.config/ephor/board.toml`.** Start from
    [`docs/examples/board.toml`](examples/board.toml). The smallest useful
    file is:
@@ -101,9 +104,14 @@ understood is the one most likely to launch something you didn't ask for.
 DR = "~/projects/work/aim-myt"
 ```
 
-This maps a project key to a checkout. A flow runs in the ticket's own
-worktree when ephor knows one (from its work record). Otherwise it runs in
-the `[repos]` path for the ticket's project. With neither, an agent flow is
+This maps a project key to a checkout. Paths must be absolute (or start
+with `~`): a tick runs from the dashboard, `ephor flows watch` or a timer,
+each with its own working directory, and a relative path would resolve
+differently in each. A flow runs in the ticket's own worktree when ephor
+knows one (from its work record, and only a linked `git worktree` counts —
+a session that ran in the repo root never makes the main checkout the
+ticket's worktree). Otherwise it runs in the `[repos]` path for the
+ticket's project. With neither, an agent flow is
 `blocked: no repo` rather than started in some other checkout, and a
 `command =` flow runs in `$HOME`. `on_pr` uses the same lookup to know
 which repo to ask `gh` about.
@@ -117,7 +125,7 @@ which repo to ask `gh` about.
 | `max_runs_per_hour` | `6` | Launches across all flows in the last hour. |
 | `ticket_breaker` | `3` | Launches for one ticket in the last hour before that ticket's flows are blocked. |
 | `max_event_age` | `"30m"` | A tick after a longer gap creates every run as `stale` and waiting for confirmation. |
-| `confirm_ttl` | `"24h"` | A run that nobody approves within this time expires. |
+| `confirm_ttl` | `"24h"` | A run that nobody approves within this time expires. So does an approved (or `auto`) run that a guard or a pause has held this long since it was approved (or created): a yes from days ago does not launch today. |
 | `pr_interval` | `"5m"` | Minimum spacing between rounds of `gh` lookups for `on_pr` rules. |
 | `settle` | `"10m"` | How long a session must be continuously idle for `on_session = "idle"`. |
 
@@ -161,7 +169,7 @@ becomes six sessions.
 |---|---|---|---|
 | `on_enter = "Peer Review"` | a ticket's status becomes the named one, including a ticket that appears on the board already in it | `<status_id>-<seq>`: one visit to the status | the ticket is still on that visit |
 | `on_exit = "In Progress"` | a ticket's status stops being the named one | `<status_id>-<seq>` of the visit that ended | the ticket hasn't moved again |
-| `on_pr = "opened"` | a PR naming the ticket is open and the previous lookup did not have it open (new, or reopened) | `pr<number>`: one PR | the PR is still open |
+| `on_pr = "opened"` | a PR naming the ticket is open and the previous lookup did not have it open. Fires once per PR number: a PR closed and reopened later does not fire again | `pr<number>`: one PR | the PR is still open |
 | `on_pr = "merged"` | a PR naming the ticket is merged and was not merged at the previous lookup | `pr<number>` | always (a merge is final) |
 | `on_session = "died"` | a session bound to the ticket was alive at the previous tick and its agent process has now exited | the session id's first 12 characters | always |
 | `on_session = "idle"` | a session bound to the ticket has been IDLE, or waiting for your input, with no further hook event for `settle`, and wasn't at the previous tick. `command=` only (see the launch guard below) | the session id's first 12 characters | the session stays idle |
@@ -244,7 +252,9 @@ awaiting_confirm ──approve──► claimed ──► launched ──► don
       ├─deny──► denied          ▼  │ (retried while the event is current)
       └─ttl / event over──► expired      blocked
                                 │
-      event over ──► superseded      too many attempts ──► stuck
+      event over, or flow edited ──► superseded
+      held past confirm_ttl ──► expired
+      too many attempts ──► stuck
 ```
 
 Before a claimed run launches, the guards are checked in this order:
@@ -253,17 +263,39 @@ Before a claimed run launches, the guards are checked in this order:
 2. `max_runs_per_hour`;
 3. `ticket_breaker`;
 4. agent flows only: `max_active_agents`, and the **launch guard**. The
-   guard refuses if a live session is already bound to the ticket, a
-   session was started on it in the last 10 minutes, or its work record was
-   touched in the last 10 minutes;
+   guard refuses if a live session is already bound to the ticket (by a
+   fact — a pin, `EPHOR_TICKET`, its branch — not a session that merely
+   mentions the key), a session was launched on it in the last 10 minutes
+   (a dashboard restart seeing existing sessions does not count), or its
+   work record was touched in the last 10 minutes. A session scan that
+   fails blocks too: an unknown count is not zero;
 5. an uncached re-read of the ticket from Jira. An `on_enter` run whose
    ticket has already left the status is superseded, and so is any
-   `assignee = "me"` run whose ticket is no longer yours.
+   `assignee = "me"` run whose ticket is no longer yours. A re-read that
+   comes back without a status blocks the run (unknown, not moved).
 
 If a guard says "not now", the run is `blocked` with the reason, and every
-tick retries it for as long as its event is current. A launch that never
-reports a window is retried after 10 minutes, up to 3 attempts, and then
-marked `stuck`.
+tick retries it for as long as its event is current — up to `confirm_ttl`
+from its approval (or, for an `auto` run, its creation), after which it
+expires as `held past confirm_ttl`. A blocked run is logged once per guard,
+not once per tick. A launch that never reports a window is retried after 10
+minutes, up to 3 attempts, and then marked `stuck`; before any retry the
+tick looks for the earlier attempt's window and exit status, and adopts
+them rather than starting the flow twice. An agent flow is never relaunched
+on a guess: if its earlier attempt left no window, the event log decides
+whether that agent ran (`done`) or nobody can tell (`stuck`).
+
+A run launches the flow that created it. If you edit a flow in
+`board.toml` so that it runs something else (another template, provider or
+`worktree`, or `command =` changed to `start =`), its pending runs are
+superseded (`flow changed since this run was created`) rather than
+launched, and its waiting ones expire before you can approve them. A flow
+that now needs a confirmation only launches runs somebody approved.
+
+**Pause holds runs; it does not drop them.** Events that arrive while
+flows are paused still create runs, parked as `blocked: paused`.
+`ephor flows resume` says how many are held; they dispatch on the next
+tick, except any held longer than `confirm_ttl`, which expire.
 
 The launch guard is what makes `on_pr = "opened"` → `/review-pr` work as a
 hand-off. The implementing session opens the PR and is usually still alive,
@@ -282,13 +314,13 @@ say), or use `on_session = "died"` to start a fresh one after it ends.
 
 | Command | Does |
 |---|---|
-| `ephor flows check` | Validate board.toml, print the search JQL and every flow, probe Jira `/myself` |
+| `ephor flows check` | Validate board.toml, print the search JQL and every flow, probe Jira `/myself`, and run the board search once |
 | `ephor flows board [--refresh]` | Print the lanes from the last snapshot (`--refresh` runs a tick first) |
 | `ephor flows tick [--dry-run]` | Run one tick. `--dry-run` reads everything and writes and launches nothing |
 | `ephor flows watch [--interval 60]` | Tick every interval until Ctrl-C, printing only when something happened |
 | `ephor flows ls [--all]` | Runs, newest first (finished ones for a day, or all with `--all`) |
 | `ephor flows approve <run>` / `deny <run>` | Answer a run that is awaiting confirmation. `<run>` may be a unique prefix, but the ticket key must be typed whole |
-| `ephor flows pause` / `resume` | Stop / restart all dispatching |
+| `ephor flows pause` / `resume` | Stop / restart all dispatching. `resume` says how many held runs will go |
 
 In the dashboard, `g` cycles to the `status` grouping. Tickets with no live
 session appear as ticket rows, and rows show a badge for their ticket's
@@ -476,8 +508,12 @@ if __name__ == "__main__":
 
 The flow's tmux window stays open until the program exits, so you can
 watch it. `ephor flows ls` then shows the run as `done` or `failed`, with
-its exit code. A graph that should start an agent can run `ephor start
-"$EPHOR_TICKET" --prompt "..."` as one of its steps.
+its exit code.
+
+To start an agent, use a `start =` flow: it is confirm-only, counted
+against `max_active_agents`, and held by the launch guard. A `command =`
+flow that launches agents itself (say, a graph step that runs `ephor
+start`) bypasses all of those, so give it `mode = "confirm"`.
 
 ## Running flows when the dashboard is closed
 
@@ -536,6 +572,10 @@ or the session doesn't exist, stays `blocked` and is retried on each tick.
 
 ## Troubleshooting
 
+- **The header says `FLOWS ✗`.** The dashboard could not refresh the board
+  or run its flows: board.toml has errors, Jira is not configured or
+  rejected the search, or the snapshot has not been refreshed for a while.
+  The text beside it says which; `ephor flows check` has the detail.
 - **Nothing fires.** Run `ephor flows tick --dry-run`. On the first tick,
   and the first tick after you add a rule, the rule adopts the board
   (`adopted …`), and only later moves fire it. Check `ephor flows check`

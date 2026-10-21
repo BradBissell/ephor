@@ -240,17 +240,40 @@ def test_a_worktree_agent_flow_passes_the_flow_env_to_the_launcher(tmp_path: Pat
 
 def test_live_panes(monkeypatch: pytest.MonkeyPatch) -> None:
     def ok(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess([], 0, stdout="%1\n%22\n\n", stderr="")
+        return subprocess.CompletedProcess(
+            [], 0, stdout="41.1700000000\t%1\n41.1700000000\t%22\n\n", stderr=""
+        )
 
-    def down(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess([], 1, stdout="", stderr="no server running")
+    def no_server(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="no server running on /tmp/tmux-1000/default"
+        )
+
+    def no_socket(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="error connecting to /tmp/tmux-1000/default"
+        )
+
+    def broken(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 1, stdout="", stderr="lost server")
 
     def missing(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
         raise FileNotFoundError("tmux")
 
     monkeypatch.setattr(subprocess, "run", ok)
-    assert runners.live_panes() == {"%1", "%22"}
-    monkeypatch.setattr(subprocess, "run", down)
+    live = runners.live_panes()
+    assert live == runners.LivePanes("41.1700000000", frozenset({"%1", "%22"}))
+    assert live.has("%1") and live.has("%1", "41.1700000000")
+    # Same pane id on a different server: a pane that only shares the number.
+    assert not live.has("%1", "7.1600000000")
+    assert not live.has("%5")
+    # No server is an answer: nothing is running.
+    monkeypatch.setattr(subprocess, "run", no_server)
+    assert runners.live_panes() == runners.LivePanes("", frozenset())
+    monkeypatch.setattr(subprocess, "run", no_socket)
+    assert runners.live_panes() == runners.LivePanes("", frozenset())
+    # Anything else is unknown.
+    monkeypatch.setattr(subprocess, "run", broken)
     assert runners.live_panes() is None
     monkeypatch.setattr(subprocess, "run", missing)
     assert runners.live_panes() is None

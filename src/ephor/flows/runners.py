@@ -299,15 +299,51 @@ def _launch_command(
     return LaunchOutcome(True, message, window=window, pane=pane)
 
 
-def live_panes() -> set[str] | None:
-    """Every tmux pane id that exists right now, or None when tmux did not answer.
+# What tmux prints when there is no server on its socket to ask. That is an
+# answer — no pane exists — not a failure to get one.
+_NO_SERVER_RE = re.compile(r"no server running|error connecting to", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class LivePanes:
+    """Every pane tmux has right now, and which server it is.
+
+    ``server`` is ``<pid>.<start_time>``: pane ids are a per-server counter
+    that restarts at %0, so after a reboot or a ``kill-server`` the pane id
+    a run recorded can name an unrelated pane. A run records the server its
+    pane was opened on, and a different server means its pane is gone.
+    ``server`` is "" when no server is running (and ``panes`` is empty).
+    """
+
+    server: str
+    panes: frozenset[str]
+
+    def has(self, pane: str, server: str = "") -> bool:
+        """True when ``pane`` (opened on ``server``, if known) still exists."""
+        if pane not in self.panes:
+            return False
+        return not server or not self.server or server == self.server
+
+
+def live_panes() -> LivePanes | None:
+    """Every tmux pane that exists right now, or None when tmux did not answer.
 
     None is "unknown", never "every pane is gone": a tick that cannot reach
-    the tmux server must not mark every launched run finished.
+    the tmux server must not mark every launched run finished. A tmux that
+    says there is no server at all *has* answered, and the answer is no
+    panes.
     """
     try:
         proc = subprocess.run(
-            ["/usr/bin/env", "tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+            [
+                "/usr/bin/env",
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                # The server's pid and start time, then the pane.
+                "#{pid}.#{start_time}\t#{pane_id}",
+            ],
             capture_output=True,
             text=True,
             timeout=_TMUX_TIMEOUT_SEC,
@@ -316,8 +352,18 @@ def live_panes() -> set[str] | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
+        if _NO_SERVER_RE.search(proc.stderr or ""):
+            return LivePanes(server="", panes=frozenset())
         return None
-    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    server = ""
+    panes: set[str] = set()
+    for line in proc.stdout.splitlines():
+        ident, _, pane = line.strip().rpartition("\t")
+        if not pane.strip():
+            continue
+        panes.add(pane.strip())
+        server = server or ident.strip()
+    return LivePanes(server=server, panes=frozenset(panes))
 
 
 def flow_panes() -> dict[str, str] | None:

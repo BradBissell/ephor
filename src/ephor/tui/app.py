@@ -31,6 +31,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
 from textual.css.query import NoMatches
+from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, ListItem, ListView, Static
 
 from ephor import eventlog, gitinfo, jira, launcher, permissions, ticket_pins, work_items
@@ -269,6 +270,9 @@ class EphorApp(App[int]):
         # A tick was asked for (a run was just approved) while one was
         # running; run another as soon as it lands.
         self._board_rerun: bool = False
+        # The last board health the app toasted ("" = fine), so a problem is
+        # announced once when it starts and once when it clears.
+        self._flows_health: str = ""
         # session_id -> the other sessions sharing its worktree. Recomputed
         # each refresh from cwds we already have; see gitinfo.collisions.
         self._collisions: dict[str, tuple[str, ...]] = {}
@@ -606,6 +610,9 @@ class EphorApp(App[int]):
                     session_id=sid,
                     ticket=ticket,
                     detail=f"{agent.provider or 'agent'} in {agent.project_name or agent.cwd}",
+                    # First sight by this dashboard, not a launch: the flows
+                    # launch guard must not read a restart as a new agent.
+                    observed=True,
                 )
             elif previous != current:
                 eventlog.append(
@@ -1012,7 +1019,9 @@ class EphorApp(App[int]):
         """
         summary = StatusSummary.from_agents(agents)
         if self._header_bar is not None:
-            self._header_bar.update_summary(summary, self._lanes.awaiting_count)
+            self._header_bar.update_summary(
+                summary, self._lanes.awaiting_count, self._lanes.health()
+            )
         if self._summary_line is not None:
             self._summary_line.update(
                 _render_summary_line(
@@ -1029,9 +1038,20 @@ class EphorApp(App[int]):
 
     # ---- actions --------------------------------------------------------
 
+    def _on_dashboard(self) -> bool:
+        """True when the session list is the screen in front (no modal over it).
+
+        The app's ``enter`` and ``space`` are priority bindings, which stay in
+        the binding chain under a modal screen; a session action reached from
+        inside the flows screen would act on whatever session the hidden
+        cursor was on.
+        """
+        return not isinstance(self.screen, ModalScreen)
+
     async def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Backstop for Enter: ListView's own Selected event also fires the jump."""
-        del event  # unused
+        if event.list_view.id != "session-list":
+            return
         await self.action_jump()
 
     async def action_refresh(self) -> None:
@@ -1213,6 +1233,8 @@ class EphorApp(App[int]):
 
     def action_toggle_select(self) -> None:
         """Mark or unmark the row under the cursor for a batch action."""
+        if not self._on_dashboard():
+            return
         list_view = self.query_one(ListView)
         row_id = self._cursor_sid(list_view)
         if row_id is None:
@@ -1266,6 +1288,9 @@ class EphorApp(App[int]):
         # hide nothing and confuse everything.
         self._collapsed.clear()
         self._lanes.reset_folds()
+        if self._group_by == "status" and self._lanes.config is None:
+            self._set_toast("grouping: status — no board.toml, default lanes (see docs/flows.md)")
+            return
         if self._group_by == "status" and self._lanes.board_errors:
             count = len(self._lanes.board_errors)
             self._set_toast(
@@ -1498,6 +1523,8 @@ class EphorApp(App[int]):
             self._set_toast(f"summarizing {started} sessions…")
 
     async def action_jump(self) -> None:
+        if not self._on_dashboard():
+            return
         list_view = self.query_one(ListView)
 
         # Enter inside the ticket prompt means "save this pin", not "jump".
@@ -2088,6 +2115,17 @@ class EphorApp(App[int]):
             # Approved: dispatch now rather than on the next one-minute pass.
             self._request_tick()
 
+    def _note_flows_health(self) -> None:
+        """Toast once when the board's health changes (the header keeps showing it)."""
+        health = self._lanes.health()
+        if health == self._flows_health:
+            return
+        if health:
+            self._set_toast(f"flows: {health}")
+        elif self._flows_health:
+            self._set_toast("flows: board refresh is working again")
+        self._flows_health = health
+
     def _request_tick(self) -> None:
         """Run a tick as soon as possible — now, or right after the one in flight."""
         if self._board_in_flight:
@@ -2128,6 +2166,7 @@ class EphorApp(App[int]):
         self._board_in_flight = False
         if data is not None:
             self._lanes.apply(data)
+            self._note_flows_health()
         if self._board_rerun:
             self._board_rerun = False
             self._refresh_board()

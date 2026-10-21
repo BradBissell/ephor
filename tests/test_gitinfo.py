@@ -193,3 +193,13 @@ def test_worktree_of_resolves_a_real_checkout(tmp_path: Path) -> None:
     gitinfo.clear_cache()
     assert gitinfo.worktree_of(tmp_path) is None
     assert gitinfo.worktree_of(None) is None
+
+
+def test_is_linked_worktree_tells_a_linked_worktree_from_the_main_one(tmp_path: Path) -> None:
+    main = _repo(tmp_path / "main")
+    _git(main, "worktree", "add", "-q", "-b", "DR-1-x", str(tmp_path / "main-DR-1"))
+    assert gitinfo.is_linked_worktree(tmp_path / "main-DR-1")
+    assert not gitinfo.is_linked_worktree(main)
+    assert not gitinfo.is_linked_worktree(tmp_path)
+    assert not gitinfo.is_linked_worktree(tmp_path / "missing")
+    assert not gitinfo.is_linked_worktree(None)

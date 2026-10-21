@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 
 from textual.widgets import Static
 
@@ -46,13 +47,15 @@ from ephor.flows import printable, runs, ticket_sort_key
 from ephor.flows import snapshot as board_snapshot
 from ephor.flows import tick as flows_tick
 from ephor.flows.runs import Run, RunState
-from ephor.flows.snapshot import RefreshResult, Snapshot, TicketState
+from ephor.flows.snapshot import RefreshResult, RefreshStatus, Snapshot, TicketState
 from ephor.state.models import AgentState
 from ephor.tui.rows import group_row_id, virtual_row_id
 
 # The tick's cadence, from the TUI. Tickets move when a human drags a card,
 # and one search covers the whole board, so this is one request a minute.
 SNAPSHOT_REFRESH_INTERVAL = 60.0
+# A snapshot older than this many tick intervals is reported as stale.
+_STALE_INTERVALS = 2.0
 
 
 def markup_text(text: str, limit: int | None = None) -> str:
@@ -83,6 +86,9 @@ class LaneData:
     # Every flow run on disk, newest first — for badges, the header count
     # and the `f` screen.
     runs: tuple[Run, ...] = ()
+    # Which Jira credentials are missing ("" when configured), read on the
+    # worker so the render path never touches the environment.
+    jira_missing: str = ""
 
 
 def gather(*, refresh: bool) -> LaneData:
@@ -105,6 +111,7 @@ def gather(*, refresh: bool) -> LaneData:
         work_status=statuses,
         result=result,
         runs=tuple(runs.list_runs()),
+        jira_missing=jira_api.missing_credentials() if config is not None else "",
     )
 
 
@@ -156,6 +163,39 @@ class Lanes:
     @property
     def last_result(self) -> RefreshResult | None:
         return self._data.result
+
+    def health(self, now: datetime | None = None) -> str:
+        """What is wrong with the board and its flows, in a few words; "" when nothing is.
+
+        A broken board.toml or a failing tick otherwise looks exactly like a
+        quiet board: the lanes keep drawing the last snapshot and no run is
+        ever created. The header bar shows this, and the app toasts it once
+        when it changes. Without a board.toml there is nothing to report.
+        """
+        config = self._data.config
+        if config is None:
+            return ""
+        if config.board_errors:
+            return f"board.toml [board] has {len(config.board_errors)} error(s) — ephor flows check"
+        problems: list[str] = []
+        if config.flow_errors:
+            problems.append(
+                f"board.toml has {len(config.flow_errors)} flow error(s), no flow runs"
+                " — ephor flows check"
+            )
+        if self._data.jira_missing:
+            problems.append(f"Jira not configured — missing {self._data.jira_missing}")
+        result = self._data.result
+        if result is not None and result.status not in _HEALTHY:
+            problems.append(f"board: {result.message}")
+        snap = self._data.snapshot
+        # Only once this dashboard has tried a tick: the snapshot read at
+        # start-up is old by design until the first one lands.
+        if result is not None and snap is not None:
+            age = snap.age_sec(now)
+            if age is not None and age > _STALE_INTERVALS * SNAPSHOT_REFRESH_INTERVAL:
+                problems.append(f"snapshot {_age_words(age)} old")
+        return " · ".join(problems)
 
     @property
     def settings(self) -> BoardSettings:
@@ -303,9 +343,22 @@ class Lanes:
         return "  " + "  ·  ".join(parts)
 
 
-def ticket_row_markup(key: str, record: TicketState | None, badge: str = "") -> str:
-    """One ticket row: key, flow badge, status, title — dimmed, because nothing is running.
+_HEALTHY = frozenset({RefreshStatus.OK, RefreshStatus.LOCKED})
 
+
+def _age_words(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def ticket_row_markup(key: str, record: TicketState | None, badge: str = "") -> str:
+    """One ticket row: key, status, flow badge, title — dimmed, because nothing is running.
+
+    The badge comes after the fixed-width key and status columns, as on a
+    session row, so a badged row lines up with the rest of its lane.
     Every value is ticket text, typed by whoever edits the ticket, so all of
     it is escaped and stripped of control characters before it is markup.
     """
@@ -317,8 +370,8 @@ def ticket_row_markup(key: str, record: TicketState | None, badge: str = "") -> 
     who = markup_text(record.assignee, 24)
     tail = f"  [dim]{who}[/]" if who else ""
     return (
-        f"   [dim]◇[/] [bold]{markup_text(key):<10}[/] {flag}"
-        f"[#EBCB8B]{status:<14}[/] [dim]{title}[/]{tail}"
+        f"   [dim]◇[/] [bold]{markup_text(key):<10}[/] "
+        f"[#EBCB8B]{status:<14}[/] {flag}[dim]{title}[/]{tail}"
     )
 
 

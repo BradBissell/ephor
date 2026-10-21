@@ -289,3 +289,140 @@ def test_gather_runs_the_tick_when_jira_is_configured(
     assert len(calls) == 1
     assert data.result is not None and not data.result.ok
     assert data.snapshot is not None and "DR-3" in data.snapshot.tickets
+
+
+# --- keys inside the flows screen never reach a session -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enter_space_and_clicks_in_the_flows_screen_never_act_on_a_session(
+    fleet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ephor.tui import app as app_module
+
+    jumped: list[object] = []
+    monkeypatch.setattr(app_module, "jump_to", lambda agent: jumped.append(agent))
+    app = EphorApp(manager=StateManager(fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _status(app)
+        session_list = app.query_one("#session-list", app_module.ListView)
+        session_list.index = app._sid_by_row.index("s1")
+        await pilot.pause()
+        await pilot.press("f")
+        await pilot.pause()
+        assert isinstance(app.screen, FlowsScreen)
+        await pilot.press("down", "space", "enter")
+        await pilot.pause()
+        await pilot.click("#flows-list ListItem")
+        await pilot.pause()
+        assert isinstance(app.screen, FlowsScreen)
+        assert jumped == []
+        assert app._selected == set()
+        # Calling the actions directly while the modal is up is inert too.
+        await app.action_jump()
+        app.action_toggle_select()
+        assert jumped == [] and app._selected == set()
+        await pilot.press("escape")
+        await pilot.pause()
+        # Back on the dashboard, space marks the session under the cursor again.
+        await pilot.press("space")
+        await pilot.pause()
+        assert app._selected == {"s1"}
+
+
+@pytest.mark.asyncio
+async def test_the_flows_title_counts_what_the_rows_show_now(fleet: Path) -> None:
+    app = EphorApp(manager=StateManager(fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        app._refresh_board = lambda: None  # type: ignore[method-assign]
+        await pilot.press("f")
+        await pilot.pause()
+        title = app.screen.query_one("#flows-title")
+        assert "1 awaiting" in str(title.render())
+        await pilot.press("y")
+        await pilot.pause()
+        assert "0 awaiting" in str(title.render())
+
+
+# --- the board says when it is not working ------------------------------------------------
+
+
+def _health_config(text: str) -> board.BoardConfig:
+    config = board.parse(__import__("tomllib").loads(text))
+    return config
+
+
+def test_health_is_quiet_without_a_board_and_when_all_is_well() -> None:
+    assert Lanes().health() == ""
+    ok = _health_config(_BOARD)
+    now = datetime.now(UTC)
+    fresh = Snapshot(taken_at=now.isoformat())
+    result = snap.RefreshResult(snap.RefreshStatus.OK, snapshot=fresh)
+    assert Lanes(LaneData(config=ok, snapshot=fresh, result=result)).health(now) == ""
+    locked = snap.RefreshResult(snap.RefreshStatus.LOCKED, snapshot=fresh)
+    assert Lanes(LaneData(config=ok, snapshot=fresh, result=locked)).health(now) == ""
+
+
+def test_health_reports_flow_errors_a_failing_search_and_a_stale_snapshot() -> None:
+    broken = _health_config(
+        _BOARD + '\n[[flow]]\nname = "review"\non_enter = "Peer Review"\n'
+        'start = "/review-pr {ticket}"\nmode = "auto"\n'
+    )
+    assert broken.flow_errors and broken.lanes_ok
+    assert "1 flow error(s)" in Lanes(LaneData(config=broken)).health()
+
+    now = datetime.now(UTC)
+    old = Snapshot(taken_at=(now - timedelta(hours=2)).isoformat())
+    failed = snap.RefreshResult(snap.RefreshStatus.SEARCH_FAILED, snapshot=None)
+    health = Lanes(LaneData(config=_health_config(_BOARD), snapshot=old, result=failed)).health(now)
+    assert "Jira search failed" in health and "snapshot 2h old" in health
+
+    off = Lanes(LaneData(config=_health_config(_BOARD), jira_missing="email (X or Y)"))
+    assert off.health() == "Jira not configured — missing email (X or Y)"
+
+    bad_board = _health_config('[board]\ncolumns = []\nprojects = ["DR"]\n')
+    assert "[board] has" in Lanes(LaneData(config=bad_board)).health()
+
+
+def test_the_header_shows_a_flows_problem() -> None:
+    summary = StatusSummary()
+    assert "FLOWS ✗" not in _plain(format_header(summary))
+    shown = _plain(format_header(summary, flows_problem="board: Jira search failed [x]"))
+    assert "FLOWS ✗ board: Jira search failed [x]" in shown
+
+
+@pytest.mark.asyncio
+async def test_a_change_in_board_health_is_toasted_once(fleet: Path) -> None:
+    app = EphorApp(manager=StateManager(fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        config = _health_config(_BOARD)
+        failed = snap.RefreshResult(snap.RefreshStatus.SEARCH_FAILED)
+        toasts: list[str] = []
+        app._set_toast = toasts.append  # type: ignore[method-assign]
+        app._flows_health = ""
+        app._on_board_data(LaneData(config=config, result=failed))
+        app._on_board_data(LaneData(config=config, result=failed))
+        assert toasts == ["flows: board: Jira search failed — snapshot left as it was"]
+        ok = snap.RefreshResult(snap.RefreshStatus.OK, snapshot=Snapshot(taken_at=""))
+        app._on_board_data(LaneData(config=config, result=ok))
+        assert toasts[-1] == "flows: board refresh is working again"
+        assert app._header_bar is not None
+
+
+@pytest.mark.asyncio
+async def test_status_grouping_without_a_board_says_where_to_look(tmp_path: Path) -> None:
+    directory = tmp_path / "sessions"
+    directory.mkdir()
+    app = EphorApp(manager=StateManager(directory))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        toasts: list[str] = []
+        app._set_toast = toasts.append  # type: ignore[method-assign]
+        while app._group_by != "status":
+            app.action_cycle_grouping()
+        assert toasts[-1] == "grouping: status — no board.toml, default lanes (see docs/flows.md)"
