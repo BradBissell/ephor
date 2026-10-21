@@ -102,7 +102,9 @@ src/ephor/
 ├── audit.py                   ← session cost/speed joined to outcome (`ephor audit`)
 ├── launcher.py                ← `ephor start` / `ephor resume`: worktree + tmux + $EPHOR_TICKET
 ├── permissions.py             ← writes the decisions the hook handler emits
-├── jira_api.py                ← opt-in Jira read: status, summary, assignee, drift
+├── jira_api.py                ← opt-in Jira read: status, summary, assignee, drift, board search
+├── board.py                   ← board.toml: lanes, repos, flow rules (validated, errors collected)
+├── filelock.py                ← sidecar flock for stores written from more than one process
 └── notify.py                  ← opt-in push (ntfy/webhook); policy engine that decides
                                what is worth interrupting you for
 ```
@@ -130,9 +132,30 @@ deleted branch cannot turn a settled fact back into an amber guess).
 | File | Writer | Lock |
 |---|---|---|
 | `sessions/<sid>.json` | the hook handler, only | per-session flock |
-| `work/<KEY>.json` | ephor (TUI, CLI, launcher) | none — single writer |
+| `work/<KEY>.json` | ephor (TUI, CLI, launcher, flows tick) | `work/.lock` flock around every load-merge-save |
 | `pending/<sid>.json` | ephor; **read + deleted** by the hook | none — create/consume |
-| `events.ndjson` | the TUI | none — `O_APPEND`, one line per write |
+| `events.ndjson` | the TUI, the launcher, the flows tick | `events.ndjson.lock` flock around rotate + `O_APPEND` write |
+| `flows/snapshot.json` | the flows tick, only | `flows/tick.lock` (non-blocking); atomic rename, written last |
+| `flows/runs/<run_id>.json` | the flows tick; approve/deny (CLI, TUI) | `O_EXCL` create claims a run; every later read-check-write (tick transitions, approve/deny) holds the `flows/runs/.lock` sidecar flock (short, blocking with timeout) and re-reads the state under it; approve/deny refuse unless the state is still `awaiting_confirm` |
+| `flows/payloads/<run_id>.json` | the flows tick | none — written once before launch, 0600 |
+| `flows/paused` | `ephor flows pause` / `resume` | none — presence is the flag |
+
+Until the flows tick, ephor itself was effectively a single writer of work
+records and event-log lines, so neither needed a lock. The tick runs from a
+TUI worker thread, from `ephor flows watch`, or from a systemd timer — all at
+once, potentially — so both stores now take a sidecar flock
+(`ephor/filelock.py`) around their read-modify-write. A sidecar, because the
+data files are replaced by rename and a lock on a renamed-away inode guards
+nothing. The locks are fail-open: a writer that cannot get one within a
+quarter of a second proceeds unlocked, exactly as before, rather than wedging
+the dashboard — the TUI makes these writes on its event-loop thread.
+
+Run files need more than atomic rename: approve can read `awaiting_confirm`
+while a tick expires or supersedes the run, and approve's rename would then
+bring it back as `claimed`. So every run update re-reads and re-checks the
+state under `flows/runs/.lock`. That is a separate lock from `flows/tick.lock`
+because the tick holds `tick.lock` across Jira and `gh` calls, and an approve
+from the dashboard must not wait seconds behind the network.
 
 The invariant `docs/architecture.md` has always promised holds unchanged:
 **the hook is still the only writer of session state files.** `ephor start`

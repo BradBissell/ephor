@@ -268,3 +268,132 @@ def test_resolver_falls_back_to_the_path_outside_a_repo(
     resolver = PrResolver()
     assert resolver.resolve(tmp_path) is not None
     assert resolver.cached(tmp_path) is not None
+
+
+# ---- head sha + ticket-wide lookup (flows) --------------------------------
+
+
+def test_pr_fields_carry_the_head_sha(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = json.dumps({**json.loads(_PR_JSON), "headRefOid": "abc123"})
+    monkeypatch.setattr(gh.subprocess, "run", _fake_gh(payload))
+    pr = pr_for_branch(tmp_path)
+    assert pr is not None and pr.head_sha == "abc123"
+    assert "headRefOid" in gh._PR_FIELDS.split(",")
+
+
+def _ticket_pr(number: int, title: str, state: str = "OPEN", **extra: object) -> dict[str, object]:
+    return {
+        "number": number,
+        "url": f"https://github.com/acme/repo/pull/{number}",
+        "state": state,
+        "title": title,
+        "headRefOid": f"sha{number}",
+        "headRefName": "",
+        "body": "",
+        **extra,
+    }
+
+
+def test_find_prs_for_ticket_returns_every_pr_naming_the_ticket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    stdout = json.dumps(
+        [
+            _ticket_pr(3, "DR-12 second attempt"),
+            _ticket_pr(2, "first attempt", "CLOSED", headRefName="DR-12-first"),
+            _ticket_pr(1, "unrelated", "MERGED", body="Fixes dr-12."),
+        ]
+    )
+    monkeypatch.setattr(gh.subprocess, "run", _fake_cli(stdout, gh_calls=calls))
+    prs = gh.find_prs_for_ticket(tmp_path, "DR-12")
+    assert prs is not None
+    assert [(p.number, p.state, p.head_sha) for p in prs] == [
+        (3, "OPEN", "sha3"),
+        (2, "CLOSED", "sha2"),
+        (1, "MERGED", "sha1"),
+    ]
+    argv = calls[0]
+    assert argv[argv.index("--search") + 1] == "DR-12"
+    assert argv[argv.index("--state") + 1] == "all"
+    fields = argv[argv.index("--json") + 1].split(",")
+    assert {"number", "state", "headRefOid", "url", "title"} <= set(fields)
+
+
+def test_find_prs_for_ticket_drops_hits_for_a_longer_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GitHub search can surface DR-123 for DR-12; reviewing it would be wrong."""
+    stdout = json.dumps([_ticket_pr(9, "DR-123 other work"), _ticket_pr(8, "XDR-12 lookalike")])
+    monkeypatch.setattr(gh.subprocess, "run", _fake_gh(stdout))
+    assert gh.find_prs_for_ticket(tmp_path, "DR-12") == []
+
+
+def test_find_prs_for_ticket_distinguishes_no_pr_from_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gh.subprocess, "run", _fake_gh("[]"))
+    assert gh.find_prs_for_ticket(tmp_path, "DR-1") == []
+
+    monkeypatch.setattr(gh.subprocess, "run", _fake_gh("", returncode=1))
+    assert gh.find_prs_for_ticket(tmp_path, "DR-1") is None
+
+    monkeypatch.setattr(gh.subprocess, "run", _fake_gh("garbage"))
+    assert gh.find_prs_for_ticket(tmp_path, "DR-1") is None
+
+    def boom(*args: object, **kwargs: object) -> object:
+        raise AssertionError("gh must not run for a missing repo")
+
+    monkeypatch.setattr(gh.subprocess, "run", boom)
+    assert gh.find_prs_for_ticket(tmp_path / "missing", "DR-1") is None
+
+
+def test_find_prs_for_ticket_ignores_a_passing_mention_in_another_pr_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DR-99's PR saying "Follow-up to DR-12" is not DR-12's PR."""
+    stdout = json.dumps(
+        [
+            _ticket_pr(
+                7,
+                "DR-99 thing",
+                headRefName="dr-99-thing",
+                body="Follow-up to DR-12.\nCloses DR-12",
+            ),
+            _ticket_pr(6, "DR-99: follow-up to DR-12"),
+            _ticket_pr(5, "no key here", body="Blocked by DR-12 for now"),
+        ]
+    )
+    monkeypatch.setattr(gh.subprocess, "run", _fake_gh(stdout))
+    assert gh.find_prs_for_ticket(tmp_path, "DR-12") == []
+
+
+def test_find_prs_for_ticket_trusts_the_branch_over_the_title(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout = json.dumps(
+        [
+            _ticket_pr(4, "DR-12 tidy-up", headRefName="bb/DR-99-tidy"),
+            _ticket_pr(3, "tidy-up", headRefName="bb/dr-12-tidy"),
+            _ticket_pr(2, "plain title", body="Some context.\n\nJira: DR-12\n"),
+        ]
+    )
+    monkeypatch.setattr(gh.subprocess, "run", _fake_gh(stdout))
+    prs = gh.find_prs_for_ticket(tmp_path, "dr-12")
+    assert prs is not None
+    assert [p.number for p in prs] == [3, 2]
+
+
+def test_find_prs_for_ticket_treats_a_full_page_as_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full page may have pushed the ticket's own PR off the end."""
+    calls: list[list[str]] = []
+    stdout = json.dumps(
+        [_ticket_pr(1000 + i, f"DR-{100 + i} other") for i in range(gh._TICKET_PR_LIMIT)]
+    )
+    monkeypatch.setattr(gh.subprocess, "run", _fake_cli(stdout, gh_calls=calls))
+    assert gh.find_prs_for_ticket(tmp_path, "DR-1") is None
+    argv = calls[0]
+    assert "--limit" in argv
+    assert argv[argv.index("--limit") + 1] == str(gh._TICKET_PR_LIMIT)

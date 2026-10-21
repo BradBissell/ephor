@@ -36,6 +36,9 @@ from ephor.providers import get_provider
 
 _TIMEOUT_SEC = 20.0
 _TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-\d{1,7}$")
+# tmux reads ``:`` and ``.`` inside a target as window/pane separators, so a
+# session name carrying either would silently address something else.
+_TMUX_SESSION_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_@+=-]{0,63}$")
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,10 @@ class StartResult:
     worktree: str = ""
     branch: str = ""
     window: str = ""
+    # tmux pane id (``%12``) of the window's only pane. The flows tick keeps
+    # it on the run record so a later tick can tell "launched and running"
+    # from "claimed and never got a pane".
+    pane: str = ""
 
 
 def _run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
@@ -261,34 +268,73 @@ def link_env_files(root: Path, target: Path) -> int:
     return linked
 
 
-def open_window(name: str, cwd: Path, command: str, env: dict[str, str]) -> tuple[str | None, str]:
-    """Open a tmux window running ``command`` in ``cwd``. Returns (window id, msg).
+def valid_tmux_session(name: str) -> bool:
+    """True when ``name`` is usable as ``-t <name>:`` without tmux misreading it."""
+    return bool(_TMUX_SESSION_RE.match(name or ""))
+
+
+def open_window(
+    name: str,
+    cwd: Path,
+    command: str,
+    env: dict[str, str],
+    *,
+    detached: bool = False,
+    target_session: str = "",
+) -> tuple[str | None, str, str]:
+    """Open a tmux window running ``command`` in ``cwd``.
+
+    Returns ``(window id, pane id, message)``; the ids are None/"" on failure.
 
     The environment is applied with ``env`` inside the window's own shell
     rather than inherited from ephor's process, because the point is to set
     ``EPHOR_TICKET`` for the *agent*, and ephor may itself have been started
     from a session that has one.
+
+    ``detached`` (``-d``) opens the window without switching to it. An
+    operator who typed ``ephor start`` wants to land in the new window; a
+    flow launching in the background must not yank them out of whatever pane
+    they are typing in. ``target_session`` (``-t <name>:``) puts the window in
+    a named session instead of the current one, which is also the only way a
+    launch from outside tmux (a systemd timer) has anywhere to go. It is
+    passed as ``=<name>:`` because tmux otherwise falls back to a prefix or
+    pattern match: with ``flows`` gone but ``flows-old`` open, the window
+    would land in ``flows-old`` instead of failing. :func:`valid_tmux_session`
+    forbids a leading ``=``, so the prefix never doubles up.
     """
+    if target_session and not valid_tmux_session(target_session):
+        return None, "", f"invalid tmux session name {target_session!r}"
     prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(env.items()))
     full = f"exec env {prefix} {command}" if prefix else f"exec {command}"
-    code, out, err = _run(
-        [
-            "/usr/bin/env",
-            "tmux",
-            "new-window",
-            "-P",
-            "-F",
-            "#{window_id}",
-            "-n",
-            name,
-            "-c",
-            str(cwd),
-            full,
-        ]
-    )
+    args = ["/usr/bin/env", "tmux", "new-window", "-P", "-F", "#{window_id} #{pane_id}"]
+    if detached:
+        args.append("-d")
+    if target_session:
+        args.extend(["-t", f"={target_session}:"])
+    args.extend(["-n", name, "-c", str(cwd), full])
+    code, out, err = _run(args)
     if code != 0:
-        return None, f"tmux new-window failed: {err or 'unknown error'}"
-    return out or None, f"opened tmux window {out}"
+        return None, "", f"tmux new-window failed: {err or 'unknown error'}"
+    window, _, pane = out.partition(" ")
+    if not window:
+        return None, "", "tmux new-window printed no window id"
+    return window, pane.strip(), f"opened tmux window {window}"
+
+
+def agent_invocation(provider: str, *, ticket: str, prompt: str = "") -> tuple[str, dict[str, str]]:
+    """The command line and environment that launch ``provider`` on ``ticket``.
+
+    Shared by :func:`start` and by callers that open an agent window without
+    a worktree (a flow running in a repo root), so there is one place that
+    decides how a prompt is quoted and which variables the hook will read.
+    Raises KeyError for an unknown provider, like :func:`get_provider`.
+    """
+    agent = get_provider(provider)
+    command = f"{agent.binary} {shlex.quote(prompt)}" if prompt else agent.binary
+    env = {"EPHOR_PROVIDER": agent.name}
+    if ticket:
+        env["EPHOR_TICKET"] = ticket
+    return command, env
 
 
 def start(
@@ -302,12 +348,17 @@ def start(
     window_name: str = "",
     launch_agent: bool = True,
     dry_run: bool = False,
+    detached: bool = False,
+    target_session: str = "",
 ) -> StartResult:
     """Create the worktree, open the window, launch the agent, record the work.
 
     ``launch_agent=False`` opens the window on a plain shell instead. That is
     what an operator wants when they are going to drive the work themselves
     in this pane and just need somewhere to run a dev server and tail logs.
+
+    ``detached`` and ``target_session`` pass through to :func:`open_window`;
+    both default to the interactive behaviour ``ephor start`` has always had.
     """
     ticket = normalize_ticket(ticket_raw)
     if ticket is None:
@@ -325,12 +376,12 @@ def start(
         return StartResult(False, f"unknown provider {provider!r}")
 
     if dry_run:
-        target = worktree_path(root, ticket)
+        planned = worktree_path(root, ticket)
         what = agent.binary if launch_agent else "a shell"
         return StartResult(
             True,
-            f"would create {target} on {branch_name(ticket, title)} and run {what}",
-            worktree=str(target),
+            f"would create {planned} on {branch_name(ticket, title)} and run {what}",
+            worktree=str(planned),
             branch=branch_name(ticket, title),
         )
 
@@ -340,16 +391,20 @@ def start(
     link_env_files(root, target)
 
     if launch_agent:
-        command = agent.binary
-        if prompt:
-            command = f"{agent.binary} {shlex.quote(prompt)}"
-        env = {"EPHOR_TICKET": ticket, "EPHOR_PROVIDER": agent.name}
+        command, env = agent_invocation(agent.name, ticket=ticket, prompt=prompt)
     else:
         # A login shell, so the operator lands in their normal environment
         # with EPHOR_TICKET already exported for whatever they start by hand.
         command = os.environ.get("SHELL") or "/bin/sh"
         env = {"EPHOR_TICKET": ticket}
-    window, window_message = open_window(window_name or ticket, target, command, env)
+    window, pane, window_message = open_window(
+        window_name or ticket,
+        target,
+        command,
+        env,
+        detached=detached,
+        target_session=target_session,
+    )
     if window is None:
         return StartResult(False, window_message, worktree=str(target))
 
@@ -374,6 +429,7 @@ def start(
         worktree=str(target),
         branch=context.branch or branch_name(ticket, title),
         window=window,
+        pane=pane,
     )
 
 
@@ -405,7 +461,7 @@ def resume(
     env = {"EPHOR_PROVIDER": agent.name}
     if ticket:
         env["EPHOR_TICKET"] = ticket
-    window, message = open_window(name or ticket or agent.name, target, command, env)
+    window, pane, message = open_window(name or ticket or agent.name, target, command, env)
     if window is None:
         return StartResult(False, message, worktree=str(target))
     eventlog.append(
@@ -416,5 +472,9 @@ def resume(
         provider=agent.name,
     )
     return StartResult(
-        True, f"resumed {session_id[:8]} — {message}", worktree=str(target), window=window
+        True,
+        f"resumed {session_id[:8]} — {message}",
+        worktree=str(target),
+        window=window,
+        pane=pane,
     )

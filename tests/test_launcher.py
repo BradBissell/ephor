@@ -194,15 +194,22 @@ def test_start_records_the_work_item_and_declares_the_ticket(
     _init_repo(repo)
     opened: dict[str, object] = {}
 
-    def fake_window(name: str, cwd: Path, command: str, env: dict[str, str]) -> tuple[str, str]:
-        opened.update({"name": name, "cwd": cwd, "command": command, "env": env})
-        return "@7", "opened tmux window @7"
+    def fake_window(
+        name: str, cwd: Path, command: str, env: dict[str, str], **kwargs: object
+    ) -> tuple[str, str, str]:
+        opened.update({"name": name, "cwd": cwd, "command": command, "env": env, **kwargs})
+        return "@7", "%7", "opened tmux window @7"
 
     monkeypatch.setattr(launcher, "open_window", fake_window)
     result = launcher.start("DR-9", title="add thing", base="main", cwd=repo)
 
     assert result.ok is True
     assert result.window == "@7"
+    assert result.pane == "%7"
+    # An interactive `ephor start` keeps its old shape: switch to the new
+    # window, in the current session.
+    assert opened["detached"] is False
+    assert opened["target_session"] == ""
     # The whole point: the agent's environment carries the key, so the hook
     # records it as fact instead of the dashboard inferring it.
     assert opened["env"]["EPHOR_TICKET"] == "DR-9"
@@ -225,9 +232,11 @@ def test_resume_uses_the_providers_own_flag(
 ) -> None:
     seen: dict[str, object] = {}
 
-    def fake_window(name: str, cwd: Path, command: str, env: dict[str, str]) -> tuple[str, str]:
+    def fake_window(
+        name: str, cwd: Path, command: str, env: dict[str, str], **kwargs: object
+    ) -> tuple[str, str, str]:
         seen["command"] = command
-        return "@1", "ok"
+        return "@1", "%1", "ok"
 
     monkeypatch.setattr(launcher, "open_window", fake_window)
     result = launcher.resume("abc123", provider="claude", cwd=str(tmp_path), ticket="DR-1")
@@ -296,9 +305,11 @@ def test_no_agent_opens_a_shell_and_still_declares_the_ticket(
     _init_repo(repo)
     seen: dict[str, object] = {}
 
-    def fake_window(name: str, cwd: Path, command: str, env: dict[str, str]) -> tuple[str, str]:
+    def fake_window(
+        name: str, cwd: Path, command: str, env: dict[str, str], **kwargs: object
+    ) -> tuple[str, str, str]:
         seen.update({"name": name, "command": command, "env": env})
-        return "@3", "ok"
+        return "@3", "%3", "ok"
 
     monkeypatch.setattr(launcher, "open_window", fake_window)
     monkeypatch.setenv("SHELL", "/bin/zsh")
@@ -316,7 +327,119 @@ def test_window_name_can_be_overridden(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setattr(
         launcher,
         "open_window",
-        lambda name, cwd, command, env: (seen.update({"name": name}), ("@1", "ok"))[1],
+        lambda name, cwd, command, env, **kw: (seen.update({"name": name}), ("@1", "%1", "ok"))[1],
     )
     launcher.start("DR-1", base="main", cwd=repo, window_name="DR-1-add-retry")
     assert seen["name"] == "DR-1-add-retry"
+
+
+# --- detached / targeted windows (flows) ----------------------------------
+
+
+def _capture_run(monkeypatch: pytest.MonkeyPatch, stdout: str = "@4 %9", code: int = 0):
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
+        calls.append(args)
+        return code, stdout, "boom" if code else ""
+
+    monkeypatch.setattr(launcher, "_run", fake_run)
+    return calls
+
+
+def test_open_window_by_default_switches_to_the_window_in_the_current_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _capture_run(monkeypatch)
+    window, pane, message = launcher.open_window("DR-1", tmp_path, "claude", {"A": "b c"})
+    assert (window, pane) == ("@4", "%9")
+    assert "@4" in message
+    args = calls[0]
+    assert "-d" not in args
+    assert "-t" not in args
+    assert args[args.index("-F") + 1] == "#{window_id} #{pane_id}"
+    assert args[-1] == "exec env A='b c' claude"
+
+
+def test_open_window_detached_into_a_named_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flow launch must not steal focus, and may target another session."""
+    calls = _capture_run(monkeypatch)
+    window, pane, _ = launcher.open_window(
+        "flow:DR-1:review", tmp_path, "claude", {}, detached=True, target_session="work"
+    )
+    assert (window, pane) == ("@4", "%9")
+    args = calls[0]
+    assert "-d" in args
+    # `=` forces an exact session match; tmux would otherwise fall back to a
+    # prefix (`work-old`) and open the window somewhere nobody is looking.
+    assert args[args.index("-t") + 1] == "=work:"
+    assert args[args.index("-n") + 1] == "flow:DR-1:review"
+
+
+def test_open_window_refuses_a_session_name_tmux_would_misread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _capture_run(monkeypatch)
+    for bad in ("work:1", "a.b", "has space", "-x"):
+        window, pane, message = launcher.open_window("w", tmp_path, "sh", {}, target_session=bad)
+        assert window is None and pane == ""
+        assert "invalid tmux session" in message
+    assert calls == []
+
+
+def test_open_window_reports_tmux_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _capture_run(monkeypatch, stdout="", code=1)
+    window, pane, message = launcher.open_window("w", tmp_path, "sh", {})
+    assert window is None and pane == ""
+    assert "boom" in message
+
+
+def test_open_window_tolerates_a_tmux_that_prints_no_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _capture_run(monkeypatch, stdout="@4")
+    window, pane, _ = launcher.open_window("w", tmp_path, "sh", {})
+    assert (window, pane) == ("@4", "")
+
+
+def test_start_passes_detached_and_target_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    seen: dict[str, object] = {}
+
+    def fake_window(
+        name: str, cwd: Path, command: str, env: dict[str, str], **kwargs: object
+    ) -> tuple[str, str, str]:
+        seen.update(kwargs)
+        seen["command"] = command
+        return "@2", "%2", "ok"
+
+    monkeypatch.setattr(launcher, "open_window", fake_window)
+    result = launcher.start(
+        "DR-1",
+        base="main",
+        cwd=repo,
+        prompt="/review-pr DR-1",
+        detached=True,
+        target_session="work",
+    )
+    assert result.ok is True
+    assert result.pane == "%2"
+    assert seen["detached"] is True
+    assert seen["target_session"] == "work"
+    assert seen["command"] == "claude '/review-pr DR-1'"
+
+
+def test_agent_invocation_quotes_the_prompt_and_declares_the_ticket() -> None:
+    command, env = launcher.agent_invocation("claude", ticket="DR-1", prompt="it's $HOME")
+    assert command == "claude 'it'\"'\"'s $HOME'"
+    assert env == {"EPHOR_PROVIDER": "claude", "EPHOR_TICKET": "DR-1"}
+    command, env = launcher.agent_invocation("claude", ticket="")
+    assert command == "claude"
+    assert env == {"EPHOR_PROVIDER": "claude"}
+    with pytest.raises(KeyError):
+        launcher.agent_invocation("notanagent", ticket="DR-1")

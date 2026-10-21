@@ -128,7 +128,7 @@ _GROUP_PREFIX = "\x00grp:"
 
 def is_group_row(row_id: str | None) -> bool:
     """True when a row id names a group header instead of a session."""
-    return bool(row_id) and row_id.startswith(_GROUP_PREFIX)
+    return row_id is not None and row_id.startswith(_GROUP_PREFIX)
 
 
 def group_key_of(row_id: str) -> str:
