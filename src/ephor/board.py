@@ -628,6 +628,12 @@ def _parse_rule(index: int, entry: object, errors: list[str]) -> FlowRule | None
             f'{where}: mode = "auto" is not allowed on a start= flow — '
             "agent-launching flows are confirm-only"
         )
+    if start and trigger is Trigger.ON_SESSION and value == "idle":
+        errors.append(
+            f'{where}: on_session = "idle" cannot use start= — the idle session is itself '
+            "live on the ticket, so the launch guard would hold the run until it ends; "
+            'use command= (e.g. to message the session) or on_session = "died"'
+        )
 
     if len(errors) != count or trigger is None or not isinstance(name, str):
         return None

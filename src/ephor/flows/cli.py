@@ -5,7 +5,9 @@ subcommand per phase:
 
 * ``board`` prints the status lanes from the last snapshot — the same lanes
   the dashboard's ``status`` grouping draws — with each ticket's flow badge.
-* ``tick [--dry-run]`` runs one tick (:mod:`ephor.flows.tick`).
+* ``tick [--dry-run]`` runs one tick (:mod:`ephor.flows.tick`); ``watch``
+  runs one every ``--interval`` seconds until Ctrl-C, which is how flows keep
+  running while the dashboard is closed.
 * ``ls [--all]`` lists runs, newest first; ``approve`` / ``deny`` answer a
   run that is awaiting confirmation, by id or unique prefix.
 * ``pause`` / ``resume`` set and clear the flag that stops every dispatch.
@@ -15,7 +17,10 @@ subcommand per phase:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from ephor import board, jira_api, work_items
@@ -44,6 +49,14 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         action="store_true",
         help="Report what would happen; write nothing and launch nothing",
     )
+    watch_p = sub.add_parser("watch", help="Run a tick every --interval seconds until Ctrl-C")
+    watch_p.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_WATCH_INTERVAL_SEC,
+        help=f"Seconds between ticks (default {DEFAULT_WATCH_INTERVAL_SEC:g}, minimum "
+        f"{MIN_WATCH_INTERVAL_SEC:g})",
+    )
     ls_p = sub.add_parser("ls", help="List flow runs, newest first")
     ls_p.add_argument(
         "--all", action="store_true", help="Include every finished run, not just recent ones"
@@ -64,6 +77,8 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return cmd_board(refresh=bool(args.refresh))
     if command == "tick":
         return cmd_tick(dry_run=bool(args.dry_run))
+    if command == "watch":
+        return cmd_watch(interval=float(args.interval))
     if command == "ls":
         return cmd_ls(show_all=bool(args.all))
     if command == "approve":
@@ -210,8 +225,17 @@ def cmd_tick(*, dry_run: bool) -> int:
         print(f"ephor: tick: {result.message}", file=sys.stderr)
         return 1
     print(f"{prefix}{result.message}")
+    _print_details(result)
+    if dry_run:
+        print("dry run: nothing was written and nothing was launched")
+    return 0
+
+
+def _print_details(result: flows_tick.TickResult) -> None:
     for move in result.transitions:
         print(f"  moved     {move.key:<10} {printable(move.detail, 60)}")
+    for event in result.events:
+        print(f"  {event.trigger.removeprefix('on_'):<9} {event.key:<10} {event.detail}")
     for name in result.adopted:
         print(f"  adopted   {name} — records the board as it stands; fires on the next move")
     if result.dispatch_note:
@@ -220,9 +244,90 @@ def cmd_tick(*, dry_run: bool) -> int:
         # Run ids and verbs are ours; the detail can carry ticket text.
         detail = f"  — {printable(action.detail, 120)}" if action.detail else ""
         print(f"  {action.verb:<10} {action.run_id}{detail}")
-    if dry_run:
-        print("dry run: nothing was written and nothing was launched")
+
+
+# --- watch --------------------------------------------------------------------------
+
+DEFAULT_WATCH_INTERVAL_SEC = 60.0
+# Below this a watch would mostly be asking Jira the same question again.
+MIN_WATCH_INTERVAL_SEC = 10.0
+
+
+def cmd_watch(
+    *,
+    interval: float,
+    max_ticks: int | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Tick every ``interval`` seconds until Ctrl-C (or ``max_ticks``, for tests).
+
+    board.toml is re-read before every tick, so an edit takes effect on the
+    next one without a restart; a file that disappears, or stops parsing, is
+    reported and waited out rather than ending the watch. A tick that finds
+    ``tick.lock`` held (the dashboard is mid-tick) is the normal case and is
+    not reported. A line is printed when something happened, or when the
+    outcome differs from the previous tick's — not once a minute for nothing.
+    """
+    if not math.isfinite(interval) or interval < MIN_WATCH_INTERVAL_SEC:
+        print(
+            "ephor: --interval must be a finite number of at least "
+            f"{MIN_WATCH_INTERVAL_SEC:g} seconds",
+            file=sys.stderr,
+        )
+        return 2
+    if board.load() is None:
+        print(
+            f"ephor: no board at {board.board_path()} — create one to turn the board on",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"watching the board every {interval:g}s — Ctrl-C to stop", flush=True)
+    last = ""
+    count = 0
+    try:
+        while max_ticks is None or count < max_ticks:
+            count += 1
+            last = _watch_once(last)
+            if max_ticks is not None and count >= max_ticks:
+                break
+            sleep(interval)
+    except KeyboardInterrupt:
+        print("\nstopped")
     return 0
+
+
+def _watch_once(last: str) -> str:
+    """One watched tick. Returns what it amounted to, for the next one to compare with.
+
+    That key is the outcome without its counts — "ok" plus any dispatch
+    note, or the error — so a quiet board prints nothing, a tick that did
+    something always prints, and a change of state (paused, Jira down,
+    board.toml broken) prints once.
+    """
+    stamp = datetime.now().astimezone().strftime("%H:%M:%S")
+    config = board.load()
+    if config is None:
+        line = f"no board at {board.board_path()}"
+    elif not config.lanes_ok:
+        line = f"board.toml [board] has {len(config.board_errors)} error(s) — `ephor flows check`"
+    else:
+        result = flows_tick.run(config)
+        if result.status is flows_tick.TickStatus.LOCKED:
+            return last
+        if not result.ok:
+            line = f"tick: {result.message}"
+        else:
+            note = f" · {result.dispatch_note}" if result.dispatch_note else ""
+            key = f"ok{note}"
+            busy = result.transitions or result.events or result.actions or result.adopted
+            if busy or key != last:
+                print(f"{stamp} {result.message}{note}", flush=True)
+                _print_details(result)
+                sys.stdout.flush()
+            return key
+    if line != last:
+        print(f"{stamp} {line}", flush=True)
+    return line
 
 
 # --- runs ---------------------------------------------------------------------------
@@ -307,12 +412,9 @@ def cmd_check() -> int:
         print(f"  search: {config.board.search_jql()}")
         for rule in config.rules:
             what = f"start={rule.start!r}" if rule.start else f"command={rule.command!r}"
-            pending = (
-                "" if rule.trigger in flows_tick.EVALUATED_TRIGGERS else " (not yet evaluated)"
-            )
             print(
                 f"  flow {rule.name}: {rule.trigger}={rule.value!r} assignee={rule.assignee} "
-                f"mode={rule.mode} {what}{pending}"
+                f"mode={rule.mode} {what}"
             )
     if not jira_api.is_configured():
         print("jira: not configured (set EPHOR_JIRA_URL, EPHOR_JIRA_EMAIL, EPHOR_JIRA_TOKEN)")

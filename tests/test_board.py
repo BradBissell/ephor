@@ -181,6 +181,21 @@ def test_command_flows_may_be_auto_but_not_take_agent_options() -> None:
     assert any("only to start= flows" in e for e in bad.flow_errors)
 
 
+def test_an_idle_session_flow_cannot_start_an_agent() -> None:
+    # The idle session is itself live on the ticket: the launch guard would
+    # hold the run as long as it is current, and it supersedes once it isn't.
+    bad = _rules('[[flow]]\nname = "nudge"\non_session = "IDLE"\nstart = "/continue {ticket}"\n')
+    assert any('on_session = "idle" cannot use start=' in e for e in bad.flow_errors)
+    assert not bad.dispatch_ok
+
+
+def test_idle_command_flows_and_died_start_flows_still_validate() -> None:
+    idle = _rules('[[flow]]\nname = "nudge"\non_session = "idle"\ncommand = "true"\n')
+    assert idle.dispatch_ok, idle.flow_errors
+    died = _rules('[[flow]]\nname = "redo"\non_session = "died"\nstart = "/continue {ticket}"\n')
+    assert died.dispatch_ok, died.flow_errors
+
+
 @pytest.mark.parametrize(
     ("line", "message"),
     [
@@ -469,3 +484,28 @@ def test_an_order_by_with_no_fields_is_a_board_error() -> None:
     assert "[board] jql: ORDER BY has no field list" in config.board_errors
     ok = _rules("", header='[board]\nprojects = ["DR"]\njql = "status = QA ORDER BY rank"\n')
     assert ok.lanes_ok, ok.board_errors
+
+
+def test_the_documented_example_board_is_valid() -> None:
+    example = Path(__file__).resolve().parent.parent / "docs" / "examples" / "board.toml"
+    config = board.load(example)
+    assert config is not None
+    assert config.errors == ()
+    assert {r.trigger for r in config.rules} == {
+        board.Trigger.ON_ENTER,
+        board.Trigger.ON_PR,
+        board.Trigger.ON_SESSION,
+    }
+
+
+def test_every_toml_snippet_in_the_flows_guide_is_valid() -> None:
+    import re
+    import tomllib
+
+    guide = Path(__file__).resolve().parent.parent / "docs" / "flows.md"
+    blocks = re.findall(r"```toml\n(.*?)```", guide.read_text(), re.DOTALL)
+    assert len(blocks) >= 5
+    for block in blocks:
+        data = tomllib.loads(block)
+        data.setdefault("board", {"projects": ["DR"]})
+        assert board.parse(data).errors == (), block

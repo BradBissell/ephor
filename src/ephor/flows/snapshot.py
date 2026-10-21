@@ -43,9 +43,11 @@ search brings in were not *moved* there — the window onto the board was —
 and the flow tick adopts them instead of firing on them.
 
 The snapshot also carries fields only the flow tick reads (``rules_seen``,
-``myself``, ``prs``, ``sessions_seen``). A rule-less refresh carries them
-forward untouched — in particular it never marks a rule as seen, so a rule
-the tick has not evaluated yet still starts in adopt mode.
+``myself``, and the two observations :mod:`ephor.flows.triggers` compares
+from tick to tick: ``prs`` with ``pr_checked_at``, and ``sessions_seen``).
+A rule-less refresh carries them forward untouched — in particular it never
+marks a rule as seen, so a rule the tick has not evaluated yet still starts
+in adopt mode.
 """
 
 from __future__ import annotations
@@ -185,12 +187,20 @@ class TicketState:
 
 @dataclass(frozen=True)
 class PrState:
-    """A ticket's pull request as the last ``gh`` lookup saw it (flow tick only)."""
+    """One of a ticket's pull requests as the last ``gh`` lookup saw it (flow tick only)."""
 
     number: int
-    state: str = ""
+    state: str = ""  # OPEN | MERGED | CLOSED, as gh reports it
     head_sha: str = ""
     url: str = ""
+
+    @property
+    def is_open(self) -> bool:
+        return self.state.upper() == "OPEN"
+
+    @property
+    def is_merged(self) -> bool:
+        return self.state.upper() == "MERGED"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -203,13 +213,69 @@ class PrState:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PrState | None:
         number = data.get("number")
-        if isinstance(number, bool) or not isinstance(number, int):
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
             return None
         return cls(
             number=number,
             state=_str(data.get("state")),
             head_sha=_str(data.get("head_sha")),
             url=_str(data.get("url")),
+        )
+
+
+def _prs_from(value: object) -> tuple[PrState, ...] | None:
+    """A ticket's stored PR list, or None when it is not the shape we write.
+
+    A lone object (an older shape) is a list of one. An empty list is a real
+    observation — "no PR yet" — and is kept. A list with *any* malformed
+    entry is dropped whole: a baseline missing one PR would read, next time,
+    as that PR having just been opened, and no baseline at all only costs a
+    re-baseline.
+    """
+    items = [value] if isinstance(value, dict) else value
+    if not isinstance(items, list):
+        return None
+    found: list[PrState] = []
+    for item in items:
+        pr = PrState.from_dict(item) if isinstance(item, dict) else None
+        if pr is None:
+            return None
+        found.append(pr)
+    return tuple(found)
+
+
+@dataclass(frozen=True)
+class SessionSeen:
+    """A ticket-bound agent session as the last tick saw it (flow tick only).
+
+    ``settled`` is "IDLE, with no event for at least ``[flows] settle``".
+    ``pid`` is kept so a session whose state file has since been deleted can
+    still be told apart: a dead process was a death, a live one was not.
+    """
+
+    ticket: str
+    status: str
+    pid: int = 0
+    settled: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ticket": self.ticket,
+            "status": self.status,
+            "pid": self.pid,
+            "settled": self.settled,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SessionSeen | None:
+        ticket = _str(data.get("ticket"))
+        if not ticket:
+            return None
+        return cls(
+            ticket=ticket,
+            status=_str(data.get("status")),
+            pid=_int(data.get("pid")),
+            settled=data.get("settled") is True,
         )
 
 
@@ -258,9 +324,13 @@ class Snapshot:
     tickets: Mapping[str, TicketState] = field(default_factory=dict)
     rules_seen: tuple[str, ...] = ()
     myself: str = ""  # the configured user's Jira accountId, cached by the tick
+    # When on_pr rules last asked gh about the board's tickets, and what it
+    # said: ticket -> every PR that names it. A ticket with an entry (even
+    # an empty one) has a baseline; only a change from it fires on_pr.
     pr_checked_at: str = ""
-    prs: Mapping[str, PrState] = field(default_factory=dict)
-    sessions_seen: Mapping[str, Any] = field(default_factory=dict)
+    prs: Mapping[str, tuple[PrState, ...]] = field(default_factory=dict)
+    # session id -> what the last tick saw of it (on_session rules only).
+    sessions_seen: Mapping[str, SessionSeen] = field(default_factory=dict)
     # Tickets forgotten after DROP_AFTER_UNSEEN, so a return gets a new seq.
     dropped: Mapping[str, DroppedTicket] = field(default_factory=dict)
     # board_scope() of the search that produced ``tickets`` ("" before P2).
@@ -290,8 +360,10 @@ class Snapshot:
             "myself": self.myself,
             "tickets": {key: t.to_dict() for key, t in sorted(self.tickets.items())},
             "pr_checked_at": self.pr_checked_at,
-            "prs": {key: pr.to_dict() for key, pr in sorted(self.prs.items())},
-            "sessions_seen": dict(self.sessions_seen),
+            "prs": {key: [pr.to_dict() for pr in found] for key, found in sorted(self.prs.items())},
+            "sessions_seen": {
+                sid: seen.to_dict() for sid, seen in sorted(self.sessions_seen.items())
+            },
             "dropped": {key: d.to_dict() for key, d in sorted(self.dropped.items())},
             "scope": self.scope,
         }
@@ -307,12 +379,19 @@ class Snapshot:
                 if isinstance(key, str) and key and isinstance(value, dict):
                     tickets[key] = TicketState.from_dict(value)
         raw_prs = data.get("prs")
-        prs: dict[str, PrState] = {}
+        prs: dict[str, tuple[PrState, ...]] = {}
         if isinstance(raw_prs, dict):
             for key, value in raw_prs.items():
-                pr = PrState.from_dict(value) if isinstance(value, dict) else None
-                if isinstance(key, str) and pr is not None:
-                    prs[key] = pr
+                found = _prs_from(value)
+                if isinstance(key, str) and key and found is not None:
+                    prs[key] = found
+        raw_sessions = data.get("sessions_seen")
+        sessions: dict[str, SessionSeen] = {}
+        if isinstance(raw_sessions, dict):
+            for sid, value in raw_sessions.items():
+                seen = SessionSeen.from_dict(value) if isinstance(value, dict) else None
+                if isinstance(sid, str) and sid and seen is not None:
+                    sessions[sid] = seen
         raw_dropped = data.get("dropped")
         dropped: dict[str, DroppedTicket] = {}
         if isinstance(raw_dropped, dict):
@@ -320,7 +399,6 @@ class Snapshot:
                 if isinstance(key, str) and key and isinstance(value, dict):
                     dropped[key] = DroppedTicket.from_dict(value)
         rules = data.get("rules_seen")
-        sessions = data.get("sessions_seen")
         return cls(
             taken_at=_str(data.get("taken_at")),
             tickets=tickets,
@@ -330,7 +408,7 @@ class Snapshot:
             myself=_str(data.get("myself")),
             pr_checked_at=_str(data.get("pr_checked_at")),
             prs=prs,
-            sessions_seen=sessions if isinstance(sessions, dict) else {},
+            sessions_seen=sessions,
             dropped=dropped,
             scope=_str(data.get("scope")),
             schema_version=_int(data.get("schema_version")) or SNAPSHOT_SCHEMA_VERSION,

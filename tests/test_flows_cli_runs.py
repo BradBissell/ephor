@@ -238,3 +238,139 @@ def test_board_refresh_runs_the_rules_rather_than_swallowing_the_move(
     assert main(["flows", "board", "--refresh"]) == 0
     assert [r.run_id for r in runs.list_runs()] == ["DR-1.notify.10-1"]
     assert "[▶ notify]" in capsys.readouterr().out
+
+
+# --- watch ----------------------------------------------------------------------------
+
+
+def test_watch_ticks_until_told_to_stop(
+    jira: dict[str, Issue], windows: list[dict[str, Any]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ephor.flows import cli as flows_cli
+
+    _write_board()
+    jira["DR-1"] = Issue(key="DR-1", status="In Progress", status_id="3", title="One")
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        # Between the first and second tick the ticket moves.
+        jira["DR-1"] = Issue(key="DR-1", status="Peer Review", status_id="10", title="One")
+
+    assert flows_cli.cmd_watch(interval=30, max_ticks=3, sleep=sleep) == 0
+    assert sleeps == [30, 30]
+    out = capsys.readouterr().out
+    assert "watching the board every 30s" in out
+    assert "adopted   notify" in out
+    assert "moved     DR-1" in out
+    assert "dispatched DR-1.notify.10-1" in out
+    assert len(windows) == 1
+    # The third tick changed nothing and printed nothing new.
+    assert out.count("ticket(s) on the board") == 2
+
+
+def test_watch_stops_cleanly_on_ctrl_c(
+    jira: dict[str, Issue], capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ephor.flows import cli as flows_cli
+
+    _write_board()
+
+    def interrupt(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    assert flows_cli.cmd_watch(interval=60, sleep=interrupt) == 0
+    assert capsys.readouterr().out.rstrip().endswith("stopped")
+
+
+def test_watch_rejects_a_tiny_interval_and_a_missing_board(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["flows", "watch", "--interval", "1"]) == 2
+    assert "at least 10 seconds" in capsys.readouterr().err
+    assert main(["flows", "watch"]) == 1
+    assert "no board at" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("interval", [float("nan"), float("inf")])
+def test_watch_rejects_a_non_finite_interval_without_ticking(
+    interval: float,
+    jira: dict[str, Issue],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ephor.flows import cli as flows_cli
+
+    _write_board()  # a board that would tick, so only the interval stops it
+    ticks: list[str] = []
+    monkeypatch.setattr(flows_cli, "_watch_once", lambda last: ticks.append(last) or last)
+    assert flows_cli.cmd_watch(interval=interval, max_ticks=1, sleep=lambda s: None) == 2
+    assert "finite number of at least 10 seconds" in capsys.readouterr().err
+    assert ticks == []
+
+
+def test_watch_waits_out_a_board_that_breaks_and_a_held_lock(
+    jira: dict[str, Issue], capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ephor.filelock import locked
+    from ephor.flows import cli as flows_cli
+
+    _write_board()
+    calls = 0
+
+    def sleep(seconds: float) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            _write_board("[board]\nprojects = 3\n")
+        elif calls == 2:
+            _write_board()
+
+    with locked(snap.tick_lock_path(), timeout=0) as held:
+        assert held
+        assert flows_cli.cmd_watch(interval=10, max_ticks=1, sleep=sleep) == 0
+    assert "on the board" not in capsys.readouterr().out
+    assert flows_cli.cmd_watch(interval=10, max_ticks=3, sleep=sleep) == 0
+    out = capsys.readouterr().out
+    assert "board.toml [board] has 2 error(s)" in out
+    assert out.count("ticket(s) on the board") == 2
+
+
+def test_tick_prints_pr_events(
+    jira: dict[str, Issue],
+    windows: list[dict[str, Any]],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from ephor import github
+    from ephor.github import PullRequest
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_board(
+        f"""
+[board]
+projects = ["DR"]
+[repos]
+DR = "{repo}"
+[[flow]]
+name = "ping"
+on_pr = "opened"
+command = "ping.sh {{ticket}}"
+mode = "auto"
+assignee = "any"
+"""
+    )
+    found: list[PullRequest] = []
+    monkeypatch.setattr(github, "find_prs_for_ticket", lambda path, key: list(found))
+    jira["DR-1"] = Issue(key="DR-1", status="In Progress", status_id="3", title="One")
+    assert main(["flows", "tick"]) == 0
+    found.append(PullRequest(number=7, url="https://x/pull/7", state="OPEN"))
+    stored = snap.load()
+    assert stored is not None
+    snap.save(Snapshot(**{**stored.__dict__, "pr_checked_at": ""}))
+    assert main(["flows", "tick"]) == 0
+    out = capsys.readouterr().out
+    assert "pr        DR-1       PR #7 opened" in out
+    assert "dispatched DR-1.ping.pr7" in out

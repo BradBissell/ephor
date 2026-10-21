@@ -46,9 +46,14 @@ exit file that attempt left, or adopts its window (found by the run id in
 the pane's start command); only when tmux confirms there is none does it
 open another.
 
-Triggers: ``on_enter`` and ``on_exit`` are evaluated here. ``on_pr`` and
-``on_session`` rules are validated but not yet evaluated — they are not
-marked as seen either, so they will adopt the board when they are.
+**Triggers.** ``on_enter`` and ``on_exit`` read the snapshot diff.
+``on_pr`` and ``on_session`` read observations of their own — ``gh``'s PRs
+per ticket, spaced ``pr_interval`` apart, and the session state files —
+which :mod:`ephor.flows.triggers` compares with the previous snapshot's, so
+all four share adopt mode, the stale gap, the guards and the run files. A
+status run stays current while its visit to the status does; an ``on_pr
+= "opened"`` run while its PR is open; an ``on_session = "idle"`` run while
+its session stays idle; ``merged`` and ``died`` are final and stay current.
 """
 
 from __future__ import annotations
@@ -60,20 +65,24 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from ephor import eventlog, jira_api, work_items
+from ephor import eventlog, github, jira_api, work_items
 from ephor.board import Assignee, BoardConfig, FlowRule, Mode, Trigger
 from ephor.constants import AgentStatus
 from ephor.filelock import locked
-from ephor.flows import runners, runs
+from ephor.flows import runners, runs, triggers
 from ephor.flows import snapshot as board_snapshot
 from ephor.flows.runs import MAX_ATTEMPTS, Run, RunState
 from ephor.flows.snapshot import (
+    PrState,
     RefreshResult,
     RefreshStatus,
+    SessionSeen,
     Snapshot,
     TicketState,
     Transition,
 )
+from ephor.flows.triggers import TriggerEvent
+from ephor.github import PullRequest
 from ephor.jira_api import Issue
 from ephor.state.models import AgentState
 from ephor.work_items import WorkItem
@@ -82,9 +91,7 @@ from ephor.work_items import WorkItem
 # this recently counts as "someone is already on this ticket".
 LAUNCH_GUARD_SEC = 10 * 60.0
 _HOUR = 3600.0
-# Rules this tick evaluates. The others are accepted by the config but wait
-# for their own phase; see the module docstring.
-EVALUATED_TRIGGERS = frozenset({Trigger.ON_ENTER, Trigger.ON_EXIT})
+_STATUS_TRIGGERS = frozenset({Trigger.ON_ENTER, Trigger.ON_EXIT})
 
 
 def _now() -> datetime:
@@ -143,6 +150,16 @@ def _flow_panes() -> dict[str, str] | None:
     return runners.flow_panes()
 
 
+def _find_prs(repo: Path, key: str) -> list[PullRequest] | None:
+    return github.find_prs_for_ticket(repo, key)
+
+
+def _pid_alive(pid: int) -> bool:
+    from ephor.state.manager import _is_pid_alive
+
+    return _is_pid_alive(pid)
+
+
 @dataclass(frozen=True)
 class TickDeps:
     search: Callable[[str, tuple[str, ...]], list[Issue] | None] = _search
@@ -154,6 +171,8 @@ class TickDeps:
     work_item: Callable[[str], WorkItem | None] = _work_item
     live_panes: Callable[[], set[str] | None] = _live_panes
     flow_panes: Callable[[], dict[str, str] | None] = _flow_panes
+    find_prs: Callable[[Path, str], list[PullRequest] | None] = _find_prs
+    pid_alive: Callable[[int], bool] = _pid_alive
     launchers: runners.Launchers = field(default_factory=runners.Launchers)
 
 
@@ -197,6 +216,8 @@ class TickResult:
     status: TickStatus
     snapshot: Snapshot | None = None
     transitions: tuple[Transition, ...] = ()
+    # PR and session events observed this tick (whether or not a rule took them).
+    events: tuple[TriggerEvent, ...] = ()
     actions: tuple[Action, ...] = ()
     adopted: tuple[str, ...] = ()  # rule names that adopted the board this tick
     # Why nothing was dispatched, when nothing could be ("" when dispatch ran).
@@ -331,8 +352,8 @@ def _tick_locked(
     if not config.dispatch_ok:
         notes.append(f"board.toml has {len(config.errors)} error(s) — no flow runs")
     else:
-        rules = [r for r in config.rules if r.trigger in EVALUATED_TRIGGERS]
-        if scope_changed and rules:
+        rules = list(config.rules)
+        if scope_changed and any(r.trigger in _STATUS_TRIGGERS for r in rules):
             notes.append("board scope changed — tickets new to the search were adopted")
 
     myself = snap.myself
@@ -344,6 +365,9 @@ def _tick_locked(
             return TickResult(TickStatus.MYSELF_FAILED, snapshot=previous, dry_run=dry_run)
     snap = replace(snap, myself=myself)
 
+    context = _Context(deps)
+    snap, events = _observe(config, snap, rules, context, now)
+
     ledger = _Ledger(dry_run=dry_run, now=now)
     adopted: list[str] = []
     if config.dispatch_ok:
@@ -353,19 +377,28 @@ def _tick_locked(
             if previous is None or rule.fingerprint not in seen:
                 adopted.append(rule.name)
                 continue
-            for move in transitions:
-                if scope_changed and move.appeared:
-                    continue
-                record = snap.tickets.get(move.key)
-                if record is not None and _matches(rule, move, record, myself):
-                    _create_run(ledger, rule, move, record, stale=stale)
+            if rule.trigger in _STATUS_TRIGGERS:
+                for move in transitions:
+                    if scope_changed and move.appeared:
+                        continue
+                    record = snap.tickets.get(move.key)
+                    if record is not None and _matches(rule, move, record, myself):
+                        _create_run(ledger, rule, move, record, stale=stale)
+                continue
+            for event in events:
+                record = snap.tickets.get(event.key)
+                if record is not None and _event_matches(rule, event, record, myself):
+                    _create_event_run(ledger, rule, event, record, stale=stale)
         snap = replace(snap, rules_seen=tuple(sorted({r.fingerprint for r in rules})))
 
-    _tend(ledger, config, snap, deps)
+    # A session observation that is not running (no on_session rule in
+    # effect, e.g. while board.toml has errors) is unknown, not "not idle".
+    watching_sessions = any(r.trigger is Trigger.ON_SESSION for r in rules)
+    _tend(ledger, config, snap, deps, watching_sessions=watching_sessions)
     if config.dispatch_ok:
         if runs.is_paused():
             notes.insert(0, "paused (ephor flows resume)")
-        _dispatch(ledger, config, snap, deps)
+        _dispatch(ledger, config, snap, context)
     dispatch_note = "; ".join(notes)
 
     if not dry_run:
@@ -383,11 +416,67 @@ def _tick_locked(
         TickStatus.OK,
         snapshot=snap,
         transitions=tuple(transitions),
+        events=tuple(events),
         actions=tuple(ledger.actions),
         adopted=tuple(adopted),
         dispatch_note=dispatch_note,
         dry_run=dry_run,
     )
+
+
+# --- PR and session observations ------------------------------------------------------
+
+
+def _observe(
+    config: BoardConfig,
+    snap: Snapshot,
+    rules: list[FlowRule],
+    context: _Context,
+    now: datetime,
+) -> tuple[Snapshot, list[TriggerEvent]]:
+    """Refresh the snapshot's PR and session observations; the events between them.
+
+    Each observation is kept only while a rule reads it. With no ``on_pr``
+    (or ``on_session``) rule in effect — none configured, or a config with
+    errors — it is cleared, so a rule added later starts from a fresh
+    baseline instead of firing on everything that changed while nobody was
+    looking. That is the same thing that happens to status moves while a
+    config is broken: they are seen, and fire nothing.
+    """
+    events: list[TriggerEvent] = []
+    pr_rules = [r for r in rules if r.trigger is Trigger.ON_PR]
+    if not pr_rules:
+        snap = replace(snap, prs={}, pr_checked_at="")
+    elif triggers.pr_lookup_due(snap.pr_checked_at, config.flows.pr_interval, now):
+        keys = triggers.pr_tickets(snap, pr_rules, snap.myself)
+        prs, found = triggers.observe_prs(
+            snap.prs,
+            keys,
+            tickets=snap.tickets,
+            repo_for=lambda key: config.resolve_repo(key, context.deps.work_item(key))[0],
+            find=context.deps.find_prs,
+        )
+        snap = replace(snap, prs=prs, pr_checked_at=runs.iso(now))
+        events.extend(found)
+    else:
+        snap = replace(snap, prs={k: v for k, v in snap.prs.items() if k in snap.tickets})
+
+    if not any(r.trigger is Trigger.ON_SESSION for r in rules):
+        snap = replace(snap, sessions_seen={})
+    else:
+        agents = context.all_sessions()
+        if agents is not None:
+            seen, found = triggers.observe_sessions(
+                snap.sessions_seen,
+                agents,
+                ticket_of=context.deps.ticket_of,
+                pid_alive=context.deps.pid_alive,
+                settle=config.flows.settle,
+                now=now,
+            )
+            snap = replace(snap, sessions_seen=seen)
+            events.extend(found)
+    return snap, events
 
 
 # --- matching and creating ------------------------------------------------------------
@@ -416,6 +505,19 @@ def _matches(rule: FlowRule, move: Transition, record: TicketState, myself: str)
         # A ticket new to the board left nothing.
         return not move.appeared and rule.matches_status(move.from_status)
     return False
+
+
+def _event_matches(rule: FlowRule, event: TriggerEvent, record: TicketState, myself: str) -> bool:
+    """True when the PR or session ``event`` is the one ``rule`` fires on.
+
+    The ticket must be on the board — a ticket the last search missed is
+    never fired on, whatever its PR or session did.
+    """
+    if rule.trigger is not event.trigger or rule.value != event.value:
+        return False
+    if not record.on_board:
+        return False
+    return triggers.assignee_ok(rule, record, myself)
 
 
 def _generation(rule: FlowRule, move: Transition) -> str:
@@ -460,11 +562,70 @@ def _create_run(
         ledger.note(run_id, "created", f"{state}{' (stale)' if stale else ''} · {move.detail}")
 
 
-def generation_current(run: Run, tickets: Mapping[str, TicketState]) -> bool:
-    """True while the event that fired ``run`` is still the ticket's latest."""
+def _create_event_run(
+    ledger: _Ledger, rule: FlowRule, event: TriggerEvent, record: TicketState, *, stale: bool
+) -> None:
+    run_id = runs.make_run_id(event.key, rule.name, event.generation)
+    if not runs.valid_run_id(run_id):
+        return
+    confirm = stale or rule.mode is Mode.CONFIRM
+    state = RunState.AWAITING_CONFIRM if confirm else RunState.CLAIMED
+    stamp = runs.iso(ledger.now)
+    pr = event.pr
+    candidate = Run(
+        run_id=run_id,
+        flow=rule.name,
+        ticket=event.key,
+        trigger=str(rule.trigger),
+        generation=event.generation,
+        state=state,
+        created_at=stamp,
+        updated_at=stamp,
+        stale=stale,
+        reason="stale: created after a gap in ticks" if stale else "",
+        kind="start" if rule.launches_agent else "command",
+        title=record.title,
+        # The ticket's status when the event fired: what {status} renders as.
+        to_status=record.status,
+        status_id=record.status_id,
+        seq=record.seq,
+        event=event.value,
+        pr_number=pr.number if pr is not None else 0,
+        pr_url=pr.url if pr is not None else "",
+        head_sha=pr.head_sha if pr is not None else "",
+        session_id=event.session_id,
+    )
+    if ledger.create(candidate):
+        ledger.note(run_id, "created", f"{state}{' (stale)' if stale else ''} · {event.detail}")
+
+
+def generation_current(
+    run: Run,
+    tickets: Mapping[str, TicketState],
+    *,
+    prs: Mapping[str, tuple[PrState, ...]] | None = None,
+    sessions: Mapping[str, SessionSeen] | None = None,
+) -> bool:
+    """True while the event that fired ``run`` still holds.
+
+    For a status trigger, while it is still the ticket's latest move. For
+    ``on_pr = "opened"``, while the PR is open (``prs`` None, or a PR the
+    last lookup did not see, is unknown and counts as open); for
+    ``on_session = "idle"``, while the session stays idle (``sessions``
+    None is unknown). ``merged`` and ``died`` cannot be undone. A ticket
+    that has left the snapshot altogether ends every run on it.
+    """
     record = tickets.get(run.ticket)
     if record is None:
         return False
+    if run.trigger == str(Trigger.ON_PR):
+        if run.event == triggers.PR_OPENED and prs is not None:
+            return triggers.pr_still_open(run.ticket, run.pr_number, prs)
+        return True
+    if run.trigger == str(Trigger.ON_SESSION):
+        if run.event == triggers.SESSION_IDLE and sessions is not None:
+            return triggers.session_still_idle(run.session_id, sessions)
+        return True
     if record.seq != run.seq:
         return False
     if run.trigger == str(Trigger.ON_ENTER):
@@ -472,18 +633,34 @@ def generation_current(run: Run, tickets: Mapping[str, TicketState]) -> bool:
     return True
 
 
+def _current(run: Run, snap: Snapshot, *, watching_sessions: bool) -> bool:
+    return generation_current(
+        run,
+        snap.tickets,
+        prs=snap.prs,
+        sessions=snap.sessions_seen if watching_sessions else None,
+    )
+
+
 # --- tending runs that already exist ---------------------------------------------------
 
 
-def _tend(ledger: _Ledger, config: BoardConfig, snap: Snapshot, deps: TickDeps) -> None:
+def _tend(
+    ledger: _Ledger,
+    config: BoardConfig,
+    snap: Snapshot,
+    deps: TickDeps,
+    *,
+    watching_sessions: bool,
+) -> None:
     """Expire, supersede and finish runs, before anything new is dispatched."""
     panes: set[str] | None = None
     panes_read = False
     for run in sorted(ledger.runs.values(), key=lambda r: (r.created_at, r.run_id)):
         if run.state is RunState.AWAITING_CONFIRM:
-            _tend_awaiting(ledger, config, snap, run)
+            _tend_awaiting(ledger, config, snap, run, watching_sessions=watching_sessions)
         elif run.state in (RunState.CLAIMED, RunState.BLOCKED):
-            if not generation_current(run, snap.tickets):
+            if not _current(run, snap, watching_sessions=watching_sessions):
                 _cancel(ledger, run, RunState.SUPERSEDED, _moved_reason(run, snap))
         elif run.state is RunState.LAUNCHED:
             if not panes_read:
@@ -495,14 +672,20 @@ def _moved_reason(run: Run, snap: Snapshot) -> str:
     record = snap.tickets.get(run.ticket)
     if record is None:
         return "ticket left the board"
+    if run.trigger == str(Trigger.ON_PR):
+        return f"PR #{run.pr_number} is no longer open"
+    if run.trigger == str(Trigger.ON_SESSION):
+        return f"session {run.session_id[:8]} is no longer idle"
     return f"ticket moved on (now {record.status or '?'})"
 
 
-def _tend_awaiting(ledger: _Ledger, config: BoardConfig, snap: Snapshot, run: Run) -> None:
+def _tend_awaiting(
+    ledger: _Ledger, config: BoardConfig, snap: Snapshot, run: Run, *, watching_sessions: bool
+) -> None:
     age = runs.age_sec(run.created_at, ledger.now)
     if age is not None and age > config.flows.confirm_ttl:
         _cancel(ledger, run, RunState.EXPIRED, "not confirmed within confirm_ttl")
-    elif not generation_current(run, snap.tickets):
+    elif not _current(run, snap, watching_sessions=watching_sessions):
         _cancel(ledger, run, RunState.EXPIRED, _moved_reason(run, snap))
     elif config.dispatch_ok and config.rule(run.flow) is None:
         _cancel(ledger, run, RunState.EXPIRED, "flow no longer in board.toml")
@@ -548,19 +731,28 @@ class _Context:
     # predate those launches, so the agent cap and the launch guard count
     # them from here.
     launched: set[str] = field(default_factory=set)
+    _all_sessions: list[AgentState] | None = None
+    _all_sessions_read: bool = False
     _sessions: list[AgentState] | None = None
     _starts: dict[str, str] | None = None
     _flow_panes: dict[str, str] | None = None
     _flow_panes_read: bool = False
 
+    def all_sessions(self) -> list[AgentState] | None:
+        """Every session state file, DEAD ones included; None when the scan failed."""
+        if not self._all_sessions_read:
+            self._all_sessions_read = True
+            try:
+                self._all_sessions = list(self.deps.sessions())
+            except OSError:
+                self._all_sessions = None
+        return self._all_sessions
+
     def live_sessions(self) -> list[AgentState]:
         if self._sessions is None:
-            try:
-                self._sessions = [
-                    a for a in self.deps.sessions() if a.status is not AgentStatus.DEAD
-                ]
-            except OSError:
-                self._sessions = []
+            self._sessions = [
+                a for a in self.all_sessions() or [] if a.status is not AgentStatus.DEAD
+            ]
         return self._sessions
 
     def recent_starts(self) -> dict[str, str]:
@@ -593,8 +785,7 @@ def _launches_within(
     return count
 
 
-def _dispatch(ledger: _Ledger, config: BoardConfig, snap: Snapshot, deps: TickDeps) -> None:
-    context = _Context(deps)
+def _dispatch(ledger: _Ledger, config: BoardConfig, snap: Snapshot, context: _Context) -> None:
     ready = [r for r in ledger.runs.values() if r.state in (RunState.CLAIMED, RunState.BLOCKED)]
     for run in sorted(ready, key=lambda r: (r.created_at, r.run_id)):
         current = ledger.runs.get(run.run_id, run)
@@ -802,10 +993,25 @@ def payload_for(run: Run, snap: Snapshot, repo: Path | None) -> dict[str, Any]:
         "status_id": run.status_id,
         "assignee": record.assignee if record is not None else "",
         "assignee_id": record.assignee_id if record is not None else "",
-        "pr": None,
-        "session_id": "",
+        "event": run.event,
+        "pr": {
+            "number": run.pr_number,
+            "url": run.pr_url,
+            "head_sha": run.head_sha,
+            "state": _pr_state_of(run, snap),
+        }
+        if run.pr_number
+        else None,
+        "session_id": run.session_id,
         "repo_path": str(repo) if repo is not None else "",
     }
+
+
+def _pr_state_of(run: Run, snap: Snapshot) -> str:
+    for pr in snap.prs.get(run.ticket, ()):
+        if pr.number == run.pr_number:
+            return pr.state
+    return ""
 
 
 def _launch(

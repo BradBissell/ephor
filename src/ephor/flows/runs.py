@@ -2,7 +2,11 @@
 
 A flow firing is recorded before anything is launched, as a file whose *name*
 is the whole dedupe: ``<KEY>.<flow>.<generation>``, where the generation names
-the one event that fired it (a visit to a status, a pull request, a session).
+the one event that fired it — ``<status>-<seq>`` for a visit to a status
+(``on_enter`` / ``on_exit``), ``pr<number>`` for a pull request (``on_pr``),
+and the first twelve characters of the session id for a session
+(``on_session``). So a rule fires at most once per visit, per PR, or per
+session.
 Two ticks that both see the same move both try to create the same file, and
 the second create fails — so a crash, a retry, or two dashboards racing can
 never launch the same flow twice for the same event. There is no ledger to
@@ -165,6 +169,24 @@ def status_generation(status_id: str, status: str, seq: int) -> str:
     return f"{status_token(status_id, status)}-{seq}"
 
 
+def pr_generation(number: int) -> str:
+    """``pr<number>``: one pull request (``on_pr``)."""
+    return f"pr{number}"
+
+
+def session_generation(session_id: str) -> str:
+    """The session id's first twelve characters (``on_session``), or a hash of it.
+
+    Claude's session ids are UUIDs, whose first twelve characters are already
+    filename-safe. Another provider's might not be, and those are hashed
+    rather than pasted into a path.
+    """
+    head = (session_id or "")[:12]
+    if head and _TOKEN_RE.match(head.replace("-", "_")):
+        return head
+    return "s" + hashlib.sha256((session_id or "").encode()).hexdigest()[:11]
+
+
 def make_run_id(ticket: str, flow: str, generation: str) -> str:
     return f"{ticket.upper()}.{flow}.{generation}"
 
@@ -205,6 +227,13 @@ class Run:
     status_id: str = ""
     seq: int = 0
     launched_at: str = ""
+    # on_pr / on_session: which event ("opened", "merged", "died", "idle"),
+    # and the PR or session it was about. Empty for status triggers.
+    event: str = ""
+    pr_number: int = 0
+    pr_url: str = ""
+    head_sha: str = ""
+    session_id: str = ""
     schema_version: int = RUN_SCHEMA_VERSION
 
     @property
@@ -215,6 +244,15 @@ class Run:
     def matched_status(self) -> str:
         """The status the rule matched: entered for on_enter, left for on_exit."""
         return self.from_status if self.trigger == "on_exit" else self.to_status
+
+    @property
+    def label(self) -> str:
+        """What fired the run, in a few words: a status, ``PR #12 opened``, ``session … idle``."""
+        if self.trigger == "on_pr" and self.pr_number:
+            return f"PR #{self.pr_number} {self.event}".strip()
+        if self.trigger == "on_session" and self.session_id:
+            return f"session {self.session_id[:8]} {self.event}".strip()
+        return self.matched_status
 
     def to_json(self) -> str:
         raw: dict[str, Any] = asdict(self)
@@ -258,6 +296,11 @@ class Run:
             status_id=_str(data.get("status_id")),
             seq=_int(data.get("seq")),
             launched_at=_str(data.get("launched_at")),
+            event=_str(data.get("event")),
+            pr_number=_int(data.get("pr_number")),
+            pr_url=_str(data.get("pr_url")),
+            head_sha=_str(data.get("head_sha")),
+            session_id=_str(data.get("session_id")),
             schema_version=_int(data.get("schema_version")) or RUN_SCHEMA_VERSION,
         )
 

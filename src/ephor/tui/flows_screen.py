@@ -78,7 +78,7 @@ def run_markup(run: Run, now: datetime | None = None) -> str:
     when = "?" if age is None else _short_age(age)
     stale = " [#d29922]stale[/]" if run.stale else ""
     reason = f"  [dim]{markup_text(run.reason, 80)}[/]" if run.reason else ""
-    status = f" [dim]· {markup_text(run.matched_status, 24)}[/]" if run.matched_status else ""
+    status = f" [dim]· {markup_text(run.label, 32)}[/]" if run.label else ""
     return (
         f"[{style}]{run.state!s:<16}[/] [bold]{markup_text(run.run_id)}[/]"
         f"{status} [dim]{when}[/]{stale}{reason}"

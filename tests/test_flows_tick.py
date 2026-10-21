@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from ephor.flows import tick as flows_tick
 from ephor.flows.runs import Run, RunState
 from ephor.flows.snapshot import Snapshot, TicketState
 from ephor.flows.tick import TickDeps, TickResult, TickStatus
+from ephor.github import PullRequest
 from ephor.jira_api import Issue
 from ephor.launcher import StartResult
 from ephor.state.models import AgentState
@@ -182,6 +184,15 @@ class World:
         self.panes: set[str] | None = set()
         # run id -> pane of the flow windows tmux reports; None = tmux silent.
         self.flow_panes: dict[str, str] | None = {}
+        # ticket -> what `gh pr list --search` says; a missing key is "no PRs".
+        self.prs: dict[str, list[PullRequest] | None] = {}
+        self.pr_calls: list[tuple[Path, str]] = []
+        self.dead_pids: set[int] = set()
+
+    def find_prs(self, repo: Path, key: str) -> list[PullRequest] | None:
+        self.pr_calls.append((repo, key))
+        found = self.prs.get(key, [])
+        return None if found is None else list(found)
 
     def deps(self) -> TickDeps:
         return TickDeps(
@@ -194,6 +205,8 @@ class World:
             work_item=self.work.get,
             live_panes=lambda: None if self.panes is None else set(self.panes),
             flow_panes=lambda: None if self.flow_panes is None else dict(self.flow_panes),
+            find_prs=self.find_prs,
+            pid_alive=lambda pid: pid not in self.dead_pids,
             launchers=runners.Launchers(
                 start=self.launch.start, open_window=self.launch.open_window
             ),
@@ -377,13 +390,6 @@ def test_a_stale_gap_makes_even_auto_runs_wait(world: World, repo: Path) -> None
     assert run.state is RunState.AWAITING_CONFIRM
     assert run.stale
     assert world.launch.windows == []
-
-
-def test_pr_and_session_rules_are_not_evaluated_or_marked_seen(world: World) -> None:
-    config = _config({"name": "pr", "on_pr": "opened", "command": "x.sh"})
-    _baseline(world, config)
-    stored = snap.load()
-    assert stored is not None and stored.rules_seen == ()
 
 
 def test_a_config_with_errors_keeps_the_snapshot_but_dispatches_nothing(world: World) -> None:
@@ -1242,3 +1248,462 @@ def test_a_relaunch_clears_an_exit_file_left_by_an_earlier_attempt(world: World)
     world.panes = {relaunched.pane}
     world.tick(config, T0 + timedelta(minutes=3))
     assert _only_run().state is RunState.LAUNCHED
+
+
+# --- on_pr --------------------------------------------------------------------------
+
+PR_REVIEW = {"name": "pr-review", "on_pr": "opened", "start": "/review-pr {ticket}"}
+PR_PING = {"name": "pr-ping", "on_pr": "opened", "command": "ping.sh {ticket}", "mode": "auto"}
+SHIPPED = {"name": "shipped", "on_pr": "merged", "command": "shipped.sh {ticket}", "mode": "auto"}
+
+
+def _pr(number: int, state: str = "OPEN", sha: str = "abc123") -> PullRequest:
+    return PullRequest(
+        number=number,
+        url=f"https://github.com/o/r/pull/{number}",
+        state=state,
+        title=f"DR-1: change {number}",
+        head_ref="feature/DR-1-x",
+        head_sha=sha,
+    )
+
+
+def _pr_baseline(world: World, config: BoardConfig, at: datetime = T0) -> None:
+    """DR-1 In Progress with no PR yet: the rule adopts and the lookup sets a baseline."""
+    world.jira.put("DR-1", "In Progress", "3")
+    result = world.tick(config, at)
+    assert result.ok, result.message
+    stored = snap.load()
+    assert stored is not None and stored.prs == {"DR-1": ()}
+
+
+def test_on_pr_opened_fires_once_for_a_new_open_pr(world: World, repo: Path) -> None:
+    config = _config(PR_REVIEW, repos={"DR": str(repo)})
+    _pr_baseline(world, config)
+    world.prs["DR-1"] = [_pr(12)]
+    result = world.tick(config, T0 + timedelta(minutes=5))
+    run = _only_run()
+    assert run.run_id == "DR-1.pr-review.pr12"
+    assert run.state is RunState.AWAITING_CONFIRM
+    assert (run.trigger, run.event, run.pr_number, run.head_sha) == (
+        "on_pr",
+        "opened",
+        12,
+        "abc123",
+    )
+    assert run.to_status == "In Progress"  # what {status} renders as
+    assert run.label == "PR #12 opened"
+    assert [(e.key, e.value, e.generation) for e in result.events] == [("DR-1", "opened", "pr12")]
+    # Seen again on later lookups: the same PR never fires twice.
+    world.tick(config, T0 + timedelta(minutes=10))
+    world.tick(config, T0 + timedelta(minutes=15))
+    assert [r.run_id for r in runs.list_runs()] == ["DR-1.pr-review.pr12"]
+
+
+def test_on_pr_lookups_are_spaced_by_pr_interval(world: World, repo: Path) -> None:
+    config = _config(PR_PING, repos={"DR": str(repo)}, pr_interval="5m")
+    _pr_baseline(world, config)
+    assert len(world.pr_calls) == 1
+    world.prs["DR-1"] = [_pr(12)]
+    world.tick(config, T0 + timedelta(minutes=1))
+    world.tick(config, T0 + timedelta(minutes=4))
+    assert len(world.pr_calls) == 1
+    assert runs.list_runs() == []
+    world.tick(config, T0 + timedelta(minutes=5))
+    assert len(world.pr_calls) == 2
+    assert world.pr_calls[-1] == (repo, "DR-1")
+    stored = snap.load()
+    assert stored is not None and stored.pr_checked_at == runs.iso(T0 + timedelta(minutes=5))
+    assert [r.run_id for r in runs.list_runs()] == ["DR-1.pr-ping.pr12"]
+
+
+def test_an_auto_pr_flow_launches_with_the_pr_in_its_payload(world: World, repo: Path) -> None:
+    config = _config(PR_PING, repos={"DR": str(repo)})
+    _pr_baseline(world, config)
+    world.prs["DR-1"] = [_pr(12)]
+    world.tick(config, T0 + timedelta(minutes=5))
+    run = _only_run()
+    assert run.state is RunState.LAUNCHED
+    [window] = world.launch.windows
+    assert window["name"] == "flow:DR-1:pr-ping"
+    assert window["env"]["EPHOR_FLOW_RUN"] == "DR-1.pr-ping.pr12"
+    payload = json.loads(Path(window["env"]["EPHOR_FLOW_PAYLOAD"]).read_text())
+    assert payload["trigger"] == "on_pr"
+    assert payload["event"] == "opened"
+    assert payload["pr"] == {
+        "number": 12,
+        "url": "https://github.com/o/r/pull/12",
+        "head_sha": "abc123",
+        "state": "OPEN",
+    }
+    assert payload["session_id"] == ""
+
+
+def test_a_pr_already_open_at_the_first_lookup_is_a_baseline(world: World, repo: Path) -> None:
+    config = _config(PR_PING, repos={"DR": str(repo)})
+    world.jira.put("DR-1", "In Progress", "3")
+    world.prs["DR-1"] = [_pr(12)]
+    world.tick(config, T0)  # adopts the rule, and the PR
+    world.tick(config, T0 + timedelta(minutes=5))
+    # A ticket new to the board whose PR is already open: also a baseline.
+    world.jira.put("DR-2", "In Progress", "3")
+    world.prs["DR-2"] = [_pr(13)]
+    world.tick(config, T0 + timedelta(minutes=10))
+    world.tick(config, T0 + timedelta(minutes=15))
+    assert runs.list_runs() == []
+    assert world.launch.windows == []
+
+
+def test_on_pr_merged_fires_on_the_merge_and_opened_does_not_refire(
+    world: World, repo: Path
+) -> None:
+    config = _config(PR_PING, SHIPPED, repos={"DR": str(repo)})
+    _pr_baseline(world, config)
+    world.prs["DR-1"] = [_pr(12)]
+    world.tick(config, T0 + timedelta(minutes=5))
+    # The ticket goes to Done; its PR merges. Done tickets with a PR last seen
+    # open are still asked about — that is how the merge is seen.
+    world.jira.put("DR-1", "Done", "20")
+    world.prs["DR-1"] = [_pr(12, "MERGED", sha="def456")]
+    world.tick(config, T0 + timedelta(minutes=10))
+    ids = sorted(r.run_id for r in runs.list_runs())
+    assert ids == ["DR-1.pr-ping.pr12", "DR-1.shipped.pr12"]
+    shipped = runs.load("DR-1.shipped.pr12")
+    assert shipped is not None and shipped.event == "merged" and shipped.head_sha == "def456"
+    # Once nothing is open on a Done ticket it is no longer looked up.
+    calls = len(world.pr_calls)
+    world.tick(config, T0 + timedelta(minutes=15))
+    assert len(world.pr_calls) == calls
+
+
+def test_a_done_ticket_with_no_open_pr_is_not_looked_up(world: World, repo: Path) -> None:
+    config = _config(SHIPPED, repos={"DR": str(repo)})
+    world.jira.put("DR-1", "Done", "20")
+    world.jira.put("DR-2", "In Progress", "3")
+    world.tick(config, T0)
+    assert [key for _, key in world.pr_calls] == ["DR-2"]
+
+
+def test_on_pr_only_asks_about_tickets_a_rule_could_fire_on(world: World, repo: Path) -> None:
+    config = _config(PR_PING, repos={"DR": str(repo)})
+    world.jira.put("DR-1", "In Progress", "3")
+    world.jira.put("DR-2", "In Progress", "3", assignee="acct-other")
+    world.tick(config, T0)
+    assert [key for _, key in world.pr_calls] == ["DR-1"]
+
+
+def test_a_gh_failure_keeps_the_baseline_and_fires_nothing(world: World, repo: Path) -> None:
+    config = _config(PR_PING, repos={"DR": str(repo)})
+    _pr_baseline(world, config)
+    world.prs["DR-1"] = None  # gh did not answer
+    world.tick(config, T0 + timedelta(minutes=5))
+    stored = snap.load()
+    assert stored is not None and stored.prs == {"DR-1": ()}
+    assert runs.list_runs() == []
+    # The next answer is compared with the baseline that survived.
+    world.prs["DR-1"] = [_pr(12)]
+    world.tick(config, T0 + timedelta(minutes=10))
+    assert [r.run_id for r in runs.list_runs()] == ["DR-1.pr-ping.pr12"]
+
+
+def test_a_ticket_with_no_repo_is_not_looked_up(world: World) -> None:
+    config = _config(PR_PING)
+    world.jira.put("DR-1", "In Progress", "3")
+    world.tick(config, T0)
+    assert world.pr_calls == []
+    stored = snap.load()
+    assert stored is not None and stored.prs == {}
+
+
+def test_an_awaiting_opened_run_expires_when_the_pr_closes(world: World, repo: Path) -> None:
+    config = _config(PR_REVIEW, repos={"DR": str(repo)})
+    _pr_baseline(world, config)
+    world.prs["DR-1"] = [_pr(12)]
+    world.tick(config, T0 + timedelta(minutes=5))
+    # A status move does not end it: an on_pr run is about the PR.
+    world.jira.put("DR-1", "Peer Review", "10")
+    world.tick(config, T0 + timedelta(minutes=6))
+    assert _only_run().state is RunState.AWAITING_CONFIRM
+    world.prs["DR-1"] = [_pr(12, "CLOSED")]
+    world.tick(config, T0 + timedelta(minutes=10))
+    run = _only_run()
+    assert run.state is RunState.EXPIRED
+    assert run.reason == "PR #12 is no longer open"
+
+
+def test_an_approved_pr_review_waits_for_the_implementing_session(world: World, repo: Path) -> None:
+    config = _config(PR_REVIEW, repos={"DR": str(repo)})
+    _pr_baseline(world, config)
+    world.prs["DR-1"] = [_pr(12)]
+    world.tick(config, T0 + timedelta(minutes=5))
+    runs.approve("DR-1.pr-review.pr12")
+    world.sessions = [_agent("impl-session", "DR-1")]
+    world.tick(config, T0 + timedelta(minutes=6))
+    run = _only_run()
+    assert run.state is RunState.BLOCKED
+    assert run.reason.startswith("launch guard: session impl-ses")
+    world.sessions = []
+    world.tick(config, T0 + timedelta(minutes=7))
+    assert _only_run().state is RunState.LAUNCHED
+    [window] = world.launch.windows
+    assert "/review-pr DR-1" in window["command"]
+
+
+def test_on_pr_after_a_stale_gap_waits_for_a_human(world: World, repo: Path) -> None:
+    config = _config(PR_PING, repos={"DR": str(repo)})
+    _pr_baseline(world, config)
+    world.prs["DR-1"] = [_pr(12)]
+    world.tick(config, T0 + timedelta(hours=3))
+    run = _only_run()
+    assert run.state is RunState.AWAITING_CONFIRM and run.stale
+    assert world.launch.windows == []
+
+
+def test_removing_every_on_pr_rule_clears_the_observation(world: World, repo: Path) -> None:
+    config = _config(PR_PING, repos={"DR": str(repo)})
+    _pr_baseline(world, config)
+    world.tick(_config(repos={"DR": str(repo)}), T0 + timedelta(minutes=1))
+    stored = snap.load()
+    assert stored is not None and (stored.prs, stored.pr_checked_at) == ({}, "")
+    # Put back later: a fresh baseline, so a PR opened meanwhile does not fire.
+    world.prs["DR-1"] = [_pr(12)]
+    world.tick(config, T0 + timedelta(minutes=2))
+    world.tick(config, T0 + timedelta(minutes=8))
+    assert runs.list_runs() == []
+
+
+def test_dry_run_looks_prs_up_but_writes_nothing(world: World, repo: Path) -> None:
+    config = _config(PR_PING, repos={"DR": str(repo)})
+    _pr_baseline(world, config)
+    before = snap.snapshot_path().read_text()
+    world.prs["DR-1"] = [_pr(12)]
+    result = world.tick(config, T0 + timedelta(minutes=5), dry_run=True)
+    assert [a.verb for a in result.actions] == ["created", "dispatch"]
+    assert snap.snapshot_path().read_text() == before
+    assert runs.list_runs() == [] and world.launch.windows == []
+
+
+# --- on_session -----------------------------------------------------------------------
+
+DIED = {"name": "on-died", "on_session": "died", "command": "died.sh {ticket}", "mode": "auto"}
+IDLE = {"name": "on-idle", "on_session": "idle", "command": "idle.sh {ticket}"}
+SID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+
+def _session(
+    sid: str = SID,
+    ticket: str = "DR-1",
+    status: str = "WORKING",
+    *,
+    pid: int | None = 4242,
+    last_event: datetime = T0,
+) -> AgentState:
+    return AgentState.from_dict(
+        {
+            "session_id": sid,
+            "cwd": "/nowhere",
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "status": status,
+            "ticket": ticket,
+            "agent_pid": pid,
+            "last_event_time": runs.iso(last_event),
+            "schema_version": 4,
+        }
+    )
+
+
+def _session_baseline(world: World, config: BoardConfig, *sessions: AgentState) -> None:
+    world.jira.put("DR-1", "In Progress", "3")
+    world.sessions = list(sessions)
+    result = world.tick(config, T0)
+    assert result.ok, result.message
+
+
+def test_on_session_died_fires_when_a_seen_session_goes_dead(world: World, repo: Path) -> None:
+    config = _config(DIED, repos={"DR": str(repo)})
+    _session_baseline(world, config, _session())
+    world.sessions = [_session(status="DEAD")]
+    world.dead_pids.add(4242)
+    result = world.tick(config, T0 + timedelta(minutes=1))
+    run = _only_run()
+    assert run.run_id == f"DR-1.on-died.{SID[:12]}"
+    assert (run.event, run.session_id, run.label) == ("died", SID, f"session {SID[:8]} died")
+    assert run.state is RunState.LAUNCHED
+    assert [e.value for e in result.events] == ["died"]
+    payload = json.loads(Path(world.launch.windows[0]["env"]["EPHOR_FLOW_PAYLOAD"]).read_text())
+    assert (payload["session_id"], payload["pr"]) == (SID, None)
+    # Still DEAD on the next tick, then gone: one death, one run.
+    world.tick(config, T0 + timedelta(minutes=2))
+    world.sessions = []
+    world.tick(config, T0 + timedelta(minutes=3))
+    assert len(runs.list_runs()) == 1
+
+
+def test_a_deleted_state_file_of_a_dead_process_is_a_death(world: World, repo: Path) -> None:
+    config = _config(DIED, repos={"DR": str(repo)})
+    _session_baseline(world, config, _session(status="IDLE"))
+    # The reconciler removed the file before any tick saw it DEAD.
+    world.sessions = []
+    world.dead_pids.add(4242)
+    world.tick(config, T0 + timedelta(minutes=1))
+    assert [r.run_id for r in runs.list_runs()] == [f"DR-1.on-died.{SID[:12]}"]
+
+
+def test_resume_residue_and_unknown_vanishings_are_not_deaths(world: World, repo: Path) -> None:
+    config = _config(DIED, repos={"DR": str(repo)})
+    other = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+    _session_baseline(world, config, _session(), _session(other, pid=None))
+    # SID is marked DEAD by the scan while its process lives on (`--resume`);
+    # `other` had no pid recorded and its file disappeared.
+    world.sessions = [_session(status="DEAD")]
+    world.tick(config, T0 + timedelta(minutes=1))
+    world.sessions = []
+    world.tick(config, T0 + timedelta(minutes=2))
+    assert runs.list_runs() == []
+
+
+def test_on_session_idle_fires_after_settle(world: World, repo: Path) -> None:
+    config = _config(IDLE, repos={"DR": str(repo)}, settle="10m")
+    _session_baseline(world, config, _session(status="WORKING"))
+    went_idle = T0 + timedelta(minutes=1)
+    world.sessions = [_session(status="IDLE", last_event=went_idle)]
+    world.tick(config, T0 + timedelta(minutes=2))
+    world.tick(config, T0 + timedelta(minutes=10))
+    assert runs.list_runs() == []
+    world.tick(config, went_idle + timedelta(minutes=10))
+    run = _only_run()
+    assert run.run_id == f"DR-1.on-idle.{SID[:12]}"
+    assert run.state is RunState.AWAITING_CONFIRM
+    # Work, then idle again: the same session never fires the rule twice.
+    world.sessions = [_session(status="WORKING", last_event=T0 + timedelta(minutes=12))]
+    world.tick(config, T0 + timedelta(minutes=12))
+    later = T0 + timedelta(minutes=13)
+    world.sessions = [_session(status="IDLE", last_event=later)]
+    world.tick(config, later + timedelta(minutes=11))
+    assert len(runs.list_runs()) == 1
+
+
+def test_an_idle_run_expires_when_its_session_works_again(world: World, repo: Path) -> None:
+    config = _config(IDLE, repos={"DR": str(repo)}, settle="10m")
+    _session_baseline(world, config, _session(status="IDLE", last_event=T0))
+    world.tick(config, T0 + timedelta(minutes=10))
+    assert _only_run().state is RunState.AWAITING_CONFIRM
+    world.sessions = [_session(status="WORKING", last_event=T0 + timedelta(minutes=11))]
+    world.tick(config, T0 + timedelta(minutes=11))
+    run = _only_run()
+    assert run.state is RunState.EXPIRED
+    assert run.reason == f"session {SID[:8]} is no longer idle"
+
+
+def test_a_session_first_seen_already_settled_is_a_baseline(world: World, repo: Path) -> None:
+    config = _config(IDLE, repos={"DR": str(repo)}, settle="10m")
+    _session_baseline(world, config, _session(status="IDLE", last_event=T0 - timedelta(hours=2)))
+    newcomer = "99998888-7777-6666-5555-444433332222"
+    world.sessions = [
+        _session(status="IDLE", last_event=T0 - timedelta(hours=2)),
+        _session(newcomer, status="IDLE", last_event=T0 - timedelta(hours=1)),
+    ]
+    world.tick(config, T0 + timedelta(minutes=1))
+    world.tick(config, T0 + timedelta(minutes=2))
+    assert runs.list_runs() == []
+
+
+def test_on_session_ignores_tickets_off_the_board_and_other_assignees(
+    world: World, repo: Path
+) -> None:
+    config = _config(DIED, repos={"DR": str(repo)})
+    world.jira.put("DR-2", "In Progress", "3", assignee="acct-other")
+    s2 = "22222222-2222-2222-2222-222222222222"
+    s3 = "33333333-3333-3333-3333-333333333333"
+    _session_baseline(world, config, _session(s2, "DR-2", pid=2), _session(s3, "OPS-9", pid=3))
+    world.sessions = [_session(s2, "DR-2", "DEAD", pid=2), _session(s3, "OPS-9", "DEAD", pid=3)]
+    world.dead_pids.update({2, 3})
+    result = world.tick(config, T0 + timedelta(minutes=1))
+    assert sorted(e.key for e in result.events) == ["DR-2", "OPS-9"]
+    assert runs.list_runs() == []
+
+
+def test_session_observations_are_kept_only_while_a_rule_reads_them(
+    world: World, repo: Path
+) -> None:
+    config = _config(DIED, repos={"DR": str(repo)})
+    _session_baseline(world, config, _session())
+    stored = snap.load()
+    assert stored is not None and list(stored.sessions_seen) == [SID]
+    assert stored.sessions_seen[SID].pid == 4242
+    world.tick(_config(repos={"DR": str(repo)}), T0 + timedelta(minutes=1))
+    stored = snap.load()
+    assert stored is not None and stored.sessions_seen == {}
+
+
+def test_a_new_session_rule_adopts_before_it_fires(world: World, repo: Path) -> None:
+    _session_baseline(world, _config(repos={"DR": str(repo)}), _session())
+    config = _config(DIED, repos={"DR": str(repo)})
+    world.sessions = [_session(status="DEAD")]
+    world.dead_pids.add(4242)
+    result = world.tick(config, T0 + timedelta(minutes=1))
+    assert result.adopted == ("on-died",)
+    assert runs.list_runs() == []
+
+
+def test_the_tick_scans_sessions_once(world: World, repo: Path) -> None:
+    config = _config(DIED, REVIEW, repos={"DR": str(repo)})
+    _session_baseline(world, config, _session("s-other", "DR-7"))
+    _approved_review_on(world, config)
+    calls: list[int] = []
+    original = world.deps
+
+    def counting() -> TickDeps:
+        base = original()
+
+        def sessions() -> list[AgentState]:
+            calls.append(1)
+            return base.sessions()
+
+        return replace(base, sessions=sessions)
+
+    world.deps = counting  # type: ignore[method-assign]
+    world.tick(config, T0 + timedelta(minutes=3))
+    assert len(calls) == 1
+
+
+def _approved_review_on(world: World, config: BoardConfig) -> None:
+    world.jira.put("DR-1", "Peer Review", "10")
+    world.tick(config, T0 + timedelta(minutes=1))
+    approved, _ = runs.approve("DR-1.review.10-1")
+    assert approved is not None
+
+
+def test_no_session_event_fires_on_a_ticket_the_last_search_missed(
+    world: World, repo: Path
+) -> None:
+    config = _config(DIED, repos={"DR": str(repo)})
+    _session_baseline(world, config, _session())
+    # DR-1 drops out of the search (kept in the snapshot, unseen) as its
+    # session dies: absence is not a reason to fire, whatever the session did.
+    del world.jira.issues["DR-1"]
+    world.sessions = [_session(status="DEAD")]
+    world.dead_pids.add(4242)
+    result = world.tick(config, T0 + timedelta(minutes=1))
+    assert [e.value for e in result.events] == ["died"]
+    stored = snap.load()
+    assert stored is not None and stored.tickets["DR-1"].unseen_ticks == 1
+    assert runs.list_runs() == []
+
+
+def test_a_broken_board_does_not_expire_a_waiting_idle_run(world: World, repo: Path) -> None:
+    config = _config(IDLE, repos={"DR": str(repo)}, settle="10m")
+    _session_baseline(world, config, _session(status="IDLE", last_event=T0))
+    world.tick(config, T0 + timedelta(minutes=10))
+    assert _only_run().state is RunState.AWAITING_CONFIRM
+    broken = board.parse(
+        {
+            "board": {"projects": ["DR"]},
+            "repos": {"DR": str(repo)},
+            "flows": {"settle": "10m"},
+            "flow": [IDLE, {"name": "bad", "on_enter": "X"}],
+        }
+    )
+    assert broken.errors
+    world.tick(broken, T0 + timedelta(minutes=11))
+    assert _only_run().state is RunState.AWAITING_CONFIRM

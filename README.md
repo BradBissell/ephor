@@ -195,6 +195,60 @@ a week at a time and nothing else in the toolchain notices it.
 
 Unset, no request is made. ephor stays a local tool until told otherwise.
 
+### The board, and flows that act on it
+
+Write `~/.config/ephor/board.toml` and the dashboard can also show your Jira
+board. Press `g` until the grouping is `status`: sessions sit in the lane of
+their ticket's status, in your board's column order. Tickets with nothing
+running on them get rows of their own.
+
+The same file holds **flows**, rules that fire when something happens to a
+ticket:
+
+```toml
+[board]
+projects = ["DR"]
+columns = ["To Do", "In Progress", "Peer Review", "Done"]
+
+[repos]
+DR = "~/projects/work/aim-myt"
+
+[[flow]]                       # offer a review when a ticket lands in Peer Review
+name = "review"
+on_enter = "Peer Review"
+start = "/review-pr {ticket}"
+
+[[flow]]                       # run a script, unattended, when its PR merges
+name = "shipped"
+on_pr = "merged"
+command = "~/.config/ephor/flows/shipped.sh {ticket}"
+mode = "auto"
+```
+
+- **Triggers:** `on_enter` / `on_exit` a status, `on_pr = "opened" |
+  "merged"`, and `on_session = "died" | "idle"`.
+- **What runs:** `start =` opens an agent session with a prompt or skill.
+  `command =` runs any executable (a shell script, or a LangGraph program
+  that reads `$EPHOR_FLOW_PAYLOAD`).
+- **Where it runs:** every flow gets its own detached tmux window, so it
+  never takes your focus.
+- **Approval:** agent flows always wait for you. Press `f` in the dashboard,
+  then `y` to approve or `n` to deny, or use `ephor flows approve <run>`.
+
+There is no daemon. The dashboard runs a **tick** every minute: it searches
+the board, compares the result with the last snapshot, and acts on what
+changed. `ephor flows watch` or a systemd timer does the same while the
+dashboard is closed.
+
+Every event fires each rule at most once. A new rule adopts the board as it
+stands rather than firing on everything already there. Jira is only ever
+read.
+
+`ephor flows check` validates the file, and `ephor flows tick --dry-run`
+shows what would happen. The full reference is
+[`docs/flows.md`](docs/flows.md), and there is a commented example in
+[`docs/examples/board.toml`](docs/examples/board.toml).
+
 ### Managing twenty-five sessions
 
 | Key | Does |
@@ -206,6 +260,7 @@ Unset, no request is made. ephor stays a local tool until told otherwise.
 | `A` / `D` | standing allow for a session / revoke a decision |
 | `N` / `R` | start another session on this ticket / reopen this session |
 | `x`, `s`, `o` | kill, summarize, open PR — all act on the marked set |
+| `f` | flow runs: `y` approve / `n` deny a run awaiting confirmation |
 
 **Marking is what makes an action a batch action.** With nothing marked
 every key behaves exactly as it did before, on the cursor row.

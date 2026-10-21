@@ -21,7 +21,8 @@ Two kinds of flow:
 
 Every flow is told about its event the same way: ``EPHOR_FLOW_RUN`` (the run
 id), ``EPHOR_FLOW_PAYLOAD`` (a 0600 JSON file with the ticket, title,
-statuses and repo) and ``EPHOR_TICKET``. A ``command =`` flow also gets
+statuses, repo, and the PR or session the event was about) and
+``EPHOR_TICKET``. A ``command =`` flow also gets
 ``EPHOR_FLOW_TITLE`` and ``EPHOR_FLOW_STATUS``, which are the safe way to use
 ticket text inside a quoted string.
 """

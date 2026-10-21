@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import stat
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from ephor.flows.snapshot import (
     DROP_AFTER_UNSEEN,
     PrState,
     RefreshStatus,
+    SessionSeen,
     Snapshot,
     TicketState,
 )
@@ -246,14 +248,14 @@ def test_fields_the_tick_owns_are_carried_forward() -> None:
         rules_seen=("abc",),
         myself="acct-1",
         pr_checked_at="2026-01-01T00:00:00+00:00",
-        prs={"DR-1": PrState(number=7, state="OPEN", head_sha="deadbeef", url="u")},
-        sessions_seen={"s1": {"status": "IDLE"}},
+        prs={"DR-1": (PrState(number=7, state="OPEN", head_sha="deadbeef", url="u"),)},
+        sessions_seen={"s1": SessionSeen(ticket="DR-1", status="IDLE", pid=9, settled=True)},
     )
     new, _ = snap.advance(previous, [], now=T0)
     assert new.rules_seen == ("abc",)
     assert new.myself == "acct-1"
-    assert new.prs["DR-1"].number == 7
-    assert new.sessions_seen == {"s1": {"status": "IDLE"}}
+    assert new.prs["DR-1"][0].number == 7
+    assert new.sessions_seen == previous.sessions_seen
     assert new.taken_at != previous.taken_at
 
 
@@ -300,7 +302,18 @@ def test_malformed_entries_are_skipped_not_fatal() -> None:
             {
                 "taken_at": "2026-10-01T12:00:00+00:00",
                 "tickets": {"DR-1": {"status": "To Do", "seq": "x"}, "DR-2": "nope"},
-                "prs": {"DR-1": {"number": "7"}, "DR-3": {"number": 3}},
+                "prs": {
+                    "DR-1": {"number": "7"},
+                    "DR-3": {"number": 3},  # the older single-object shape
+                    "DR-4": [{"number": 4, "state": "OPEN"}, {"number": "x"}],
+                    "DR-5": [],
+                    "DR-6": "nope",
+                },
+                "sessions_seen": {
+                    "s1": {"ticket": "DR-1", "status": "IDLE", "pid": 3, "settled": True},
+                    "s2": {"status": "IDLE"},
+                    "s3": "nope",
+                },
                 "rules_seen": ["a", 3],
             }
         )
@@ -309,8 +322,25 @@ def test_malformed_entries_are_skipped_not_fatal() -> None:
     assert loaded is not None
     assert list(loaded.tickets) == ["DR-1"]
     assert loaded.tickets["DR-1"].seq == 0
-    assert list(loaded.prs) == ["DR-3"]
+    # DR-4 holds one malformed PR: dropped whole, since a baseline missing a
+    # PR would read as that PR just opening. An empty list is a real baseline.
+    assert loaded.prs == {"DR-3": (PrState(number=3),), "DR-5": ()}
+    assert loaded.sessions_seen == {
+        "s1": SessionSeen(ticket="DR-1", status="IDLE", pid=3, settled=True)
+    }
     assert loaded.rules_seen == ("a",)
+
+
+def test_pr_and_session_observations_round_trip() -> None:
+    new, _ = snap.advance(None, [_issue("DR-1", "To Do", "1")], now=T0)
+    new = replace(
+        new,
+        pr_checked_at="2026-10-20T12:00:00+00:00",
+        prs={"DR-1": (PrState(1, "MERGED", "a", "u1"), PrState(2, "OPEN", "b", "u2")), "DR-2": ()},
+        sessions_seen={"s": SessionSeen(ticket="DR-1", status="DEAD", pid=5)},
+    )
+    assert snap.save(new)
+    assert snap.load() == new
 
 
 # --- fetch / refresh ----------------------------------------------------------
