@@ -290,6 +290,9 @@ class RowContext:
     drift: str = ""
     decision_queued: str = ""
     failing_checks: tuple[str, ...] = field(default=())
+    # The ticket's flow run in flight, as a short badge (``⏸ review?``); see
+    # ephor.flows.runs.badge. Flow names are [a-z0-9-], so it is markup-safe.
+    flow_badge: str = ""
 
 
 _EMPTY_CONTEXT = RowContext()
@@ -377,6 +380,10 @@ def _warning(context: RowContext, stale: bool) -> tuple[str, str, str] | None:
             f"> {context.decision_queued} queued",
             "#7ee787",
         )
+    if context.flow_badge:
+        # Last: a flow waiting on you is news, but less urgent than any of
+        # the above, and `f` lists every run in full.
+        return (f"{context.flow_badge} — f for flows", context.flow_badge, "#EBCB8B")
     return None
 
 

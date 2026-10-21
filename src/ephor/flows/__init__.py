@@ -13,6 +13,11 @@ The modules:
   against ``flows/snapshot.json``, and persist it. On its own that is
   everything the status lanes need; the flow tick builds on the same
   functions rather than running a second search.
+* :mod:`ephor.flows.tick` — the tick itself: rules, adopt mode, guards and
+  dispatch, run between the snapshot's diff and its write.
+* :mod:`ephor.flows.runs` — one file per flow firing, claimed by an
+  exclusive create and moved through its states by compare-and-set.
+* :mod:`ephor.flows.runners` — how a run is launched: a detached tmux window.
 * :mod:`ephor.flows.cli` — the ``ephor flows ...`` subcommands.
 
 All state lives under :func:`flows_dir`, beside the session state directory.

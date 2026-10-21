@@ -350,6 +350,7 @@ def start(
     dry_run: bool = False,
     detached: bool = False,
     target_session: str = "",
+    extra_env: dict[str, str] | None = None,
 ) -> StartResult:
     """Create the worktree, open the window, launch the agent, record the work.
 
@@ -359,6 +360,8 @@ def start(
 
     ``detached`` and ``target_session`` pass through to :func:`open_window`;
     both default to the interactive behaviour ``ephor start`` has always had.
+    ``extra_env`` is added to the window's environment — the flows tick uses
+    it to hand an agent its run id and payload file.
     """
     ticket = normalize_ticket(ticket_raw)
     if ticket is None:
@@ -397,6 +400,8 @@ def start(
         # with EPHOR_TICKET already exported for whatever they start by hand.
         command = os.environ.get("SHELL") or "/bin/sh"
         env = {"EPHOR_TICKET": ticket}
+    if extra_env:
+        env = {**extra_env, **env}
     window, pane, window_message = open_window(
         window_name or ticket,
         target,

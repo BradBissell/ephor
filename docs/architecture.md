@@ -92,6 +92,7 @@ src/ephor/
 ├── tui/app.py                 ← Textual TUI dashboard
 ├── tui/rows.py                ← row ids: session / group header / sessionless ticket row
 ├── tui/lanes.py               ← the `status` grouping: board lanes + ticket rows
+├── tui/flows_screen.py        ← the `f` screen: flow runs, `y` approve / `n` deny
 ├── usage.py                   ← ccusage transcript-token aggregation (Claude)
 ├── account_usage.py           ← server-anchored per-account 5h/7d limits (Claude)
 ├── summarizer.py              ← one-sentence reply summary via the agent's summarize command
@@ -107,7 +108,10 @@ src/ephor/
 ├── jira_api.py                ← opt-in Jira read: status, summary, assignee, drift, board search
 ├── board.py                   ← board.toml: lanes, repos, flow rules (validated, errors collected)
 ├── flows/snapshot.py          ← board search → diff → flows/snapshot.json (the rule-less tick)
-├── flows/cli.py               ← `ephor flows ...` (board)
+├── flows/tick.py              ← the flows tick: rules, adopt/stale, guards, dispatch
+├── flows/runs.py              ← flows/runs/<run_id>.json: O_EXCL claims + compare-and-set states
+├── flows/runners.py           ← start= / command= in detached tmux windows, `.exit` wrapper
+├── flows/cli.py               ← `ephor flows ...` (board, tick, ls, approve, deny, pause, resume, check)
 ├── filelock.py                ← sidecar flock for stores written from more than one process
 └── notify.py                  ← opt-in push (ntfy/webhook); policy engine that decides
                                what is worth interrupting you for
@@ -292,3 +296,25 @@ their own row-id prefix (`"\x00tkt:"`, beside the group headers'
 when the cursor is on a header or a ticket row — it never falls back to
 the marked set from there, so a keystroke aimed at a ticket can never land
 on sessions marked elsewhere on the board.
+
+## Flows tick
+
+`ephor flows tick` (also the TUI's 60-second board worker, which replaces
+the rule-less refresh above) is that refresh with `board.toml`'s rules run
+in the middle: search → diff → create runs → tend old runs → dispatch →
+write the snapshot last. A first snapshot, or a rule whose fingerprint is not
+in `rules_seen`, adopts the board and fires nothing; after a gap longer than
+`max_event_age` every new run waits for confirmation (`stale`).
+
+A run is a file named `<KEY>.<flow>.<generation>` (`<status_id>-<seq>` for
+`on_enter` / `on_exit`), claimed by an exclusive create, so the same event
+can never launch twice. It moves `awaiting_confirm → claimed → launched →
+done | failed`, or ends `denied`, `expired`, `superseded` or `stuck`;
+`blocked` is a guard's "not now" and is retried while the generation is
+still the ticket's latest. Guards run in a fixed order — pause flag, hourly
+cap, per-ticket breaker, then for agent flows the live-agent cap and the
+launch guard — followed by an uncached `GET issue` re-check. Flows launch
+in detached tmux windows named `flow:<KEY>:<flow>`; `command =` flows run
+under a wrapper that writes `runs/<run_id>.exit`, which a later tick folds
+into `done` / `failed`. `on_pr` and `on_session` rules are validated but not
+yet evaluated.

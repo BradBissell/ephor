@@ -20,10 +20,16 @@ _BADGES: tuple[tuple[str, str, str], ...] = (
     ("DEAD", "dead", "#3b4048"),
 )
 _PRIMARY = "#00ffff"
+_FLOW = "#EBCB8B"
 
 
-def format_header(summary: StatusSummary) -> str:
-    """Pure formatter — extracted from the widget so tests can assert on text."""
+def format_header(summary: StatusSummary, flows_awaiting: int = 0) -> str:
+    """Pure formatter — extracted from the widget so tests can assert on text.
+
+    ``flows_awaiting`` is how many flow runs wait for your confirmation; the
+    cell appears only when there are some, since most dashboards have no
+    board.toml at all.
+    """
     cells: list[str] = []
     for label, attr, color in _BADGES:
         count = getattr(summary, attr, 0)
@@ -32,11 +38,13 @@ def format_header(summary: StatusSummary) -> str:
         else:
             cells.append(f"[dim]{label} 0[/]")
     cells.append(f"[bold {_PRIMARY}]TOTAL {summary.total}[/]")
+    if flows_awaiting:
+        cells.append(f"[bold {_FLOW}]FLOW? {flows_awaiting}[/] [dim](f)[/]")
     return "  ".join(cells)
 
 
 class HeaderBar(Static):
     """Status counters across the top of the dashboard."""
 
-    def update_summary(self, summary: StatusSummary) -> None:
-        self.update(format_header(summary))
+    def update_summary(self, summary: StatusSummary, flows_awaiting: int = 0) -> None:
+        self.update(format_header(summary, flows_awaiting))

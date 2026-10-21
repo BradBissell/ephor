@@ -167,6 +167,73 @@ def test_a_ticket_unseen_for_too_long_is_dropped() -> None:
     assert "DR-1" not in current.tickets
 
 
+def _drop(current: Snapshot, *, now: datetime = T0) -> Snapshot:
+    for _ in range(DROP_AFTER_UNSEEN + 1):
+        current, _ = snap.advance(current, [], now=now)
+    return current
+
+
+def test_a_dropped_ticket_leaves_a_tombstone_and_returns_with_a_new_seq() -> None:
+    first, _ = snap.advance(None, [_issue("DR-1", "To Do", "1")], now=T0)
+    second, _ = snap.advance(first, [_issue("DR-1", "Peer Review", "10")], now=T0)
+    gone = _drop(second)
+    assert "DR-1" not in gone.tickets
+    assert gone.dropped["DR-1"].seq == 1
+    assert gone.dropped["DR-1"].dropped_at == "2026-10-01T12:00:00+00:00"
+    back, moves = snap.advance(gone, [_issue("DR-1", "Peer Review", "10")], now=T0)
+    assert back.tickets["DR-1"].seq == 2
+    assert [(m.appeared, m.seq) for m in moves] == [(True, 2)]
+    assert "DR-1" not in back.dropped
+
+
+def test_old_tombstones_are_pruned() -> None:
+    first, _ = snap.advance(None, [_issue("DR-1", "To Do", "1")], now=T0)
+    gone = _drop(first)
+    later = T0 + timedelta(days=snap.TOMBSTONE_KEEP_DAYS - 1)
+    kept, _ = snap.advance(gone, [], now=later)
+    assert "DR-1" in kept.dropped
+    pruned, _ = snap.advance(kept, [], now=T0 + timedelta(days=snap.TOMBSTONE_KEEP_DAYS + 1))
+    assert pruned.dropped == {}
+
+
+def test_a_baseline_starts_each_ticket_at_its_seq_floor() -> None:
+    new, moves = snap.advance(
+        None,
+        [_issue("DR-1", "To Do", "1"), _issue("DR-2", "To Do", "1")],
+        now=T0,
+        seq_floor={"DR-1": 4},
+    )
+    assert moves == []
+    assert (new.tickets["DR-1"].seq, new.tickets["DR-2"].seq) == (4, 0)
+    # Only a baseline is seeded: with a previous snapshot, the floor is ignored.
+    again, _ = snap.advance(new, [_issue("DR-3", "To Do", "1")], now=T0, seq_floor={"DR-3": 9})
+    assert again.tickets["DR-3"].seq == 0
+
+
+def test_dropped_and_scope_round_trip() -> None:
+    stored = Snapshot(
+        taken_at="2026-01-01T00:00:00+00:00",
+        dropped={"DR-1": snap.DroppedTicket(seq=3, dropped_at="2026-01-01T00:00:00+00:00")},
+        scope="abc123",
+    )
+    assert snap.save(stored)
+    loaded = snap.load()
+    assert loaded is not None
+    assert loaded.dropped == stored.dropped
+    assert loaded.scope == "abc123"
+    # A snapshot written before these fields existed reads them as empty.
+    old = Snapshot.from_dict({"taken_at": "2026-01-01T00:00:00+00:00", "dropped": {"x": 1}})
+    assert (old.dropped, old.scope) == ({}, "")
+
+
+def test_board_scope_follows_the_search() -> None:
+    one = snap.board_scope(_config().board)
+    assert one == snap.board_scope(_config().board)
+    assert len(one) == 12
+    assert one != snap.board_scope(_config(projects=["DR", "OPS"]).board)
+    assert one != snap.board_scope(_config(jql="assignee = currentUser()").board)
+
+
 def test_duplicate_and_lowercase_keys_are_folded() -> None:
     new, _ = snap.advance(None, [_issue("dr-1", "To Do", "1"), _issue("DR-1", "Done", "9")], now=T0)
     assert list(new.tickets) == ["DR-1"]
@@ -298,6 +365,7 @@ def test_refresh_persists_the_snapshot_and_logs_each_move() -> None:
     stored = snap.load()
     assert stored is not None
     assert stored.tickets["DR-1"].seq == 1
+    assert stored.scope == snap.board_scope(_config().board)
 
     events = [e for e in eventlog.read() if e.kind is eventlog.EventKind.TICKET_TRANSITIONED]
     assert [(e.ticket, e.detail) for e in events] == [

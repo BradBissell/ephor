@@ -60,6 +60,8 @@ from ephor.account_usage import (
     save_store as save_account_store,
 )
 from ephor.constants import WORK_ATTENTION_DISPLAY, AgentStatus, WorkAttention
+from ephor.flows import runs as flow_runs
+from ephor.flows.runs import Run, RunState
 from ephor.github import PrResolver, PullRequest
 from ephor.jira import clear_cwd_cache, match_for_agent, ticket_for_agent
 from ephor.jira_api import IssueResolver
@@ -87,6 +89,7 @@ from ephor.tmux.navigator import (
     kill_session,
 )
 from ephor.tui.activity import ActivitySampler
+from ephor.tui.flows_screen import FlowsScreen
 from ephor.tui.lanes import (
     SNAPSHOT_REFRESH_INTERVAL,
     LaneData,
@@ -202,6 +205,9 @@ class EphorApp(App[int]):
             "g", "cycle_grouping", "group rows by ticket / repo / Jira status lane / not at all"
         ),
         Binding("z", "toggle_collapse", "collapse or expand the group at the cursor"),
+        # Ticket flows (board.toml): y / n inside the screen, never a / d,
+        # which answer permission requests out here.
+        Binding("f", "flows", "flow runs: approve / deny"),
         # Launching, not just watching.
         Binding("N", "new_session", "start another session on this row's ticket"),
         Binding("R", "resume_session", "reopen this session in a new tmux window"),
@@ -260,6 +266,9 @@ class EphorApp(App[int]):
         self._lanes = Lanes()
         self._session_tickets: set[str] = set()
         self._board_in_flight: bool = False
+        # A tick was asked for (a run was just approved) while one was
+        # running; run another as soon as it lands.
+        self._board_rerun: bool = False
         # session_id -> the other sessions sharing its worktree. Recomputed
         # each refresh from cwds we already have; see gitinfo.collisions.
         self._collisions: dict[str, tuple[str, ...]] = {}
@@ -527,7 +536,9 @@ class EphorApp(App[int]):
             for i, (row_id, agent) in enumerate(visible):
                 if is_virtual_row(row_id):
                     ticket = ticket_of_virtual_row(row_id)
-                    ticket_row = TicketRow(ticket, self._lanes.ticket(ticket))
+                    ticket_row = TicketRow(
+                        ticket, self._lanes.ticket(ticket), self._lanes.badge_for(ticket)
+                    )
                     item = ListItem(ticket_row)
                     new_tickets[row_id] = ticket_row
                 elif agent is None:
@@ -704,7 +715,8 @@ class EphorApp(App[int]):
             if row is not None:
                 self._paint_row(row, agent, speaking_sid)
         for row_id, ticket_row in self._tickets_by_id.items():
-            ticket_row.update_ticket(self._lanes.ticket(ticket_of_virtual_row(row_id)))
+            ticket = ticket_of_virtual_row(row_id)
+            ticket_row.update_ticket(self._lanes.ticket(ticket), self._lanes.badge_for(ticket))
         if not self._headers_by_id:
             return
         members = self._group_members(agents)
@@ -813,6 +825,7 @@ class EphorApp(App[int]):
             drift=jira_drift(issue, pr.state if pr else "") or "",
             decision_queued=decision,
             failing_checks=pr.failing_checks if pr else (),
+            flow_badge=self._lanes.badge_for(ticket),
         )
 
     def _paint_row(self, row: SessionRow, agent: AgentState, speaking_sid: str | None) -> None:
@@ -999,7 +1012,7 @@ class EphorApp(App[int]):
         """
         summary = StatusSummary.from_agents(agents)
         if self._header_bar is not None:
-            self._header_bar.update_summary(summary)
+            self._header_bar.update_summary(summary, self._lanes.awaiting_count)
         if self._summary_line is not None:
             self._summary_line.update(
                 _render_summary_line(
@@ -2058,8 +2071,32 @@ class EphorApp(App[int]):
 
     # ---- status lanes ----------------------------------------------------
 
+    def action_flows(self) -> None:
+        """Open the flow runs screen (``y`` approve, ``n`` deny). Bound to `f`."""
+        self.push_screen(
+            FlowsScreen(
+                self._lanes.runs,
+                on_change=self._on_flow_answered,
+                paused=flow_runs.is_paused(),
+            )
+        )
+
+    def _on_flow_answered(self, run: Run) -> None:
+        """A run was approved or denied in the flows screen."""
+        self._lanes.update_run(run)
+        if run.state is RunState.CLAIMED:
+            # Approved: dispatch now rather than on the next one-minute pass.
+            self._request_tick()
+
+    def _request_tick(self) -> None:
+        """Run a tick as soon as possible — now, or right after the one in flight."""
+        if self._board_in_flight:
+            self._board_rerun = True
+            return
+        self._refresh_board()
+
     def _refresh_board(self) -> None:
-        """Schedule a board snapshot refresh, unless one is still running.
+        """Schedule a flows tick (and with it the snapshot), unless one is still running.
 
         A thread worker cannot be cancelled once started, so ``exclusive``
         would not stop a slow search overlapping the next one — and the
@@ -2072,11 +2109,13 @@ class EphorApp(App[int]):
 
     @work(thread=True, exit_on_error=False, group="board")
     def _board_worker(self) -> None:
-        """Background worker: re-read board.toml, search Jira, persist the snapshot.
+        """Background worker: re-read board.toml and run one flows tick.
 
-        The snapshot refresh takes ``flows/tick.lock`` without waiting, so a
-        second dashboard (or ``ephor flows watch``) running the same search
-        costs nothing: whoever loses the race reads the winner's snapshot.
+        The tick searches Jira, persists the snapshot, and creates, tends and
+        dispatches flow runs (:mod:`ephor.flows.tick`). It takes
+        ``flows/tick.lock`` without waiting, so a second dashboard (or
+        ``ephor flows tick`` from a timer) costs nothing: whoever loses the
+        race reads the winner's snapshot and runs.
         """
         data: LaneData | None = None
         try:
@@ -2089,6 +2128,9 @@ class EphorApp(App[int]):
         self._board_in_flight = False
         if data is not None:
             self._lanes.apply(data)
+        if self._board_rerun:
+            self._board_rerun = False
+            self._refresh_board()
 
 
 # ---------------------------------------------------------------------------

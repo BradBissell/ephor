@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ephor import launcher, work_items
+from ephor import gitinfo, launcher, work_items
 
 
 def test_normalize_ticket_accepts_keys_and_rejects_everything_else() -> None:
@@ -219,6 +219,61 @@ def test_start_records_the_work_item_and_declares_the_ticket(
     assert item is not None
     assert item.confirmed is True
     assert item.worktree == str(tmp_path / "repo-DR-9")
+
+
+def test_start_passes_extra_env_to_the_window_but_keeps_its_own_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    tree = tmp_path / "repo-DR-9"
+    repo.mkdir()
+    tree.mkdir()
+    opened: dict[str, object] = {}
+
+    def fake_window(
+        name: str,
+        cwd: Path,
+        command: str,
+        env: dict[str, str],
+        *,
+        detached: bool = False,
+        target_session: str = "",
+    ) -> tuple[str, str, str]:
+        opened.update(name=name, cwd=cwd, env=env, detached=detached, target_session=target_session)
+        return "@7", "%7", "opened tmux window @7"
+
+    monkeypatch.setattr(gitinfo, "worktree_of", lambda cwd: str(repo))
+    monkeypatch.setattr(
+        gitinfo, "context", lambda cwd, use_cache=True: gitinfo.GitContext(branch="DR-9-x")
+    )
+    monkeypatch.setattr(
+        launcher, "ensure_worktree", lambda root, ticket, title="", base="": (tree, "made")
+    )
+    monkeypatch.setattr(launcher, "open_window", fake_window)
+    result = launcher.start(
+        "DR-9",
+        cwd=repo,
+        prompt="/review-pr DR-9",
+        window_name="flow:DR-9:review",
+        detached=True,
+        target_session="flows",
+        extra_env={
+            "EPHOR_FLOW_RUN": "DR-9.review.10-1",
+            "EPHOR_FLOW_PAYLOAD": "/p.json",
+            "EPHOR_TICKET": "DR-666",
+            "EPHOR_PROVIDER": "evil",
+        },
+    )
+    assert result.ok and result.pane == "%7"
+    env = opened["env"]
+    assert isinstance(env, dict)
+    assert env["EPHOR_FLOW_RUN"] == "DR-9.review.10-1"
+    assert env["EPHOR_FLOW_PAYLOAD"] == "/p.json"
+    # The launcher's own keys win over anything the caller passes in.
+    assert env["EPHOR_TICKET"] == "DR-9"
+    assert env["EPHOR_PROVIDER"] == "claude"
+    assert (opened["name"], opened["cwd"]) == ("flow:DR-9:review", tree)
+    assert (opened["detached"], opened["target_session"]) == (True, "flows")
 
 
 def test_resume_refuses_providers_that_cannot_resume(tmp_path: Path) -> None:

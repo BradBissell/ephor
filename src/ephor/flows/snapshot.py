@@ -11,9 +11,10 @@ so the flows tick can run its rules in between them:
    the new snapshot, and the list of status :class:`Transition` s.
 3. :func:`save` — atomic rename, 0600, and always the *last* write of a tick.
 
-:func:`refresh` composes them under ``flows/tick.lock`` for callers that have
-no rules to run (the TUI's lanes, ``ephor flows board --refresh``). It is
-exactly a tick with no rules, which is why the tick can reuse it.
+:func:`refresh` composes them under ``flows/tick.lock``. It is exactly a
+tick with no rules — and so it must not be used where rules exist: the moves
+it records would never be offered to them. The dashboard and ``ephor flows
+board --refresh`` run the real tick (:mod:`ephor.flows.tick`) instead.
 
 Rules this file keeps, because the flows built on it depend on them:
 
@@ -31,6 +32,15 @@ from the previous snapshot, its ``seq`` goes up by one. ``(status_id, seq)``
 therefore names one *visit* to a status: a ticket that leaves Peer Review
 and comes back is a new visit with a new name, while the same visit seen on a
 hundred ticks keeps one. That pair is what a flow's run is keyed on.
+A ticket forgotten after :data:`DROP_AFTER_UNSEEN` leaves a small tombstone
+(``dropped``: its last seq), and if it comes back it continues from there:
+the run of its earlier visit keeps its file for a month, and a returning
+ticket restarting at seq 0 would collide with it and never fire.
+
+**The board's scope is part of what was seen.** ``scope`` fingerprints the
+search itself (projects plus JQL). When it changes, the tickets the new
+search brings in were not *moved* there — the window onto the board was —
+and the flow tick adopts them instead of firing on them.
 
 The snapshot also carries fields only the flow tick reads (``rules_seen``,
 ``myself``, ``prs``, ``sessions_seen``). A rule-less refresh carries them
@@ -40,6 +50,7 @@ the tick has not evaluated yet still starts in adopt mode.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -53,7 +64,7 @@ from typing import Any
 from ephor import eventlog, jira_api
 from ephor.board import BoardConfig, BoardSettings
 from ephor.filelock import locked
-from ephor.flows import flows_dir
+from ephor.flows import flows_dir, runs
 from ephor.jira_api import Issue
 
 SNAPSHOT_FILE = "snapshot.json"
@@ -65,6 +76,10 @@ SNAPSHOT_SCHEMA_VERSION = 1
 # JQL or a ticket briefly reassigned, short enough that the file does not
 # accumulate every ticket you have ever owned.
 DROP_AFTER_UNSEEN = 60
+# How long a dropped ticket's tombstone is kept. A returning ticket only
+# needs its old seq while the run files of its earlier visit still exist
+# (runs.PRUNE_AFTER_DAYS after they finish), plus some slack.
+TOMBSTONE_KEEP_DAYS = runs.PRUNE_AFTER_DAYS + 7.0
 
 # What the board search asks Jira for. Everything a lane or a flow rule
 # reads, and nothing else — an issue document is otherwise tens of kilobytes.
@@ -199,6 +214,21 @@ class PrState:
 
 
 @dataclass(frozen=True)
+class DroppedTicket:
+    """A ticket forgotten after DROP_AFTER_UNSEEN: the seq it had, and when."""
+
+    seq: int
+    dropped_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"seq": self.seq, "dropped_at": self.dropped_at}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DroppedTicket:
+        return cls(seq=_int(data.get("seq")), dropped_at=_str(data.get("dropped_at")))
+
+
+@dataclass(frozen=True)
 class Transition:
     """A ticket whose status differs from the previous snapshot."""
 
@@ -231,6 +261,10 @@ class Snapshot:
     pr_checked_at: str = ""
     prs: Mapping[str, PrState] = field(default_factory=dict)
     sessions_seen: Mapping[str, Any] = field(default_factory=dict)
+    # Tickets forgotten after DROP_AFTER_UNSEEN, so a return gets a new seq.
+    dropped: Mapping[str, DroppedTicket] = field(default_factory=dict)
+    # board_scope() of the search that produced ``tickets`` ("" before P2).
+    scope: str = ""
     schema_version: int = SNAPSHOT_SCHEMA_VERSION
 
     @property
@@ -258,6 +292,8 @@ class Snapshot:
             "pr_checked_at": self.pr_checked_at,
             "prs": {key: pr.to_dict() for key, pr in sorted(self.prs.items())},
             "sessions_seen": dict(self.sessions_seen),
+            "dropped": {key: d.to_dict() for key, d in sorted(self.dropped.items())},
+            "scope": self.scope,
         }
         return json.dumps(payload, sort_keys=True, indent=1)
 
@@ -277,6 +313,12 @@ class Snapshot:
                 pr = PrState.from_dict(value) if isinstance(value, dict) else None
                 if isinstance(key, str) and pr is not None:
                     prs[key] = pr
+        raw_dropped = data.get("dropped")
+        dropped: dict[str, DroppedTicket] = {}
+        if isinstance(raw_dropped, dict):
+            for key, value in raw_dropped.items():
+                if isinstance(key, str) and key and isinstance(value, dict):
+                    dropped[key] = DroppedTicket.from_dict(value)
         rules = data.get("rules_seen")
         sessions = data.get("sessions_seen")
         return cls(
@@ -289,6 +331,8 @@ class Snapshot:
             pr_checked_at=_str(data.get("pr_checked_at")),
             prs=prs,
             sessions_seen=sessions if isinstance(sessions, dict) else {},
+            dropped=dropped,
+            scope=_str(data.get("scope")),
             schema_version=_int(data.get("schema_version")) or SNAPSHOT_SCHEMA_VERSION,
         )
 
@@ -349,6 +393,11 @@ def save(snapshot: Snapshot, path: Path | None = None) -> bool:
 Search = Callable[..., list[Issue] | None]
 
 
+def board_scope(board: BoardSettings) -> str:
+    """A short fingerprint of what the board search asks for (projects plus JQL)."""
+    return hashlib.sha256(board.search_jql().encode()).hexdigest()[:12]
+
+
 def fetch(board: BoardSettings, *, search: Search | None = None) -> list[Issue] | None:
     """Every ticket on the board, or None when the search failed. Blocking."""
     if not board.projects:
@@ -362,14 +411,22 @@ def advance(
     issues: Iterable[Issue],
     *,
     now: datetime | None = None,
+    seq_floor: Mapping[str, int] | None = None,
 ) -> tuple[Snapshot, list[Transition]]:
     """The snapshot after ``issues``, and how it differs from ``previous``.
 
     Pure: reads nothing, writes nothing. With no previous snapshot there is
     nothing to compare against, so no transitions are reported — the first
-    snapshot is a baseline, not a board-wide burst of moves.
+    snapshot is a baseline, not a board-wide burst of moves. ``seq_floor``
+    (ticket -> lowest seq to use) seeds that baseline, so a snapshot rebuilt
+    after snapshot.json was lost does not reuse the seqs of runs still on
+    disk; it is ignored when there is a previous snapshot.
     """
+    moment = now or _now()
+    stamp = _iso(moment)
     before: Mapping[str, TicketState] = previous.tickets if previous is not None else {}
+    dropped: dict[str, DroppedTicket] = dict(previous.dropped) if previous is not None else {}
+    floor: Mapping[str, int] = (seq_floor or {}) if previous is None else {}
     tickets: dict[str, TicketState] = {}
     transitions: list[Transition] = []
     seen: set[str] = set()
@@ -388,7 +445,11 @@ def advance(
         seen.add(key)
         old = before.get(key)
         if old is None:
-            tickets[key] = fresh
+            # A ticket that was here before and was forgotten continues its
+            # count: its earlier visit's run may still be on disk.
+            tomb = dropped.pop(key, None)
+            seq = tomb.seq + 1 if tomb is not None else floor.get(key, 0)
+            tickets[key] = replace(fresh, seq=seq)
             if previous is not None:
                 transitions.append(
                     Transition(
@@ -397,7 +458,7 @@ def advance(
                         to_status=fresh.status,
                         from_status_id="",
                         to_status_id=fresh.status_id,
-                        seq=0,
+                        seq=seq,
                         appeared=True,
                     )
                 )
@@ -424,9 +485,17 @@ def advance(
         unseen = old.unseen_ticks + 1
         if unseen <= DROP_AFTER_UNSEEN:
             tickets[key] = replace(old, unseen_ticks=unseen)
+        else:
+            dropped[key] = DroppedTicket(seq=old.seq, dropped_at=stamp)
+
+    keep = TOMBSTONE_KEEP_DAYS * 86400.0
+    for key, tomb in list(dropped.items()):
+        when = _parse_iso(tomb.dropped_at)
+        if when is None or (moment - when).total_seconds() > keep:
+            del dropped[key]
 
     base = previous or Snapshot(taken_at="")
-    snapshot = replace(base, taken_at=_iso(now or _now()), tickets=tickets)
+    snapshot = replace(base, taken_at=stamp, tickets=tickets, dropped=dropped)
     return snapshot, transitions
 
 
@@ -523,7 +592,10 @@ def refresh_locked(
     issues = fetch(config.board, search=search)
     if issues is None:
         return RefreshResult(RefreshStatus.SEARCH_FAILED, snapshot=previous)
-    snapshot, transitions = advance(previous, issues, now=now)
+    snapshot, transitions = advance(
+        previous, issues, now=now, seq_floor=baseline_seq_floor(previous)
+    )
+    snapshot = replace(snapshot, scope=board_scope(config.board))
     if dry_run:
         return RefreshResult(RefreshStatus.OK, snapshot=snapshot, transitions=tuple(transitions))
     log_transitions(transitions)
@@ -532,6 +604,13 @@ def refresh_locked(
     if not save(snapshot):
         return RefreshResult(RefreshStatus.WRITE_FAILED, snapshot=previous)
     return RefreshResult(RefreshStatus.OK, snapshot=snapshot, transitions=tuple(transitions))
+
+
+def baseline_seq_floor(previous: Snapshot | None) -> dict[str, int]:
+    """For a snapshot built from nothing: each ticket's next seq, from its run files."""
+    if previous is not None:
+        return {}
+    return runs.next_seq_by_ticket()
 
 
 def _precondition(config: BoardConfig | None) -> RefreshStatus | None:

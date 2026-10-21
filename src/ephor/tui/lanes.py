@@ -22,23 +22,30 @@ all in Jira's done category) start folded, so a week of closed tickets does
 not push the live work off the screen. A lane folded or unfolded by hand
 stays that way; only a lane seen for the first time gets the default.
 
+Both kinds of row carry a **flow badge** when their ticket has a run in
+flight (``⏸ review?`` awaiting your confirmation, ``▶ review`` launched,
+``⚠ review stuck``); see :func:`ephor.flows.runs.badge`.
+
 Nothing here does I/O on the render path. :func:`gather` reads board.toml,
-refreshes the snapshot and reads the work records on a worker thread, and
-the app hands the result to :meth:`Lanes.apply` on the event loop.
+runs the flows tick (which refreshes the snapshot), and reads the runs and
+the work records on a worker thread; the app hands the result to
+:meth:`Lanes.apply` on the event loop.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from textual.widgets import Static
 
 from ephor import board, jira_api, work_items
 from ephor.board import OTHER_LANE, UNTICKETED_LANE, BoardConfig, BoardSettings
 from ephor.constants import ATTENTION_STATUSES, AgentStatus
-from ephor.flows import printable, ticket_sort_key
+from ephor.flows import printable, runs, ticket_sort_key
 from ephor.flows import snapshot as board_snapshot
+from ephor.flows import tick as flows_tick
+from ephor.flows.runs import Run, RunState
 from ephor.flows.snapshot import RefreshResult, Snapshot, TicketState
 from ephor.state.models import AgentState
 from ephor.tui.rows import group_row_id, virtual_row_id
@@ -73,22 +80,32 @@ class LaneData:
     # search does not cover.
     work_status: Mapping[str, str] = field(default_factory=dict)
     result: RefreshResult | None = None
+    # Every flow run on disk, newest first — for badges, the header count
+    # and the `f` screen.
+    runs: tuple[Run, ...] = ()
 
 
 def gather(*, refresh: bool) -> LaneData:
-    """Read the board's inputs, refreshing the snapshot first when asked. Blocking.
+    """Read the board's inputs, running a flows tick first when asked. Blocking.
 
-    The refresh runs only when there is a board.toml whose ``[board]`` is
-    valid and Jira is configured; otherwise this just reads what is on disk,
-    which is how lanes still render from a snapshot another process wrote.
+    The tick runs only when there is a board.toml whose ``[board]`` is valid
+    and Jira is configured; otherwise this just reads what is on disk, which
+    is how lanes still render from a snapshot another process wrote. With no
+    flow rules the tick is exactly the snapshot refresh.
     """
     config = board.load()
     result: RefreshResult | None = None
     if refresh and config is not None and config.lanes_ok and jira_api.is_configured():
-        result = board_snapshot.refresh(config)
+        result = flows_tick.run(config).refresh
     snap = result.snapshot if result is not None and result.ok else board_snapshot.load()
     statuses = {key: w.jira_status for key, w in work_items.load_all().items() if w.jira_status}
-    return LaneData(config=config, snapshot=snap, work_status=statuses, result=result)
+    return LaneData(
+        config=config,
+        snapshot=snap,
+        work_status=statuses,
+        result=result,
+        runs=tuple(runs.list_runs()),
+    )
 
 
 class Lanes:
@@ -100,11 +117,33 @@ class Lanes:
         # defaulted once, so unfolding Done by hand is not undone a minute
         # later by the next refresh.
         self._defaulted: set[str] = set()
+        self._badges: dict[str, str] = runs.badges_by_ticket(self._data.runs)
 
     # --- inputs -----------------------------------------------------------
 
     def apply(self, data: LaneData) -> None:
         self._data = data
+        self._badges = runs.badges_by_ticket(data.runs)
+
+    def update_run(self, run: Run) -> None:
+        """Fold one run the user just changed (approve / deny) in before the next tick."""
+        kept = [r for r in self._data.runs if r.run_id != run.run_id]
+        self.apply(replace(self._data, runs=(run, *kept)))
+
+    # --- flows ------------------------------------------------------------
+
+    @property
+    def runs(self) -> tuple[Run, ...]:
+        return self._data.runs
+
+    def badge_for(self, ticket: str | None) -> str:
+        """The flow badge for ``ticket``'s row, or ""."""
+        return self._badges.get(ticket.upper(), "") if ticket else ""
+
+    @property
+    def awaiting_count(self) -> int:
+        """Runs waiting for a human — the header bar's flow counter."""
+        return sum(1 for r in self._data.runs if r.state is RunState.AWAITING_CONFIRM)
 
     @property
     def config(self) -> BoardConfig | None:
@@ -264,27 +303,31 @@ class Lanes:
         return "  " + "  ·  ".join(parts)
 
 
-def ticket_row_markup(key: str, record: TicketState | None) -> str:
-    """One ticket row: key, status, title — dimmed, because nothing is running.
+def ticket_row_markup(key: str, record: TicketState | None, badge: str = "") -> str:
+    """One ticket row: key, flow badge, status, title — dimmed, because nothing is running.
 
     Every value is ticket text, typed by whoever edits the ticket, so all of
     it is escaped and stripped of control characters before it is markup.
     """
+    flag = f"[bold #EBCB8B]{markup_text(badge)}[/] " if badge else ""
     if record is None:
-        return f"   [dim]◇ {markup_text(key)}[/]"
+        return f"   [dim]◇ {markup_text(key)}[/] {flag}".rstrip()
     status = markup_text(record.status, 18) or "?"
     title = markup_text(record.title, 120)
     who = markup_text(record.assignee, 24)
     tail = f"  [dim]{who}[/]" if who else ""
-    return f"   [dim]◇[/] [bold]{markup_text(key):<10}[/] [#EBCB8B]{status:<14}[/] [dim]{title}[/]{tail}"
+    return (
+        f"   [dim]◇[/] [bold]{markup_text(key):<10}[/] {flag}"
+        f"[#EBCB8B]{status:<14}[/] [dim]{title}[/]{tail}"
+    )
 
 
 class TicketRow(Static):
     """A board ticket with no session: one dim line, never a session."""
 
-    def __init__(self, key: str, record: TicketState | None) -> None:
-        super().__init__(ticket_row_markup(key, record))
+    def __init__(self, key: str, record: TicketState | None, badge: str = "") -> None:
+        super().__init__(ticket_row_markup(key, record, badge))
         self.ticket_key = key
 
-    def update_ticket(self, record: TicketState | None) -> None:
-        self.update(ticket_row_markup(self.ticket_key, record))
+    def update_ticket(self, record: TicketState | None, badge: str = "") -> None:
+        self.update(ticket_row_markup(self.ticket_key, record, badge))
