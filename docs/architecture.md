@@ -90,6 +90,8 @@ src/ephor/
 ├── tmux/discover.py           ← walks /proc + tmux to find pane → agent pid (all agent binaries)
 ├── tmux/navigator.py          ← `tmux select-window` to jump to a session
 ├── tui/app.py                 ← Textual TUI dashboard
+├── tui/rows.py                ← row ids: session / group header / sessionless ticket row
+├── tui/lanes.py               ← the `status` grouping: board lanes + ticket rows
 ├── usage.py                   ← ccusage transcript-token aggregation (Claude)
 ├── account_usage.py           ← server-anchored per-account 5h/7d limits (Claude)
 ├── summarizer.py              ← one-sentence reply summary via the agent's summarize command
@@ -104,6 +106,8 @@ src/ephor/
 ├── permissions.py             ← writes the decisions the hook handler emits
 ├── jira_api.py                ← opt-in Jira read: status, summary, assignee, drift, board search
 ├── board.py                   ← board.toml: lanes, repos, flow rules (validated, errors collected)
+├── flows/snapshot.py          ← board search → diff → flows/snapshot.json (the rule-less tick)
+├── flows/cli.py               ← `ephor flows ...` (board)
 ├── filelock.py                ← sidecar flock for stores written from more than one process
 └── notify.py                  ← opt-in push (ntfy/webhook); policy engine that decides
                                what is worth interrupting you for
@@ -135,7 +139,7 @@ deleted branch cannot turn a settled fact back into an amber guess).
 | `work/<KEY>.json` | ephor (TUI, CLI, launcher, flows tick) | `work/.lock` flock around every load-merge-save |
 | `pending/<sid>.json` | ephor; **read + deleted** by the hook | none — create/consume |
 | `events.ndjson` | the TUI, the launcher, the flows tick | `events.ndjson.lock` flock around rotate + `O_APPEND` write |
-| `flows/snapshot.json` | the flows tick, only | `flows/tick.lock` (non-blocking); atomic rename, written last |
+| `flows/snapshot.json` | the flows tick, and the rule-less snapshot refresh (TUI worker, `ephor flows board --refresh`) | `flows/tick.lock` (non-blocking — a refresh that cannot take it returns and reads the holder's snapshot); atomic rename, 0600, written last |
 | `flows/runs/<run_id>.json` | the flows tick; approve/deny (CLI, TUI) | `O_EXCL` create claims a run; every later read-check-write (tick transitions, approve/deny) holds the `flows/runs/.lock` sidecar flock (short, blocking with timeout) and re-reads the state under it; approve/deny refuse unless the state is still `awaiting_confirm` |
 | `flows/payloads/<run_id>.json` | the flows tick | none — written once before launch, 0600 |
 | `flows/paused` | `ephor flows pause` / `resume` | none — presence is the flag |
@@ -263,3 +267,28 @@ needed.
 Everything stays on your machine. The only network call `ephor` makes is
 to `https://api.anthropic.com/api/oauth/usage` for per-account usage
 anchoring; see [SECURITY.md](../SECURITY.md) for the full surface area.
+
+## Status lanes
+
+`g` cycles the session list through none → ticket → repo → **status**. The
+status grouping draws one lane per `board.toml` column, in column order,
+then `Other` (statuses no column claims) and `Unticketed` (sessions with no
+ticket). A session goes in the lane of its ticket's status — the board
+snapshot when the last search saw the ticket, else the dashboard's own
+per-ticket Jira lookup, else the work record. Lanes holding finished work
+start folded.
+
+The lanes are fed by `flows/snapshot.json`, which the TUI refreshes on a
+worker thread every 60 seconds when a `board.toml` exists and Jira is
+configured (`ephor.flows.snapshot.refresh`: one JQL search, a pure diff
+against the previous snapshot, `TICKET_TRANSITIONED` events, then the
+atomic write). That refresh is a flows tick with no rules; the tick reuses
+`fetch` / `advance` / `save` and runs its rules between them.
+
+Board tickets that have no live session are drawn as **ticket rows**, with
+their own row-id prefix (`"\x00tkt:"`, beside the group headers'
+`"\x00grp:"`; see `tui/rows.py`). Every session action asks
+`is_session_row()` of the cursor row, and `_target_sids()` returns nothing
+when the cursor is on a header or a ticket row — it never falls back to
+the marked set from there, so a keystroke aimed at a ticket can never land
+on sessions marked elsewhere on the board.

@@ -286,13 +286,14 @@ def test_column_validation() -> None:
         "",
         header=(
             '[board]\nprojects = ["DR"]\n'
-            'columns = ["A", "a", "Other", { name = "B", statuses = ["A"] }, '
+            'columns = ["A", "a", "Other", "unticketed", { name = "B", statuses = ["A"] }, '
             '{ name = "" }, 3, { name = "C", statuses = "x" }]\n'
         ),
     )
     joined = "\n".join(config.board_errors)
     assert "duplicate column 'a'" in joined
     assert "'Other' is reserved" in joined
+    assert "'Unticketed' is reserved" in joined
     assert "status 'a' is already in column 'A'" in joined
     assert "column has no name" in joined
     assert "must be a status name" in joined

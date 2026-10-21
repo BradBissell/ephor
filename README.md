@@ -201,7 +201,7 @@ Unset, no request is made. ephor stays a local tool until told otherwise.
 |---|---|
 | `space` | mark a row (on a group header: the whole group) |
 | `c` | clear every mark |
-| `g` / `z` | cycle grouping (none → ticket → repo) / fold the group at the cursor |
+| `g` / `z` | cycle grouping (none → ticket → repo → Jira status lanes) / fold the group at the cursor |
 | `a` / `d` | allow / deny the marked sessions' permission request |
 | `A` / `D` | standing allow for a session / revoke a decision |
 | `N` / `R` | start another session on this ticket / reopen this session |

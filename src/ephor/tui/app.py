@@ -87,6 +87,26 @@ from ephor.tmux.navigator import (
     kill_session,
 )
 from ephor.tui.activity import ActivitySampler
+from ephor.tui.lanes import (
+    SNAPSHOT_REFRESH_INTERVAL,
+    LaneData,
+    Lanes,
+    TicketRow,
+    markup_text,
+)
+from ephor.tui.lanes import (
+    gather as gather_lanes,
+)
+from ephor.tui.rows import (
+    GROUP_PREFIX as _GROUP_PREFIX,
+)
+from ephor.tui.rows import (
+    group_key_of,
+    is_group_row,
+    is_session_row,
+    is_virtual_row,
+    ticket_of_virtual_row,
+)
 from ephor.tui.tokens import TokenTracker, format_tokens, transcript_path
 from ephor.tui.widgets import HeaderBar, SessionRow, SpeechBar
 from ephor.tui.widgets.session_row import RowContext, render_sparkline
@@ -120,20 +140,10 @@ PR_REFRESH_INTERVAL = 20.0
 JIRA_REFRESH_INTERVAL = 60.0
 
 
-# Prefix marking a ListView row as a group header rather than a session.
-# Starts with NUL so it can never collide with a session id, which the hook
-# handler anchors to [A-Za-z0-9_-].
-_GROUP_PREFIX = "\x00grp:"
-
-
-def is_group_row(row_id: str | None) -> bool:
-    """True when a row id names a group header instead of a session."""
-    return row_id is not None and row_id.startswith(_GROUP_PREFIX)
-
-
-def group_key_of(row_id: str) -> str:
-    """The group name inside a header row id."""
-    return row_id[len(_GROUP_PREFIX) :]
+# Row ids — sessions, group headers ("\x00grp:") and sessionless ticket rows
+# ("\x00tkt:") — are defined in ephor.tui.rows; is_group_row and
+# group_key_of are re-exported from here for existing callers.
+__all__ = ["EphorApp", "group_key_of", "is_group_row", "is_session_row", "is_virtual_row", "run"]
 
 
 class StatusToast(Static):
@@ -188,7 +198,9 @@ class EphorApp(App[int]):
         Binding("space", "toggle_select", "mark / unmark this row", priority=True),
         Binding("c", "clear_selection", "unmark every row"),
         # Fleet shape.
-        Binding("g", "cycle_grouping", "group rows by ticket / repo / not at all"),
+        Binding(
+            "g", "cycle_grouping", "group rows by ticket / repo / Jira status lane / not at all"
+        ),
         Binding("z", "toggle_collapse", "collapse or expand the group at the cursor"),
         # Launching, not just watching.
         Binding("N", "new_session", "start another session on this row's ticket"),
@@ -196,7 +208,7 @@ class EphorApp(App[int]):
     ]
 
     # Grouping modes, in the order `g` cycles them.
-    GROUPINGS: ClassVar[tuple[str, ...]] = ("none", "ticket", "repo")
+    GROUPINGS: ClassVar[tuple[str, ...]] = ("none", "ticket", "repo", "status")
 
     def __init__(self, manager: StateManager | None = None) -> None:
         super().__init__()
@@ -204,6 +216,7 @@ class EphorApp(App[int]):
         self._sid_by_row: list[str] = []  # row index → session_id
         self._rows_by_sid: dict[str, SessionRow] = {}  # for in-place updates
         self._headers_by_id: dict[str, GroupHeader] = {}  # group rows, same list
+        self._tickets_by_id: dict[str, TicketRow] = {}  # sessionless ticket rows, same list
         self._items_by_sid: dict[str, ListItem] = {}  # for in-place reorder
         self._agents_by_sid: dict[str, AgentState] = {}  # last painted snapshot
         self._toast: StatusToast | None = None
@@ -241,6 +254,12 @@ class EphorApp(App[int]):
         # Fleet shape: how rows are grouped, and which groups are folded away.
         self._group_by: str = "none"
         self._collapsed: set[str] = set()
+        # Status lanes (the "status" grouping): board.toml, the board
+        # snapshot, and the tickets that currently have a live session —
+        # a board ticket without one is drawn as a ticket row.
+        self._lanes = Lanes()
+        self._session_tickets: set[str] = set()
+        self._board_in_flight: bool = False
         # session_id -> the other sessions sharing its worktree. Recomputed
         # each refresh from cwds we already have; see gitinfo.collisions.
         self._collisions: dict[str, tuple[str, ...]] = {}
@@ -352,6 +371,13 @@ class EphorApp(App[int]):
         # when a human drags a card, not when a build finishes. Costs nothing
         # until credentials are configured.
         self.set_interval(JIRA_REFRESH_INTERVAL, self._refresh_issues)
+        # The board snapshot behind the status lanes: read what is on disk
+        # now so the first paint has lanes, then search Jira off the event
+        # loop on the tick's cadence. A no-op search when there is no
+        # board.toml or no Jira credentials.
+        self._lanes.apply(gather_lanes(refresh=False))
+        self._refresh_board()
+        self.set_interval(SNAPSHOT_REFRESH_INTERVAL, self._refresh_board)
 
     def _tick_speech_player(self) -> None:
         """Drive the speech player. Wrapped in suppress so a transient
@@ -393,6 +419,11 @@ class EphorApp(App[int]):
             # bottom. session_id breaks ties for sessions started in the
             # same second so the order is fully deterministic.
             agents.sort(key=lambda a: (a.started_at, a.session_id))
+            if self._group_by == "status":
+                # Taken before the filter: a ticket whose session is only
+                # filtered out still has a session, and must not be drawn
+                # as a sessionless ticket row.
+                self._session_tickets = {t for a in agents if (t := self._ticket_for_agent(a))}
             if self._filter:
                 agents = [a for a in agents if _agent_matches_filter(a, self._filter)]
 
@@ -437,7 +468,7 @@ class EphorApp(App[int]):
             follow_sid = self._compute_follow_target(agents)
 
             # Path 1 — identical order. Just refresh row text in place.
-            if new_sids == self._sid_by_row and self._rows_by_sid:
+            if new_sids == self._sid_by_row and self._items_by_sid:
                 self._update_rows(agents)
                 self._apply_follow_target(list_view, follow_sid, new_sids)
                 self._maybe_summarize_new(agents)
@@ -452,7 +483,11 @@ class EphorApp(App[int]):
             # few seconds.
             new_set = set(new_sids)
             prev_set = set(self._sid_by_row)
-            if self._rows_by_sid and new_set == prev_set and len(new_sids) == len(self._sid_by_row):
+            if (
+                self._items_by_sid
+                and new_set == prev_set
+                and len(new_sids) == len(self._sid_by_row)
+            ):
                 cursor_sid = self._cursor_sid(list_view)
                 self._update_rows(agents)
                 self._reorder_list_view(list_view, new_sids)
@@ -483,13 +518,19 @@ class EphorApp(App[int]):
 
             new_rows: dict[str, SessionRow] = {}
             new_headers: dict[str, GroupHeader] = {}
+            new_tickets: dict[str, TicketRow] = {}
             new_items: dict[str, ListItem] = {}
             items: list[ListItem] = []
             cursor_target = 0
             speaking_sid = self._speaking_sid()
             members = self._group_members(agents)
             for i, (row_id, agent) in enumerate(visible):
-                if agent is None:
+                if is_virtual_row(row_id):
+                    ticket = ticket_of_virtual_row(row_id)
+                    ticket_row = TicketRow(ticket, self._lanes.ticket(ticket))
+                    item = ListItem(ticket_row)
+                    new_tickets[row_id] = ticket_row
+                elif agent is None:
                     key = group_key_of(row_id)
                     header = GroupHeader(self._group_header_markup(key, members.get(key, [])))
                     item = ListItem(header)
@@ -512,6 +553,7 @@ class EphorApp(App[int]):
             self._sid_by_row = list(new_sids)
             self._rows_by_sid = new_rows
             self._headers_by_id = new_headers
+            self._tickets_by_id = new_tickets
             self._items_by_sid = new_items
             if items:
                 list_view.index = cursor_target
@@ -661,6 +703,8 @@ class EphorApp(App[int]):
             row = self._rows_by_sid.get(agent.session_id)
             if row is not None:
                 self._paint_row(row, agent, speaking_sid)
+        for row_id, ticket_row in self._tickets_by_id.items():
+            ticket_row.update_ticket(self._lanes.ticket(ticket_of_virtual_row(row_id)))
         if not self._headers_by_id:
             return
         members = self._group_members(agents)
@@ -687,10 +731,17 @@ class EphorApp(App[int]):
     # — keeps working unchanged; every action that needs a *session* asks
     # `_cursor_session_sid`, which reads a header as "nothing selected".
 
+    def _ticket_for_agent(self, agent: AgentState) -> str:
+        return ticket_for_agent(agent, self._summaries.get(agent.session_id)) or ""
+
     def _group_key(self, agent: AgentState) -> str:
         """Which group ``agent`` belongs to under the current mode."""
         if self._group_by == "ticket":
-            return ticket_for_agent(agent, self._summaries.get(agent.session_id)) or "no ticket"
+            return self._ticket_for_agent(agent) or "no ticket"
+        if self._group_by == "status":
+            ticket = self._ticket_for_agent(agent)
+            issue = self._issues.cached(ticket) if ticket else None
+            return self._lanes.lane_of(ticket, issue.status if issue else "")
         if self._group_by == "repo":
             root = gitinfo.worktree_of(agent.cwd)
             return Path(root).name if root else (agent.project_name or "no repo")
@@ -706,6 +757,13 @@ class EphorApp(App[int]):
         """
         if self._group_by == "none":
             return [(a.session_id, a) for a in agents]
+        if self._group_by == "status":
+            self._lanes.apply_default_folds(self._collapsed)
+            return self._lanes.rows(
+                self._group_members(agents),
+                self._lanes.tickets_without_session(self._session_tickets, self._filter),
+                self._collapsed,
+            )
         grouped: dict[str, list[AgentState]] = {}
         for agent in agents:
             grouped.setdefault(self._group_key(agent), []).append(agent)
@@ -724,6 +782,9 @@ class EphorApp(App[int]):
         from ephor.constants import ATTENTION_STATUSES
 
         collapsed = key in self._collapsed
+        if self._group_by == "status":
+            sessionless = self._lanes.tickets_without_session(self._session_tickets, self._filter)
+            return self._lanes.header_markup(key, members, len(sessionless.get(key, [])), collapsed)
         caret = "▸" if collapsed else "▾"
         needs = sum(1 for a in members if a.status in ATTENTION_STATUSES)
         working = sum(1 for a in members if a.status is AgentStatus.WORKING)
@@ -815,12 +876,10 @@ class EphorApp(App[int]):
             return None
 
     def _cursor_session_sid(self, list_view: ListView | None = None) -> str | None:
-        """The session under the cursor, or None when it is on a group header."""
+        """The session under the cursor, or None on a group header or ticket row."""
         view = list_view if list_view is not None else self.query_one(ListView)
         row_id = self._cursor_sid(view)
-        if row_id is None or is_group_row(row_id):
-            return None
-        return row_id
+        return row_id if is_session_row(row_id) else None
 
     def _target_sids(self) -> list[str]:
         """Sessions the next action applies to: the marked set, else the cursor.
@@ -828,14 +887,32 @@ class EphorApp(App[int]):
         Marking is what makes an action a batch action, and falling back to
         the cursor is what keeps every single-row keystroke working exactly
         as it did before anything could be marked.
+
+        With the cursor on a row that is *not* a session — a group header or
+        a sessionless ticket row — the answer is nothing, marks or no marks.
+        A keystroke aimed at a ticket row must never land on sessions marked
+        somewhere else on the board: ``a`` there would grant permissions to
+        them, and ``x`` would kill them.
         """
+        row_id = self._cursor_sid(self.query_one(ListView))
+        if row_id is not None and not is_session_row(row_id):
+            return []
         if self._selected:
             # Preserve on-screen order so the toast reads the way the board
             # looks, and drop anything that has since disappeared.
-            visible = [s for s in self._sid_by_row if not is_group_row(s)]
+            visible = [s for s in self._sid_by_row if is_session_row(s)]
             return [sid for sid in visible if sid in self._selected]
-        sid = self._cursor_session_sid()
-        return [sid] if sid else []
+        return [row_id] if row_id is not None else []
+
+    def _no_target_toast(self) -> None:
+        """Explain an action that found no session to act on."""
+        row_id = self._cursor_sid(self.query_one(ListView))
+        if is_virtual_row(row_id):
+            self._set_toast("that ticket has no session — move to a session row")
+        elif is_group_row(row_id):
+            self._set_toast("cursor is on a group header — move to a session row")
+        else:
+            self._set_toast("no row selected")
 
     def _compute_follow_target(self, agents: list[AgentState]) -> str | None:
         """Return the sid to auto-highlight this tick, or None for no change.
@@ -1097,7 +1174,7 @@ class EphorApp(App[int]):
         agents_by_sid = {a.session_id: a for a in self._manager.scan()}
         reasons: dict[int, str] = {}
         for i, sid in enumerate(self._sid_by_row):
-            agent = agents_by_sid.get(sid) if not is_group_row(sid) else None
+            agent = agents_by_sid.get(sid) if is_session_row(sid) else None
             if agent is None:
                 continue
             if agent.status in ATTENTION_STATUSES:
@@ -1128,6 +1205,11 @@ class EphorApp(App[int]):
         if row_id is None:
             self._set_toast("no row selected")
             return
+        if is_virtual_row(row_id):
+            # A ticket row is not a session; marking it would put a
+            # non-session id into the set every batch action reads.
+            self._set_toast(f"{ticket_of_virtual_row(row_id)} has no session to mark")
+            return
         if is_group_row(row_id):
             # Space on a header marks the whole group — the reason to group
             # rows in the first place is to act on them together.
@@ -1135,7 +1217,7 @@ class EphorApp(App[int]):
             members = [
                 sid
                 for sid in self._sid_by_row
-                if not is_group_row(sid)
+                if is_session_row(sid)
                 and self._agents_by_sid.get(sid) is not None
                 and self._group_key(self._agents_by_sid[sid]) == key
             ]
@@ -1144,7 +1226,11 @@ class EphorApp(App[int]):
                 self._set_toast(f"unmarked {len(members)} in {key}")
             else:
                 self._selected.update(members)
-                self._set_toast(f"marked {len(members)} in {key}")
+                # Actions never reach the marked set from a header (see
+                # _target_sids), so say where they do work from.
+                self._set_toast(
+                    f"marked {len(members)} in {key} — act on them from any session row"
+                )
             return
         if row_id in self._selected:
             self._selected.discard(row_id)
@@ -1166,6 +1252,14 @@ class EphorApp(App[int]):
         # Group names differ per mode, so folds from the previous mode would
         # hide nothing and confuse everything.
         self._collapsed.clear()
+        self._lanes.reset_folds()
+        if self._group_by == "status" and self._lanes.board_errors:
+            count = len(self._lanes.board_errors)
+            self._set_toast(
+                f"grouping: status — board.toml has {count} error(s), using default lanes "
+                "(see `ephor flows board`)"
+            )
+            return
         self._set_toast(f"grouping: {self._group_by}")
 
     def action_toggle_collapse(self) -> None:
@@ -1179,6 +1273,9 @@ class EphorApp(App[int]):
             return
         if is_group_row(row_id):
             key = group_key_of(row_id)
+        elif is_virtual_row(row_id):
+            ticket = ticket_of_virtual_row(row_id)
+            key = self._lanes.lane_of(ticket)
         else:
             agent = self._agents_by_sid.get(row_id)
             if agent is None:
@@ -1210,7 +1307,7 @@ class EphorApp(App[int]):
         """Withdraw any queued or standing decision for the target sessions."""
         sids = self._target_sids()
         if not sids:
-            self._set_toast("no row selected")
+            self._no_target_toast()
             return
         revoked = sum(1 for sid in sids if permissions.revoke(sid))
         self._set_toast(f"revoked {revoked} decision(s)")
@@ -1227,7 +1324,7 @@ class EphorApp(App[int]):
         """
         sids = self._target_sids()
         if not sids:
-            self._set_toast("no row selected")
+            self._no_target_toast()
             return
         written = 0
         for sid in sids:
@@ -1309,7 +1406,8 @@ class EphorApp(App[int]):
         """
         sids = self._target_sids()
         if not sids:
-            self._set_toast("no row selected")
+            self._no_target_toast()
+            self._kill_armed_sid = None
             return
 
         by_sid = {a.session_id: a for a in self._manager.scan()}
@@ -1364,7 +1462,7 @@ class EphorApp(App[int]):
         """
         sids = self._target_sids()
         if not sids:
-            self._set_toast("no row selected")
+            self._no_target_toast()
             return
         by_sid = {a.session_id: a for a in self._manager.scan()}
         started = 0
@@ -1421,8 +1519,16 @@ class EphorApp(App[int]):
         if is_group_row(row_id):
             self.action_toggle_collapse()
             return
+        if row_id is not None and is_virtual_row(row_id):
+            # A ticket row has no pane to jump to. Say what it is instead.
+            ticket = ticket_of_virtual_row(row_id)
+            record = self._lanes.ticket(ticket)
+            # Jira status names are admin-typed text; the toast parses markup.
+            status = f" · {markup_text(record.status, 40)}" if record and record.status else ""
+            self._set_toast(f"{markup_text(ticket)}{status} — no session on this ticket")
+            return
 
-        sid = row_id
+        sid = row_id if is_session_row(row_id) else None
         if sid is None:
             self._set_toast("no row selected")
             return
@@ -1769,7 +1875,10 @@ class EphorApp(App[int]):
                 self._open_many_prs(marked)
                 return
             sid = marked[0] if marked else None
-        if sid is None:
+            if sid is None:
+                self._no_target_toast()
+                return
+        if not is_session_row(sid):
             self._set_toast("no row selected")
             return
         agent = next((a for a in self._manager.scan() if a.session_id == sid), None)
@@ -1863,7 +1972,7 @@ class EphorApp(App[int]):
         directories still need probing (PrResolver's TTL does the
         throttling) and hands the batch to a single worker.
         """
-        visible = set(self._sid_by_row)
+        visible = {sid for sid in self._sid_by_row if is_session_row(sid)}
         if not visible:
             return
         pending: list[tuple[str, str, str | None]] = []
@@ -1912,7 +2021,7 @@ class EphorApp(App[int]):
         """
         tickets: set[str] = set()
         for sid in self._sid_by_row:
-            if is_group_row(sid):
+            if not is_session_row(sid):
                 continue
             agent = self._agents_by_sid.get(sid)
             if agent is None:
@@ -1946,6 +2055,40 @@ class EphorApp(App[int]):
             jira_title=getattr(issue, "title", ""),
             jira_assignee=getattr(issue, "assignee", ""),
         )
+
+    # ---- status lanes ----------------------------------------------------
+
+    def _refresh_board(self) -> None:
+        """Schedule a board snapshot refresh, unless one is still running.
+
+        A thread worker cannot be cancelled once started, so ``exclusive``
+        would not stop a slow search overlapping the next one — and the
+        older result could then land last. One in flight at a time instead.
+        """
+        if self._board_in_flight:
+            return
+        self._board_in_flight = True
+        self._board_worker()
+
+    @work(thread=True, exit_on_error=False, group="board")
+    def _board_worker(self) -> None:
+        """Background worker: re-read board.toml, search Jira, persist the snapshot.
+
+        The snapshot refresh takes ``flows/tick.lock`` without waiting, so a
+        second dashboard (or ``ephor flows watch``) running the same search
+        costs nothing: whoever loses the race reads the winner's snapshot.
+        """
+        data: LaneData | None = None
+        try:
+            data = gather_lanes(refresh=True)
+        finally:
+            self.call_from_thread(self._on_board_data, data)
+
+    def _on_board_data(self, data: LaneData | None) -> None:
+        """Main-thread callback: the next repaint draws the new lanes."""
+        self._board_in_flight = False
+        if data is not None:
+            self._lanes.apply(data)
 
 
 # ---------------------------------------------------------------------------

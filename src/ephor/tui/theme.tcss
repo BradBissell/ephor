@@ -93,6 +93,18 @@ SessionRow {
     color: $ink;
 }
 
+/* TicketRow: a board ticket with no session, in the status lanes. One dim
+ * line like a SessionRow; a long title is cut, never wrapped. */
+
+TicketRow {
+    height: 1;
+    padding: 0 1;
+    background: transparent;
+    color: $ink-dim;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
 #summary-line {
     height: 1;
     background: $surface-alt;

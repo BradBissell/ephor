@@ -1,7 +1,7 @@
 """CLI entrypoint for `ephor`.
 
 Subcommands: list / status / tmux-widget / work / log (read-only views),
-start / resume (launch work), init / uninstall / doctor (hook management,
+start / resume (launch work), flows (status lanes and ticket flows), init / uninstall / doctor (hook management,
 `--provider` aware), kill / refresh-tmux, tui, and the speech-playback
 controls.
 """
@@ -176,6 +176,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser("tui", help="Launch the Textual TUI dashboard")
 
+    from ephor.flows import cli as flows_cli
+
+    flows_cli.add_parser(subparsers)
+
     speech_p = subparsers.add_parser(
         "speech",
         help="Manage TTS playback ownership (ephor vs. ~/.claude/hooks/tts-speak-response)",
@@ -292,6 +296,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_doctor(provider=args.provider)
     if args.command == "tui":
         return _cmd_tui()
+    if args.command == "flows":
+        from ephor.flows import cli as flows_cli
+
+        return flows_cli.run(args, parser)
     if args.command == "speech":
         sub = getattr(args, "speech_command", None)
         if sub == "install":

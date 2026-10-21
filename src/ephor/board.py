@@ -56,6 +56,9 @@ BOARD_FILE = "board.toml"
 # configured columns, so a newly-added workflow status is visible (in Other)
 # the day it appears rather than vanishing until someone edits the config.
 OTHER_LANE = "Other"
+# The TUI's lane for sessions bound to no ticket at all. Not a Jira status
+# lane, but it shares the fold/grouping namespace, so no column may take it.
+UNTICKETED_LANE = "Unticketed"
 
 DEFAULT_JQL = "assignee = currentUser() AND (statusCategory != Done OR updated >= -7d)"
 DEFAULT_COLUMNS: tuple[str, ...] = ("To Do", "In Progress", "Done")
@@ -440,6 +443,9 @@ def _parse_columns(raw: object, errors: list[str]) -> tuple[Column, ...]:
             continue
         if name.lower() == OTHER_LANE.lower():
             errors.append(f"{where}: {OTHER_LANE!r} is reserved for unmatched statuses")
+            continue
+        if name.lower() == UNTICKETED_LANE.lower():
+            errors.append(f"{where}: {UNTICKETED_LANE!r} is reserved for sessions with no ticket")
             continue
         if name.lower() in names:
             errors.append(f"{where}: duplicate column {name!r}")
