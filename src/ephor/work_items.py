@@ -27,9 +27,18 @@ dashboard can group by work — several sessions attempting one ticket collapse
 under one header — which is the thing a flat list of 25 rows cannot do.
 
 Storage mirrors the session state files: one JSON file per key, 0600, written
-by atomic rename. Unlike those, ephor itself is the only writer, so there is
-no lock — a later write simply wins, and every field is last-writer-wins by
-design (a newer PR state *should* beat an older one).
+by atomic rename. Every field is last-writer-wins by design (a newer PR state
+*should* beat an older one), but a *merge* is a read-modify-write, and since
+the flows tick writes from outside the TUI (a worker thread, ``ephor flows
+watch``, a systemd timer) two merges can interleave and drop one caller's
+field. So the store has one sidecar flock (``work/.lock``) held across the
+load-merge-save in :func:`record` and around :func:`save` and :func:`forget`.
+One lock for the directory rather than one per key: every critical section is
+a few file operations long, and a per-key lock file would need deleting when
+its record goes — which reopens the race the lock exists to close.
+The lock is fail-open: a writer that cannot take it within a quarter of a
+second writes anyway, which is exactly the pre-lock behaviour — the TUI
+records from its event-loop thread and must never sit behind a stuck holder.
 """
 
 from __future__ import annotations
@@ -45,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from ephor.config import state_dir
+from ephor.filelock import locked
 
 # Bumped independently of the session-state schema: these files have a
 # different writer, a different lifetime, and no hook contract to honour.
@@ -163,11 +173,22 @@ def load_all() -> dict[str, WorkItem]:
     return items
 
 
+def _lock_path() -> Path:
+    """Sidecar lock for the store (never a record itself — see :mod:`ephor.filelock`)."""
+    return work_dir() / ".lock"
+
+
 def save(item: WorkItem) -> bool:
     """Write ``item`` atomically. False when the key or the disk says no."""
     path = _path_for(item.key)
     if path is None:
         return False
+    with locked(_lock_path()):
+        return _write(path, item)
+
+
+def _write(path: Path, item: WorkItem) -> bool:
+    """The unlocked atomic write behind :func:`save` and :func:`record`."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.parent.chmod(0o700)
@@ -212,8 +233,44 @@ def record(
     ``confirmed`` is a ratchet: once True it is never set back to False, so a
     later guess cannot demote a key that a branch name already settled.
     """
-    if not key or _path_for(key) is None:
+    path = _path_for(key) if key else None
+    if path is None:
         return None
+    with locked(_lock_path()):
+        return _merge(
+            path,
+            key,
+            session_id=session_id,
+            repo=repo,
+            branch=branch,
+            worktree=worktree,
+            confirmed=confirmed,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            pr_state=pr_state,
+            jira_status=jira_status,
+            jira_title=jira_title,
+            jira_assignee=jira_assignee,
+        )
+
+
+def _merge(
+    path: Path,
+    key: str,
+    *,
+    session_id: str | None,
+    repo: str | None,
+    branch: str | None,
+    worktree: str | None,
+    confirmed: bool | None,
+    pr_number: int | None,
+    pr_url: str | None,
+    pr_state: str | None,
+    jira_status: str | None,
+    jira_title: str | None,
+    jira_assignee: str | None,
+) -> WorkItem:
+    """Load, merge and write one record. The caller holds the record's lock."""
     current = load(key) or WorkItem(key=key.upper())
     updates: dict[str, Any] = {"last_seen": _now()}
     for name, value in (
@@ -238,7 +295,7 @@ def record(
         seen = [session_id, *(s for s in current.session_ids if s != session_id)]
         updates["session_ids"] = tuple(seen[:_MAX_SESSIONS])
     merged = replace(current, **updates)
-    save(merged)
+    _write(path, merged)
     return merged
 
 
@@ -247,10 +304,11 @@ def forget(key: str) -> bool:
     path = _path_for(key)
     if path is None:
         return False
-    try:
-        path.unlink()
-    except OSError:
-        return False
+    with locked(_lock_path()):
+        try:
+            path.unlink()
+        except OSError:
+            return False
     return True
 
 

@@ -101,3 +101,81 @@ def test_round_trips_through_disk(tmp_path: Path) -> None:
     assert item.has_pr
     restored = work_items.WorkItem.from_dict(json.loads(item.to_json()))
     assert restored == item
+
+
+def test_record_holds_the_store_lock_across_its_read_modify_write(monkeypatch) -> None:
+    """The flows tick writes from outside the TUI; a merge must not interleave."""
+    from ephor.filelock import locked
+
+    seen: list[bool] = []
+    real_load = work_items.load
+
+    def spying_load(key: str):
+        with locked(work_items._lock_path(), timeout=0) as free:
+            seen.append(free)
+        return real_load(key)
+
+    monkeypatch.setattr(work_items, "load", spying_load)
+    work_items.record("DR-9", branch="b")
+    assert seen == [False]  # someone (record) already held it
+
+
+def test_concurrent_records_lose_no_updates() -> None:
+    import threading
+
+    def writer(i: int) -> None:
+        for j in range(3):
+            work_items.record("DR-10", session_id=f"t{i}-{j}")
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    item = work_items.load("DR-10")
+    assert item is not None
+    assert len(item.session_ids) == 24
+
+
+def test_lock_file_is_not_mistaken_for_a_record() -> None:
+    work_items.record("DR-11")
+    assert (work_items.work_dir() / ".lock").exists()
+    assert set(work_items.load_all()) == {"DR-11"}
+    assert work_items.prune(max_age_days=0.0) == 1
+
+
+def test_save_holds_the_store_lock_around_its_write(monkeypatch) -> None:
+    from ephor.filelock import locked
+
+    seen: list[bool] = []
+    real_write = work_items._write
+
+    def spying_write(path, item):
+        with locked(work_items._lock_path(), timeout=0) as free:
+            seen.append(free)
+        return real_write(path, item)
+
+    monkeypatch.setattr(work_items, "_write", spying_write)
+    assert work_items.save(work_items.WorkItem(key="DR-12")) is True
+    assert seen == [False]
+
+
+def test_forget_holds_the_store_lock_so_a_record_cannot_resurrect_it(monkeypatch) -> None:
+    """record() loading DR-1 while forget() unlinks it would write the ticket back."""
+    import pathlib
+
+    from ephor.filelock import locked
+
+    work_items.record("DR-1", branch="b")
+    seen: list[bool] = []
+    real_unlink = pathlib.Path.unlink
+
+    def spying_unlink(self, *args, **kwargs):
+        with locked(work_items._lock_path(), timeout=0) as free:
+            seen.append(free)
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", spying_unlink)
+    assert work_items.forget("DR-1") is True
+    assert seen == [False]
+    assert work_items.load("DR-1") is None

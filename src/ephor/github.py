@@ -30,12 +30,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from ephor import gitinfo
+from ephor.config import ticket_projects
 from ephor.constants import WORK_ATTENTION_PRIORITY, CiState, ReviewState, WorkAttention
 
 # A closed or merged PR is finished work: its URL and state will not change
@@ -62,10 +64,19 @@ _GH_TIMEOUT_SEC = 8.0
 # cell from a link into a *work state* — a session that finished and left red
 # CI behind is the most urgent row on the board, and without these it renders
 # as a quiet IDLE row. See ephor.constants.WorkAttention.
+#
+# `headRefOid` is the head commit. Nothing on the dashboard draws it; it is
+# there so a flow can key on "this exact revision" (a review that should run
+# once per push, not once per PR).
 _PR_FIELDS = (
-    "number,url,state,title,isDraft,body,headRefName,"
+    "number,url,state,title,isDraft,body,headRefName,headRefOid,"
     "statusCheckRollup,reviewDecision,reviewRequests,mergeStateStatus,mergeable"
 )
+# The ticket-wide lookup the flows tick makes. No CI or review rollup: the
+# tick only asks "which PRs exist for this ticket and in what state", and the
+# rollup is the expensive half of a `gh pr list` response. `headRefName` and
+# `body` are there to confirm a search hit actually names the ticket.
+_TICKET_PR_FIELDS = "number,state,headRefOid,headRefName,url,title,body"
 
 
 @dataclass(frozen=True)
@@ -79,6 +90,7 @@ class PullRequest:
     draft: bool = False
     body: str = ""
     head_ref: str = ""
+    head_sha: str = ""
     ci: CiState = CiState.NONE
     review: ReviewState = ReviewState.NONE
     failing_checks: tuple[str, ...] = ()
@@ -256,6 +268,7 @@ def _parse_pr(payload: object) -> PullRequest | None:
         draft=bool(payload.get("isDraft")),
         body=str(payload.get("body") or ""),
         head_ref=str(payload.get("headRefName") or ""),
+        head_sha=str(payload.get("headRefOid") or ""),
         ci=ci,
         review=review,
         failing_checks=failing,
@@ -306,6 +319,121 @@ def pr_for_ticket(cwd: Path, ticket: str) -> PullRequest | None:
     if not isinstance(items, list) or not items:
         return None
     return _parse_pr(items[0])
+
+
+# A ticket-shaped key anywhere in a title or branch name. Bounded on the left
+# so `xdr-12` is not read as DR-12, and on the right so DR-12 is not a prefix
+# of DR-123. Case-insensitive so a lower-case branch (`bb/dr-12-tidy`) still
+# names its ticket; :func:`_ticket_keys` decides which hits are real keys.
+_TICKET_KEY_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{1,9}-\d+)(?![0-9])", re.IGNORECASE)
+
+
+def _ticket_keys(text: str, wanted: str) -> list[str]:
+    """Every ticket key in ``text``, upper-cased, in order.
+
+    Branch names are full of ``LETTERS-DIGITS`` words that are not tickets
+    (``node-20``, ``py-312``, ``ubuntu-24``), and reading one as a key would
+    let it outvote the real one. So a lower-case hit counts only when its
+    project is the wanted ticket's or one ``$EPHOR_TICKET_PROJECTS`` names;
+    an upper-case one counts unless that allowlist is set and leaves it out.
+    """
+    allowed = ticket_projects()
+    wanted_project = wanted.split("-", 1)[0]
+    keys: list[str] = []
+    for match in _TICKET_KEY_RE.finditer(text or ""):
+        raw = match.group(1)
+        key = raw.upper()
+        project = key.split("-", 1)[0]
+        if project == wanted_project or project in allowed or (not allowed and raw == key):
+            keys.append(key)
+    return keys
+
+
+def _names_ticket(pr: PullRequest, ticket: str) -> bool:
+    """True when the PR *is* ``ticket``'s PR, judged by its own identifiers.
+
+    GitHub's search tokenises loosely enough that ``DR-12`` surfaces PRs
+    about ``DR-123``, and it matches bodies too — where "Follow-up to DR-12"
+    or "blocked by DR-12" is common in a PR that belongs to another ticket.
+    A flow keyed on the wrong ticket's PR would review the wrong code, so:
+
+    * a branch name that names any ticket decides: the PR is ``ticket``'s
+      when the key appears in it anywhere (``deps/NODE-20-DR-12`` is
+      DR-12's), and another ticket's when it does not;
+    * else the first ticket key in the title decides, exactly — a title
+      saying "DR-99: follow-up to DR-12" is DR-99's;
+    * the body counts only when neither of those names any ticket at all,
+      and then only as a closing-style line (``Closes DR-12``,
+      ``Jira: DR-12``), never a passing mention.
+    """
+    wanted = ticket.upper()
+    branch_keys = _ticket_keys(pr.head_ref, wanted)
+    if branch_keys:
+        return wanted in branch_keys
+    title_keys = _ticket_keys(pr.title, wanted)
+    if title_keys:
+        return title_keys[0] == wanted
+    closing = re.compile(
+        rf"(?im)^\s*(?:closes|fixes|resolves|jira|ticket)\b[:\s]+{re.escape(wanted)}(?![0-9])"
+    )
+    return bool(closing.search(pr.body or ""))
+
+
+# `gh pr list` returns at most this many search hits. A result that fills it
+# may have been cut short before the ticket's own PR, so it is not an answer.
+_TICKET_PR_LIMIT = 100
+
+
+def find_prs_for_ticket(repo_path: Path, ticket: str) -> list[PullRequest] | None:
+    """Every PR in ``repo_path``'s GitHub repo that names ``ticket``. Blocking.
+
+    Unlike :class:`PrResolver`, which asks about the branch checked out in a
+    directory, this asks about the *ticket*: a ticket with no worktree (a
+    teammate's PR you are reviewing) still has PRs, and the flows tick needs
+    them. All states, newest first, as ``gh`` returns them.
+
+    A hit counts only when :func:`_names_ticket` says the PR is this
+    ticket's own — named in its branch or title, or (when those name no
+    ticket) in a closing line of its body — not merely mentioned.
+
+    None means ``gh`` could not answer (missing, unauthenticated, offline,
+    not a repo) and the caller must treat the PR state as unknown. It also
+    means the search came back full (``_TICKET_PR_LIMIT`` hits): the search
+    is fuzzy, so a full page may have pushed the ticket's own PR off the end,
+    and a filtered list from it would be a guess. Otherwise an empty list is
+    a real answer: there is no PR.
+    """
+    if not ticket or not repo_path.is_dir():
+        return None
+    out = _gh(
+        [
+            "pr",
+            "list",
+            "--search",
+            ticket,
+            "--state",
+            "all",
+            "--limit",
+            str(_TICKET_PR_LIMIT),
+            "--json",
+            _TICKET_PR_FIELDS,
+        ],
+        repo_path,
+    )
+    if out is None:
+        return None
+    try:
+        items = json.loads(out or "[]")
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(items, list) or len(items) >= _TICKET_PR_LIMIT:
+        return None
+    found: list[PullRequest] = []
+    for item in items:
+        pr = _parse_pr(item)
+        if pr is not None and _names_ticket(pr, ticket):
+            found.append(pr)
+    return found
 
 
 @dataclass

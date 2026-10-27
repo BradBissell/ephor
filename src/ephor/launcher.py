@@ -23,6 +23,7 @@ everything else.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shlex
@@ -35,6 +36,9 @@ from ephor.providers import get_provider
 
 _TIMEOUT_SEC = 20.0
 _TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-\d{1,7}$")
+# tmux reads ``:`` and ``.`` inside a target as window/pane separators, so a
+# session name carrying either would silently address something else.
+_TMUX_SESSION_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_@+=-]{0,63}$")
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,10 @@ class StartResult:
     worktree: str = ""
     branch: str = ""
     window: str = ""
+    # tmux pane id (``%12``) of the window's only pane. The flows tick keeps
+    # it on the run record so a later tick can tell "launched and running"
+    # from "claimed and never got a pane".
+    pane: str = ""
 
 
 def _run(args: list[str], cwd: str | None = None) -> tuple[int, str, str]:
@@ -102,6 +110,74 @@ def repo_root(cwd: str | Path | None = None) -> Path | None:
     return Path(root) if root else None
 
 
+def fetch_base(root: Path, base: str) -> bool:
+    """Fetch the remote tip ``base`` names, so branching off it is not stale.
+
+    This is the difference between a PR whose diff is the ticket and a PR
+    whose diff is the ticket plus three weeks of other people's commits.
+    ``origin/main`` in a checkout that has not fetched today points at
+    whatever main was the last time it did, and ``git worktree add`` will
+    branch off that quite happily.
+
+    A local ref (``HEAD``, a branch name, a sha) has nothing to fetch and is
+    not an error. Neither is an offline fetch — the caller verifies where the
+    branch actually landed, which is the check that matters.
+    """
+    remote, _, ref = base.partition("/")
+    if not ref or remote not in _remotes(root):
+        return False
+    _run(["/usr/bin/env", "git", "-C", str(root), "fetch", remote, ref])
+    return True
+
+
+# What a flow branches off when the repo will not say. The same default
+# ``ephor start`` has always used.
+FALLBACK_BASE = "origin/main"
+
+
+def default_base(root: Path) -> str:
+    """The remote default branch of the repo at ``root``, as ``origin/<name>``.
+
+    A flow that creates a worktree has nobody at the keyboard to pass
+    ``--base``, and a repo whose trunk is ``master`` or ``develop`` has an
+    ``origin/main`` that is stale or missing — the worktree would be rooted
+    on the wrong history, or refused. ``origin/HEAD`` is what the clone
+    recorded as the default branch; when it was never set (a repo created
+    with ``git init`` and a remote added later), an ``origin/main`` or
+    ``origin/master`` that exists is next, and :data:`FALLBACK_BASE` last.
+    Local git only: nothing is fetched here.
+    """
+    git = ["/usr/bin/env", "git", "-C", str(root)]
+    code, out, _ = _run([*git, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+    name = out.strip()
+    if code == 0 and name.startswith("origin/") and name != "origin/HEAD":
+        return name
+    for candidate in ("origin/main", "origin/master"):
+        code, _, _ = _run([*git, "rev-parse", "--verify", "--quiet", f"refs/remotes/{candidate}"])
+        if code == 0:
+            return candidate
+    return FALLBACK_BASE
+
+
+def _remotes(root: Path) -> set[str]:
+    code, out, _ = _run(["/usr/bin/env", "git", "-C", str(root), "remote"])
+    if code != 0:
+        return set()
+    return {line.strip() for line in out.splitlines() if line.strip()}
+
+
+def _rev(root: Path, ref: str) -> str:
+    code, out, _ = _run(["/usr/bin/env", "git", "-C", str(root), "rev-parse", ref])
+    return out.strip() if code == 0 else ""
+
+
+def branch_exists(root: Path, branch: str) -> bool:
+    code, _, _ = _run(
+        ["/usr/bin/env", "git", "-C", str(root), "rev-parse", "--verify", f"refs/heads/{branch}"]
+    )
+    return code == 0
+
+
 def ensure_worktree(
     root: Path, ticket: str, *, title: str = "", base: str = "origin/main"
 ) -> tuple[Path | None, str]:
@@ -110,40 +186,110 @@ def ensure_worktree(
     Reuse is the common case on a second ``ephor start`` for the same ticket —
     a resumed chunk of work belongs in the tree that already holds its commits,
     not in a fresh one branched off today's trunk.
+
+    Three things happen in a deliberate order, and each one exists because
+    skipping it produces a PR nobody wants to review:
+
+    1. **Fetch the base** before branching, so ``origin/main`` means today's
+       main rather than the last time this checkout synced.
+    2. **Never reset an existing branch.** An abandoned branch from a previous
+       attempt may hold commits that were never pushed; adopting it is
+       recoverable, resetting it onto the base is not.
+    3. **Verify where the branch landed.** If HEAD is not the base, say so and
+       refuse, rather than handing back a worktree rooted somewhere else.
     """
     target = worktree_path(root, ticket)
     if target.is_dir():
         return target, f"reusing existing worktree {target}"
+
     branch = branch_name(ticket, title)
-    # `-B` so an abandoned branch from a previous attempt is reset onto the
-    # base rather than failing the command; the worktree itself is new, so
-    # there is no uncommitted work to lose.
+    fetched = fetch_base(root, base)
+    base_sha = _rev(root, base)
+    if not base_sha:
+        return None, f"base ref {base!r} does not resolve — is it fetched, and spelled right?"
+
+    if branch_exists(root, branch):
+        # Adopt it. The branch may carry unpushed commits from an earlier
+        # attempt, and `-B` would silently throw them away.
+        code, _, err = _run(
+            ["/usr/bin/env", "git", "-C", str(root), "worktree", "add", str(target), branch]
+        )
+        if code != 0:
+            return None, f"git worktree add failed: {err or 'unknown error'}"
+        return target, f"created worktree {target} on the existing branch {branch}"
+
     code, _, err = _run(
-        ["/usr/bin/env", "git", "-C", str(root), "worktree", "add", "-B", branch, str(target), base]
+        [
+            "/usr/bin/env",
+            "git",
+            "-C",
+            str(root),
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(target),
+            base,
+        ]
     )
     if code != 0:
         return None, f"git worktree add failed: {err or 'unknown error'}"
-    return target, f"created worktree {target} on {branch}"
+
+    head = _rev(target, "HEAD")
+    if head and head != base_sha:
+        return None, (
+            f"worktree {target} is on {head[:8]}, not {base} ({base_sha[:8]}) — "
+            "refusing a branch rooted on the wrong base"
+        )
+    note = "" if fetched else " (local base, nothing to fetch)"
+    return target, f"created worktree {target} on {branch} @ {base_sha[:8]}{note}"
+
+
+def env_link_paths() -> tuple[str, ...]:
+    """Extra repo-relative paths to symlink into a new worktree.
+
+    The top-level ``.env*`` glob covers a single-package repo and nothing
+    else. A monorepo keeps its environment files next to the applications
+    that read them — ``applications/api/.env``, ``applications/ui/.env`` —
+    and a worktree missing those fails on the agent's first test run, which
+    is a slow and confusing way to find out.
+
+    ``$EPHOR_ENV_LINKS`` is a comma-separated list of those paths.
+    """
+    raw = os.environ.get("EPHOR_ENV_LINKS") or ""
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def link_env_files(root: Path, target: Path) -> int:
-    """Symlink the repo's top-level ``.env*`` files into a new worktree.
+    """Symlink the repo's environment files into a new worktree.
 
     A fresh worktree has no untracked files, which means no ``.env`` — and an
-    agent whose first action is to run the test suite discovers that the
-    slow way. Symlinks rather than copies so a later edit to the real file is
+    agent whose first action is to run the test suite discovers that the slow
+    way. Symlinks rather than copies so a later edit to the real file is
     picked up by every worktree at once.
+
+    Covers the top-level ``.env*`` glob plus whatever :func:`env_link_paths`
+    names. Returns how many links were made; already-present destinations are
+    left alone, so a second call adds nothing.
     """
+    sources: list[tuple[Path, Path]] = []
+    with contextlib.suppress(OSError):
+        sources.extend((p, target / p.name) for p in root.glob(".env*") if p.is_file())
+    for relative in env_link_paths():
+        # A path that climbs out of the repo is a configuration mistake, not
+        # an instruction to link something outside it.
+        if relative.startswith("/") or ".." in Path(relative).parts:
+            continue
+        source = root / relative
+        if source.is_file():
+            sources.append((source, target / relative))
+
     linked = 0
-    try:
-        candidates = [p for p in root.glob(".env*") if p.is_file()]
-    except OSError:
-        return 0
-    for source in candidates:
-        destination = target / source.name
+    for source, destination in sources:
         if destination.exists() or destination.is_symlink():
             continue
         try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
             destination.symlink_to(source)
         except OSError:
             continue
@@ -151,34 +297,73 @@ def link_env_files(root: Path, target: Path) -> int:
     return linked
 
 
-def open_window(name: str, cwd: Path, command: str, env: dict[str, str]) -> tuple[str | None, str]:
-    """Open a tmux window running ``command`` in ``cwd``. Returns (window id, msg).
+def valid_tmux_session(name: str) -> bool:
+    """True when ``name`` is usable as ``-t <name>:`` without tmux misreading it."""
+    return bool(_TMUX_SESSION_RE.match(name or ""))
+
+
+def open_window(
+    name: str,
+    cwd: Path,
+    command: str,
+    env: dict[str, str],
+    *,
+    detached: bool = False,
+    target_session: str = "",
+) -> tuple[str | None, str, str]:
+    """Open a tmux window running ``command`` in ``cwd``.
+
+    Returns ``(window id, pane id, message)``; the ids are None/"" on failure.
 
     The environment is applied with ``env`` inside the window's own shell
     rather than inherited from ephor's process, because the point is to set
     ``EPHOR_TICKET`` for the *agent*, and ephor may itself have been started
     from a session that has one.
+
+    ``detached`` (``-d``) opens the window without switching to it. An
+    operator who typed ``ephor start`` wants to land in the new window; a
+    flow launching in the background must not yank them out of whatever pane
+    they are typing in. ``target_session`` (``-t <name>:``) puts the window in
+    a named session instead of the current one, which is also the only way a
+    launch from outside tmux (a systemd timer) has anywhere to go. It is
+    passed as ``=<name>:`` because tmux otherwise falls back to a prefix or
+    pattern match: with ``flows`` gone but ``flows-old`` open, the window
+    would land in ``flows-old`` instead of failing. :func:`valid_tmux_session`
+    forbids a leading ``=``, so the prefix never doubles up.
     """
+    if target_session and not valid_tmux_session(target_session):
+        return None, "", f"invalid tmux session name {target_session!r}"
     prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(env.items()))
     full = f"exec env {prefix} {command}" if prefix else f"exec {command}"
-    code, out, err = _run(
-        [
-            "/usr/bin/env",
-            "tmux",
-            "new-window",
-            "-P",
-            "-F",
-            "#{window_id}",
-            "-n",
-            name,
-            "-c",
-            str(cwd),
-            full,
-        ]
-    )
+    args = ["/usr/bin/env", "tmux", "new-window", "-P", "-F", "#{window_id} #{pane_id}"]
+    if detached:
+        args.append("-d")
+    if target_session:
+        args.extend(["-t", f"={target_session}:"])
+    args.extend(["-n", name, "-c", str(cwd), full])
+    code, out, err = _run(args)
     if code != 0:
-        return None, f"tmux new-window failed: {err or 'unknown error'}"
-    return out or None, f"opened tmux window {out}"
+        return None, "", f"tmux new-window failed: {err or 'unknown error'}"
+    window, _, pane = out.partition(" ")
+    if not window:
+        return None, "", "tmux new-window printed no window id"
+    return window, pane.strip(), f"opened tmux window {window}"
+
+
+def agent_invocation(provider: str, *, ticket: str, prompt: str = "") -> tuple[str, dict[str, str]]:
+    """The command line and environment that launch ``provider`` on ``ticket``.
+
+    Shared by :func:`start` and by callers that open an agent window without
+    a worktree (a flow running in a repo root), so there is one place that
+    decides how a prompt is quoted and which variables the hook will read.
+    Raises KeyError for an unknown provider, like :func:`get_provider`.
+    """
+    agent = get_provider(provider)
+    command = f"{agent.binary} {shlex.quote(prompt)}" if prompt else agent.binary
+    env = {"EPHOR_PROVIDER": agent.name}
+    if ticket:
+        env["EPHOR_TICKET"] = ticket
+    return command, env
 
 
 def start(
@@ -189,9 +374,24 @@ def start(
     base: str = "origin/main",
     cwd: str | Path | None = None,
     prompt: str = "",
+    window_name: str = "",
+    launch_agent: bool = True,
     dry_run: bool = False,
+    detached: bool = False,
+    target_session: str = "",
+    extra_env: dict[str, str] | None = None,
 ) -> StartResult:
-    """Create the worktree, open the window, launch the agent, record the work."""
+    """Create the worktree, open the window, launch the agent, record the work.
+
+    ``launch_agent=False`` opens the window on a plain shell instead. That is
+    what an operator wants when they are going to drive the work themselves
+    in this pane and just need somewhere to run a dev server and tail logs.
+
+    ``detached`` and ``target_session`` pass through to :func:`open_window`;
+    both default to the interactive behaviour ``ephor start`` has always had.
+    ``extra_env`` is added to the window's environment — the flows tick uses
+    it to hand an agent its run id and payload file.
+    """
     ticket = normalize_ticket(ticket_raw)
     if ticket is None:
         return StartResult(False, f"{ticket_raw!r} is not a ticket key (expected e.g. DR-8222)")
@@ -208,11 +408,12 @@ def start(
         return StartResult(False, f"unknown provider {provider!r}")
 
     if dry_run:
-        target = worktree_path(root, ticket)
+        planned = worktree_path(root, ticket)
+        what = agent.binary if launch_agent else "a shell"
         return StartResult(
             True,
-            f"would create {target} on {branch_name(ticket, title)} and run {agent.binary}",
-            worktree=str(target),
+            f"would create {planned} on {branch_name(ticket, title)} and run {what}",
+            worktree=str(planned),
             branch=branch_name(ticket, title),
         )
 
@@ -221,11 +422,22 @@ def start(
         return StartResult(False, message)
     link_env_files(root, target)
 
-    command = agent.binary
-    if prompt:
-        command = f"{agent.binary} {shlex.quote(prompt)}"
-    window, window_message = open_window(
-        ticket, target, command, {"EPHOR_TICKET": ticket, "EPHOR_PROVIDER": agent.name}
+    if launch_agent:
+        command, env = agent_invocation(agent.name, ticket=ticket, prompt=prompt)
+    else:
+        # A login shell, so the operator lands in their normal environment
+        # with EPHOR_TICKET already exported for whatever they start by hand.
+        command = os.environ.get("SHELL") or "/bin/sh"
+        env = {"EPHOR_TICKET": ticket}
+    if extra_env:
+        env = {**extra_env, **env}
+    window, pane, window_message = open_window(
+        window_name or ticket,
+        target,
+        command,
+        env,
+        detached=detached,
+        target_session=target_session,
     )
     if window is None:
         return StartResult(False, window_message, worktree=str(target))
@@ -238,12 +450,16 @@ def start(
         worktree=str(target),
         confirmed=True,
     )
+    # A flow's launch carries its run id, so a later tick that lost the
+    # launched write can still find the agent this attempt started.
+    flow_run = (extra_env or {}).get("EPHOR_FLOW_RUN", "")
     eventlog.append(
         eventlog.EventKind.SESSION_STARTED,
         ticket=ticket,
         detail=f"{agent.display_name} in {target.name}",
         provider=agent.name,
         worktree=str(target),
+        **({"run_id": flow_run} if flow_run else {}),
     )
     return StartResult(
         True,
@@ -251,6 +467,7 @@ def start(
         worktree=str(target),
         branch=context.branch or branch_name(ticket, title),
         window=window,
+        pane=pane,
     )
 
 
@@ -282,7 +499,7 @@ def resume(
     env = {"EPHOR_PROVIDER": agent.name}
     if ticket:
         env["EPHOR_TICKET"] = ticket
-    window, message = open_window(name or ticket or agent.name, target, command, env)
+    window, pane, message = open_window(name or ticket or agent.name, target, command, env)
     if window is None:
         return StartResult(False, message, worktree=str(target))
     eventlog.append(
@@ -293,5 +510,9 @@ def resume(
         provider=agent.name,
     )
     return StartResult(
-        True, f"resumed {session_id[:8]} — {message}", worktree=str(target), window=window
+        True,
+        f"resumed {session_id[:8]} — {message}",
+        worktree=str(target),
+        window=window,
+        pane=pane,
     )
