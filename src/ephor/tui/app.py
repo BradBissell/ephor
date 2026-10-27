@@ -67,7 +67,7 @@ from ephor.github import PrResolver, PullRequest
 from ephor.jira import clear_cwd_cache, match_for_agent, ticket_for_agent
 from ephor.jira_api import IssueResolver
 from ephor.jira_api import drift as jira_drift
-from ephor.notify import Notifier
+from ephor.notify import Attention, Notifier
 from ephor.speech import SpeechWatcher
 from ephor.speech_player import SpeechPlayer
 from ephor.speech_settings import load as load_speech_settings
@@ -282,7 +282,11 @@ class EphorApp(App[int]):
         # tell a *change* from a repaint and log only the former.
         self._prev_status: dict[str, str] = {}
         self._prev_pr: dict[str, tuple[str, str, str]] = {}
-        self._notifier = Notifier(desktop_fallback=True)
+        self._notifier = Notifier(desktop_fallback=True, persist=True, async_send=True)
+        # Attention claims collected during one _observe pass. The notifier
+        # is handed the whole board at once because batching and the
+        # per-session cooldown are decisions about the set, not the row.
+        self._attention: list[Attention] = []
         self._kill_armed_sid: str | None = None
         self._kill_armed_at: float = 0.0
         self._filter: str = ""  # case-insensitive substring filter; "" = show all
@@ -403,6 +407,9 @@ class EphorApp(App[int]):
         # kokoro+paplay running in the background.
         with contextlib.suppress(Exception):
             self._speech_player.stop_all()
+        # Stop the notifier's sender thread; the ledger is already on disk.
+        with contextlib.suppress(Exception):
+            self._notifier.close()
 
     def _reconcile_now(self) -> None:
         """Sweep orphaned state files and reset stuck WAITING_* statuses.
@@ -593,6 +600,7 @@ class EphorApp(App[int]):
         first time it is seen rather than on every repaint.
         """
         seen: set[str] = set()
+        self._attention = []
         for agent in agents:
             sid = agent.session_id
             seen.add(sid)
@@ -623,14 +631,20 @@ class EphorApp(App[int]):
                 )
             self._prev_status[sid] = current
             self._observe_pr(agent, ticket)
-            self._maybe_notify(agent, ticket)
+            self._collect_attention(agent, ticket)
 
         for sid in [s for s in self._prev_status if s not in seen]:
             eventlog.append(eventlog.EventKind.SESSION_ENDED, session_id=sid)
             self._prev_status.pop(sid, None)
             self._prev_pr.pop(sid, None)
             self._selected.discard(sid)
-            self._notifier.clear(sid)
+            # An *ended* session is the one case that forgets eagerly: there
+            # is nothing left to settle, and a reused id should start clean.
+            self._notifier.forget(sid)
+
+        # One pass, one decision. Everything the notifier suppresses — dwell,
+        # settling, cooldown, batching, quiet hours — needs the whole board.
+        self._notifier.tick(self._attention)
 
     def _observe_pr(self, agent: AgentState, ticket: str) -> None:
         """Log PR/CI/review transitions and keep the work record current."""
@@ -673,37 +687,44 @@ class EphorApp(App[int]):
                 pr_state=pr.state,
             )
 
-    def _maybe_notify(self, agent: AgentState, ticket: str) -> None:
-        """Push a notification when this session starts needing a human.
+    def _collect_attention(self, agent: AgentState, ticket: str) -> None:
+        """Record what this session wants, if anything, for the notifier.
 
-        Deduping lives in the Notifier; this only decides *whether* the
-        session currently wants something, and says so in one line.
+        This only decides *whether* the session currently wants something and
+        says so in one line. Every question about whether that is worth a
+        push — has it lasted long enough, have we already said so, is it 3am,
+        are nine others also asking — belongs to the Notifier, which sees the
+        whole board. A session that wants nothing is simply left out; it is
+        deliberately *not* cleared, so an agent flapping in and out of a
+        prompt stays one event instead of one per flap.
         """
         from ephor.constants import ATTENTION_STATUSES
 
         label = ticket or agent.project_name or agent.session_id[:8]
+        where = agent.project_name or agent.cwd
         if agent.status in ATTENTION_STATUSES:
             reason = str(agent.status)
-            self._notifier.notify(
-                agent.session_id,
-                reason,
-                title=f"ephor: {label}",
-                body=f"{reason.replace('_', ' ').lower()} — {agent.project_name or agent.cwd}",
-                priority="high" if agent.status is AgentStatus.WAITING_PERMISSION else "default",
+            self._attention.append(
+                Attention(
+                    session_id=agent.session_id,
+                    reason=reason,
+                    label=label,
+                    detail=f"{reason.replace('_', ' ').lower()} — {where}",
+                )
             )
             return
         work = self._work_attention(agent)
         if work is not None:
-            self._notifier.notify(
-                agent.session_id,
-                str(work),
-                title=f"ephor: {label}",
-                body=WORK_ATTENTION_DISPLAY[work][1] + f" — {agent.project_name or agent.cwd}",
+            pr = self._prs.cached(agent.cwd)
+            self._attention.append(
+                Attention(
+                    session_id=agent.session_id,
+                    reason=str(work),
+                    label=label,
+                    detail=f"{WORK_ATTENTION_DISPLAY[work][1]} — {where}",
+                    url=pr.url if pr is not None else "",
+                )
             )
-            return
-        # Nothing wanted any more: re-arm so the next block notifies at once
-        # rather than waiting out the dedupe window.
-        self._notifier.clear(agent.session_id)
 
     def _group_members(self, agents: list[AgentState]) -> dict[str, list[AgentState]]:
         """Sessions per group key, for the header counts."""
