@@ -107,7 +107,7 @@ class AgentState:
             last_summary=data.get("last_summary", ""),
             provider=data.get("provider", ""),
             last_reply=data.get("last_reply", ""),
-            ticket=data.get("ticket", ""),
+            ticket=str(data.get("ticket") or ""),
             schema_version=version,
         )
 

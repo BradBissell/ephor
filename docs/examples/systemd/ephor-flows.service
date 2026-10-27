@@ -1,0 +1,16 @@
+# ~/.config/systemd/user/ephor-flows.service
+#
+# One flows tick. Run by ephor-flows.timer; see docs/flows.md.
+# Jira credentials live in a 0600 file:
+#   EPHOR_JIRA_URL=https://example.atlassian.net
+#   EPHOR_JIRA_EMAIL=you@example.com
+#   EPHOR_JIRA_TOKEN=...
+[Unit]
+Description=ephor flows tick
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/ephor/flows.env
+# Must reach ephor, gh, tmux and the agent CLIs a flow may start.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/ephor flows tick

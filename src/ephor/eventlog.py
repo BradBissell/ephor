@@ -9,14 +9,21 @@ unanswerable from anything ephor keeps.
 This is the missing tape. One line of JSON per state change, appended
 forever, queryable by ticket or by session. It follows the pattern
 :mod:`ephor.speech` already established for TTS events, for the same reasons:
-an append-only NDJSON file needs no schema migration, no lock (a line under
-``PIPE_BUF`` written to an ``O_APPEND`` fd is atomic on Linux), and no daemon
-to own it.
+an append-only NDJSON file needs no schema migration and no daemon to own it,
+and a line under ``PIPE_BUF`` written to an ``O_APPEND`` fd is atomic on
+Linux, so concurrent appends never interleave.
 
-The TUI is the writer. It is the only component that sees both the previous
-and the current state of every session on each refresh, so it is the only one
-that can tell a *change* from a repaint — and logging repaints at 2 Hz would
-bury the signal under half a million identical lines a day.
+The TUI is the main writer. It is the only component that sees both the
+previous and the current state of every session on each refresh, so it is the
+only one that can tell a *change* from a repaint — and logging repaints at
+2 Hz would bury the signal under half a million identical lines a day. The
+launcher and the flows tick write too, from their own processes.
+
+That is why appends take a sidecar flock (``events.ndjson.lock``). The append
+itself never needed one; *rotation* does. Two writers that both see the log
+over the cap would both rename it aside, and the second rename replaces the
+generation the first one just kept with a near-empty file. Holding the lock
+across the size check, the rotation and the write makes that one step.
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from ephor.config import state_dir
+from ephor.filelock import locked
 
 # Rotate at 8 MiB — roughly a year of a busy fleet's transitions, and small
 # enough that reading the whole file back to answer `ephor log DR-8222`
@@ -51,6 +59,14 @@ class EventKind(StrEnum):
     REVIEW_CHANGED = "review_changed"
     PERMISSION_DECIDED = "permission_decided"
     NOTIFIED = "notified"
+    # Written by the flows tick (ephor.flows). A transition is a Jira status
+    # change the tick observed between two snapshots; the FLOW_* kinds trace a
+    # run (extra: run_id, flow, generation, reason) from dispatch to its end.
+    TICKET_TRANSITIONED = "ticket_transitioned"
+    FLOW_DISPATCHED = "flow_dispatched"
+    FLOW_BLOCKED = "flow_blocked"
+    FLOW_FINISHED = "flow_finished"
+    FLOW_CANCELLED = "flow_cancelled"
 
 
 @dataclass(frozen=True)
@@ -85,6 +101,11 @@ class Event:
 def log_path() -> Path:
     """Where the event log lives (beside the session state dir)."""
     return state_dir().parent / "events.ndjson"
+
+
+def _lock_path(path: Path) -> Path:
+    """Sidecar lock serialising rotate-and-append across processes."""
+    return path.with_suffix(".ndjson.lock")
 
 
 def _rotate_if_needed(path: Path) -> None:
@@ -122,15 +143,18 @@ def append(
     if extra:
         payload["extra"] = extra
     try:
+        line = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.parent.chmod(0o700)
-        _rotate_if_needed(path)
-        line = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, line.encode())
-        finally:
-            os.close(fd)
+        # Fail-open: a wedged lock holder must not cost the caller its event,
+        # and an unlocked append is exactly what this did before the lock.
+        with locked(_lock_path(path)):
+            _rotate_if_needed(path)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, line.encode())
+            finally:
+                os.close(fd)
     except (OSError, TypeError, ValueError):
         return False
     return True

@@ -1,0 +1,65 @@
+# ~/.config/ephor/board.toml — the board's lanes, and the flows that act on it.
+#
+# Full reference: docs/flows.md. Check a change with `ephor flows check`, and
+# preview what the flows would do with `ephor flows tick --dry-run`.
+#
+# Needs EPHOR_JIRA_URL / EPHOR_JIRA_EMAIL / EPHOR_JIRA_TOKEN. Nothing here
+# writes to Jira.
+
+[board]
+# Projects the search is scoped to (default: $EPHOR_TICKET_PROJECTS).
+projects = ["DR"]
+# Which tickets are on the board. ANDed with the project scope.
+jql = "assignee = currentUser() AND (statusCategory != Done OR updated >= -7d)"
+# The lanes, in order. A name, or a name plus the statuses it gathers.
+# Statuses no column claims land in an "Other" lane.
+columns = [
+  "To Do",
+  "In Progress",
+  { name = "Review", statuses = ["Peer Review", "QA"] },
+  "Done",
+]
+
+[repos]
+# Where a project's flows run when the ticket has no worktree of its own.
+DR = "~/projects/work/aim-myt"
+
+[flows]
+tmux_session = ""          # "" = the current tmux session; set it for a systemd timer
+max_active_agents = 4      # no agent flow starts while this many sessions are alive
+max_runs_per_hour = 6      # launches across all flows
+ticket_breaker = 3         # launches per ticket per hour
+max_event_age = "30m"      # after a longer gap every new run waits for confirmation
+confirm_ttl = "24h"        # unanswered runs expire
+pr_interval = "5m"         # spacing of the `gh` lookups behind on_pr
+settle = "10m"             # how long a session must sit idle for on_session = "idle"
+
+# Offer a review session when one of your tickets lands in Peer Review.
+# Agent flows (start =) are always confirm-only: approve with `f` then `y`
+# in the dashboard, or `ephor flows approve DR-1234.review`.
+[[flow]]
+name = "review"
+on_enter = "Peer Review"
+start = "/review-pr {ticket}"
+worktree = false           # run in the ticket's worktree, else the repo root
+
+# Hand implementation off to a review as soon as a PR is opened. Waits
+# (blocked) until the session that opened the PR has finished.
+[[flow]]
+name = "self-review"
+on_pr = "opened"
+start = "/review-pr {ticket}"
+
+# Run a script, unattended, when a PR merges. It reads $EPHOR_FLOW_PAYLOAD.
+[[flow]]
+name = "shipped"
+on_pr = "merged"
+command = "~/.config/ephor/flows/shipped.sh {ticket}"
+mode = "auto"
+
+# Hear about an agent that died mid-task.
+[[flow]]
+name = "died"
+on_session = "died"
+command = "notify-send ephor {ticket}"
+mode = "auto"

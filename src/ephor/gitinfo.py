@@ -235,3 +235,27 @@ def collisions(sessions: Sequence[tuple[str, str | None]]) -> dict[str, tuple[st
         for session_id in ids:
             found[session_id] = tuple(other for other in ids if other != session_id)
     return found
+
+
+def is_linked_worktree(path: str | Path | None) -> bool:
+    """True when ``path`` is the root of a *linked* worktree (``git worktree add``).
+
+    A linked worktree's ``.git`` is a file pointing into the main
+    repository's ``.git/worktrees/<name>`` — its git dir differs from the
+    common dir. The main working tree has a ``.git`` directory, and a
+    submodule's ``.git`` file points into ``.git/modules``, so neither
+    counts. Read from the filesystem: no fork, safe on every repaint.
+    """
+    if path is None:
+        return False
+    try:
+        marker = Path(path).expanduser() / ".git"
+        if not marker.is_file():
+            return False
+        text = marker.read_text(errors="replace").strip()
+    except (OSError, TypeError, ValueError):
+        return False
+    if not text.startswith("gitdir:"):
+        return False
+    gitdir = text[len("gitdir:") :].strip().replace("\\", "/")
+    return "/worktrees/" in gitdir

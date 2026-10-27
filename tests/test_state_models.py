@@ -144,3 +144,13 @@ def test_v2_state_preserves_last_summary() -> None:
         }
     )
     assert s.last_summary == "fix the failing test"
+
+
+@pytest.mark.parametrize("raw", [None, ""])
+def test_a_null_or_missing_ticket_decodes_to_empty(raw: object) -> None:
+    """`"ticket": null` must not reach `.upper()` anywhere downstream."""
+    data = json.loads(_minimal_state().to_json())
+    data["ticket"] = raw
+    assert AgentState.from_dict(data).ticket == ""
+    del data["ticket"]
+    assert AgentState.from_dict(data).ticket == ""

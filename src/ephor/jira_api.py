@@ -11,6 +11,15 @@ enough for three things the board could not do before — show what the ticket
 is actually *called* instead of the branch slug, colour the key by where it
 sits in the workflow, and flag **drift**.
 
+The flows tick (:mod:`ephor.flows`) needs three more reads, all still
+read-only: one JQL :func:`search` for the whole board instead of a request
+per ticket, :func:`myself` so an ``assignee = "me"`` rule compares account
+ids rather than display names, and :func:`fetch_fresh`, an uncached re-read
+taken immediately before a launch — search results are eventually
+consistent, and a flow must not start an agent on a status the ticket has
+already left. :class:`Issue` carries the status *id* and the assignee's
+account id for the same reason: names are what people rename.
+
 Drift is the payoff. "PR merged, ticket still In Progress" is a silent,
 weekly, entirely invisible cost: nothing in git notices, nothing in Jira
 notices, and the only thing that would have noticed is a human reading both
@@ -24,6 +33,8 @@ No configuration means no network call, not a failed one.
 from __future__ import annotations
 
 import base64
+import hashlib
+import http.client
 import json
 import os
 import time
@@ -37,6 +48,13 @@ from urllib.parse import quote
 # requests per hour.
 CACHE_TTL_SEC = 600.0
 _TIMEOUT_SEC = 6.0
+
+# One board search is at most this many pages of this many issues. A personal
+# board is tens of tickets; the cap exists so a JQL typo that matches a whole
+# site ends in a truncated answer rather than a ten-minute crawl.
+SEARCH_PAGE_SIZE = 100
+SEARCH_MAX_PAGES = 10
+_DEFAULT_FIELDS = ("summary", "status", "assignee")
 
 # Statuses that mean the ticket is finished. Compared case-insensitively
 # against Jira's status *name*, and against its category key, which is the
@@ -63,6 +81,11 @@ class Issue:
     status_category: str = ""
     title: str = ""
     assignee: str = ""
+    # Stable identities behind the two display names above. A workflow can
+    # rename "Peer Review" without changing its id, and two people can share
+    # a display name but never an accountId.
+    status_id: str = ""
+    assignee_id: str = ""
 
     @property
     def is_done(self) -> bool:
@@ -90,18 +113,61 @@ def done_statuses() -> frozenset[str]:
     return custom or _DEFAULT_DONE
 
 
-def credentials() -> Credentials | None:
-    """Configured Jira credentials, or None when ephor should stay offline.
+# Where each credential is read from, first match wins. ``EPHOR_JIRA_*``
+# comes first, so pointing ephor at a second site does not disturb the
+# ``JIRA_*`` names other tools already set. ``JIRA_USERNAME`` is what the
+# Atlassian MCP server calls the account email, so a shell set up for it
+# works here too.
+CREDENTIAL_ENV: dict[str, tuple[str, ...]] = {
+    "url": ("EPHOR_JIRA_URL", "JIRA_URL"),
+    "email": ("EPHOR_JIRA_EMAIL", "JIRA_EMAIL", "JIRA_USERNAME"),
+    "token": ("EPHOR_JIRA_TOKEN", "JIRA_API_TOKEN"),
+}
 
-    ``EPHOR_JIRA_*`` wins over the ``JIRA_*`` names other tools already set,
-    so pointing ephor at a second site does not disturb them.
-    """
-    base = os.environ.get("EPHOR_JIRA_URL") or os.environ.get("JIRA_URL") or ""
-    email = os.environ.get("EPHOR_JIRA_EMAIL") or os.environ.get("JIRA_EMAIL") or ""
-    token = os.environ.get("EPHOR_JIRA_TOKEN") or os.environ.get("JIRA_API_TOKEN") or ""
+
+def _credential(part: str) -> str:
+    for name in CREDENTIAL_ENV[part]:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return ""
+
+
+def credentials() -> Credentials | None:
+    """Configured Jira credentials, or None when ephor should stay offline."""
+    base, email, token = (_credential(part) for part in ("url", "email", "token"))
     if not (base and email and token):
         return None
     return Credentials(base_url=base.rstrip("/"), email=email, token=token)
+
+
+def missing_credentials() -> str:
+    """What is missing from the Jira configuration, naming every variable read; "" if nothing.
+
+    ``"email (EPHOR_JIRA_EMAIL, JIRA_EMAIL or JIRA_USERNAME)"`` tells someone
+    whose shell has the URL and the token exactly which one to add.
+    """
+    gaps = []
+    for part, names in CREDENTIAL_ENV.items():
+        if not _credential(part):
+            gaps.append(f"{part} ({', '.join(names[:-1])} or {names[-1]})")
+    return "; ".join(gaps)
+
+
+def identity() -> str:
+    """A short fingerprint of *who* the credentials sign in as: site plus email.
+
+    Lets a cached answer about "me" (the accountId behind ``/myself``) be
+    tied to the account it was fetched for, so pointing ephor at another
+    site or user re-asks instead of matching rules against a stranger's id.
+    The token is left out: rotating it does not change who you are. "" when
+    Jira is not configured.
+    """
+    creds = credentials()
+    if creds is None:
+        return ""
+    who = f"{creds.base_url.lower()}\n{creds.email.strip().lower()}"
+    return hashlib.sha256(who.encode()).hexdigest()[:16]
 
 
 def is_configured() -> bool:
@@ -116,46 +182,160 @@ def _parse_issue(key: str, payload: object) -> Issue | None:
     if not isinstance(fields, dict):
         return None
     status_name = ""
+    status_id = ""
     category = ""
     status = fields.get("status")
     if isinstance(status, dict):
         status_name = str(status.get("name") or "")
+        status_id = str(status.get("id") or "")
         cat = status.get("statusCategory")
         if isinstance(cat, dict):
             category = str(cat.get("key") or "")
     assignee = ""
+    assignee_id = ""
     who = fields.get("assignee")
     if isinstance(who, dict):
         assignee = str(who.get("displayName") or who.get("name") or "")
+        assignee_id = str(who.get("accountId") or "")
     return Issue(
         key=str(payload.get("key") or key),
         status=status_name,
         status_category=category,
         title=str(fields.get("summary") or ""),
         assignee=assignee,
+        status_id=status_id,
+        assignee_id=assignee_id,
     )
+
+
+def _request(creds: Credentials, path: str, body: dict[str, object] | None = None) -> object | None:
+    """One authenticated call — GET, or POST when ``body`` is given.
+
+    Returns the decoded JSON, or None on any failure: an HTTP error, a
+    timeout, a connection dropped mid-body, a body that is not JSON (or is
+    nested too deeply to decode), or a site that is not https. Every caller
+    reads None as "unknown", so nothing here may escape as an exception —
+    the flows tick relies on a failed search aborting quietly.
+    """
+    url = f"{creds.base_url}{path}"
+    if not url.lower().startswith("https://"):
+        # Refuse to send a bearer credential in the clear, even to a host the
+        # user named themselves.
+        return None
+    auth = base64.b64encode(f"{creds.email}:{creds.token}".encode()).decode()
+    headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
+    data: bytes | None = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(  # noqa: S310 - scheme is the user's own configured site
+        url,
+        data=data,
+        headers=headers,
+        method="POST" if body is not None else "GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_TIMEOUT_SEC) as response:  # noqa: S310
+            parsed: object = json.loads(response.read().decode())
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,  # IncompleteRead, BadStatusLine: not OSErrors
+        OSError,
+        ValueError,  # includes JSONDecodeError and UnicodeDecodeError
+        RecursionError,  # pathologically nested JSON
+    ):
+        return None
+    return parsed
 
 
 def _fetch(key: str, creds: Credentials) -> Issue | None:
     """One authenticated GET. None on any failure — this is best-effort."""
     # `fields` keeps the response to the four things we read; a Jira issue
     # document is otherwise tens of kilobytes of custom fields.
-    url = f"{creds.base_url}/rest/api/3/issue/{quote(key, safe='')}?fields=summary,status,assignee"
-    auth = base64.b64encode(f"{creds.email}:{creds.token}".encode()).decode()
-    request = urllib.request.Request(  # noqa: S310 - scheme is the user's own configured site
-        url,
-        headers={"Authorization": f"Basic {auth}", "Accept": "application/json"},
+    payload = _request(
+        creds, f"/rest/api/3/issue/{quote(key, safe='')}?fields={','.join(_DEFAULT_FIELDS)}"
     )
-    if not url.lower().startswith("https://"):
-        # Refuse to send a bearer credential in the clear, even to a host the
-        # user named themselves.
-        return None
-    try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_SEC) as response:  # noqa: S310
-            payload = json.loads(response.read().decode())
-    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+    if payload is None:
         return None
     return _parse_issue(key, payload)
+
+
+def fetch_fresh(key: str) -> Issue | None:
+    """Read ``key`` straight from Jira, bypassing every cache. Blocking.
+
+    The pre-launch re-check: whatever a search or the dashboard's resolver
+    said a few minutes ago, this is what the ticket says *now*. None when
+    Jira is not configured or did not answer — which a caller must treat as
+    "unknown", never as "the ticket moved".
+    """
+    creds = credentials()
+    if creds is None or not key:
+        return None
+    return _fetch(key.upper(), creds)
+
+
+def myself() -> str | None:
+    """The configured user's Jira accountId, or None when unknown."""
+    creds = credentials()
+    if creds is None:
+        return None
+    payload = _request(creds, "/rest/api/3/myself")
+    if not isinstance(payload, dict):
+        return None
+    account = payload.get("accountId")
+    return account if isinstance(account, str) and account else None
+
+
+def search(
+    jql: str,
+    fields: tuple[str, ...] = _DEFAULT_FIELDS,
+    *,
+    page_size: int = SEARCH_PAGE_SIZE,
+    max_pages: int = SEARCH_MAX_PAGES,
+) -> list[Issue] | None:
+    """Every issue ``jql`` matches, via ``POST /rest/api/3/search/jql``. Blocking.
+
+    Pages with ``nextPageToken`` until Jira says ``isLast``, stops offering a
+    token, repeats one, or ``max_pages`` is reached. Those last two return
+    what was read so far: a truncated board is safe, because a ticket missing
+    from one search is treated as unseen rather than as moved.
+
+    A failure on *any* page returns None, never a partial list. That is the
+    rule the tick rests on — unknown never means unmet — and a list missing
+    its second page would look exactly like fifty tickets leaving the board.
+    """
+    creds = credentials()
+    if creds is None or not jql.strip():
+        return None
+    issues: list[Issue] = []
+    token: str | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(max(1, max_pages)):
+        body: dict[str, object] = {
+            "jql": jql,
+            "fields": list(fields),
+            "maxResults": max(1, page_size),
+        }
+        if token:
+            body["nextPageToken"] = token
+        payload = _request(creds, "/rest/api/3/search/jql", body)
+        if not isinstance(payload, dict):
+            return None
+        raw = payload.get("issues")
+        if not isinstance(raw, list):
+            return None
+        for item in raw:
+            issue = _parse_issue("", item)
+            if issue is not None and issue.key:
+                issues.append(issue)
+        next_token = payload.get("nextPageToken")
+        if payload.get("isLast") is True or not isinstance(next_token, str) or not next_token:
+            break
+        if next_token in seen_tokens:
+            break
+        seen_tokens.add(next_token)
+        token = next_token
+    return issues
 
 
 @dataclass

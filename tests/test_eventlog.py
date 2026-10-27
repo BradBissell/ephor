@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from ephor import eventlog
 from ephor.eventlog import EventKind
 
@@ -71,3 +74,115 @@ def test_read_spans_the_rotated_generation(monkeypatch) -> None:
 def test_log_file_is_private() -> None:
     eventlog.append(EventKind.STATUS_CHANGED)
     assert eventlog.log_path().stat().st_mode & 0o777 == 0o600
+
+
+def test_new_flow_kinds_round_trip() -> None:
+    eventlog.append(
+        EventKind.FLOW_DISPATCHED,
+        ticket="DR-1",
+        detail="review",
+        run_id="DR-1.review.10001-1",
+        flow="review",
+        generation="10001-1",
+        reason="",
+    )
+    eventlog.append(EventKind.TICKET_TRANSITIONED, ticket="DR-1", detail="In Progress -> Review")
+    kinds = [e.kind for e in eventlog.read(ticket="DR-1")]
+    assert kinds == [EventKind.FLOW_DISPATCHED, EventKind.TICKET_TRANSITIONED]
+    assert {str(k) for k in kinds} == {"flow_dispatched", "ticket_transitioned"}
+    for kind in ("flow_blocked", "flow_finished", "flow_cancelled"):
+        assert EventKind(kind)
+
+
+def test_rotation_and_append_happen_under_the_sidecar_lock(monkeypatch) -> None:
+    """Two writers both rotating would discard the kept generation."""
+    from ephor.filelock import locked
+
+    seen: list[bool] = []
+    real_rotate = eventlog._rotate_if_needed
+
+    def spying_rotate(path):
+        with locked(eventlog._lock_path(path), timeout=0) as free:
+            seen.append(free)
+        real_rotate(path)
+
+    monkeypatch.setattr(eventlog, "_rotate_if_needed", spying_rotate)
+    assert eventlog.append(EventKind.STATUS_CHANGED, detail="x") is True
+    assert seen == [False]
+    assert eventlog.log_path().with_suffix(".ndjson.lock").exists()
+
+
+def test_a_second_writer_cannot_rotate_while_the_first_is_mid_rotation(monkeypatch) -> None:
+    """Without the lock, B rotates under A and A's rename then discards the kept generation.
+
+    A is parked between its size check and its rename. B, started while A is
+    parked, would (unlocked) see the same oversized log, move it aside and
+    write a fresh one — and A's rename would then replace the kept
+    generation with B's one-line file. With the lock, B waits for A.
+    """
+    import threading
+
+    monkeypatch.setattr(eventlog, "MAX_LOG_BYTES", 400)
+    path = eventlog.log_path()
+    while not path.exists() or path.stat().st_size < 400:
+        eventlog.append(EventKind.STATUS_CHANGED, detail="before-rotation")
+    original_size = path.stat().st_size
+
+    # A generous wait for this test only, so B is still queued (not failed
+    # open) when A is released however slow the machine is. If append()
+    # stops taking the lock at all, this wrapper is never reached.
+    real_locked = eventlog.locked
+    monkeypatch.setattr(eventlog, "locked", lambda p, timeout=None: real_locked(p, timeout=5.0))
+
+    entered, go = threading.Event(), threading.Event()
+    first = [True]
+    real_rotate = eventlog._rotate_if_needed
+
+    def gated_rotate(target: Path) -> None:
+        if not first[0]:
+            real_rotate(target)
+            return
+        first[0] = False
+        if target.stat().st_size >= eventlog.MAX_LOG_BYTES:
+            entered.set()
+            go.wait(timeout=1)
+            os.replace(target, target.with_suffix(".ndjson.1"))
+
+    monkeypatch.setattr(eventlog, "_rotate_if_needed", gated_rotate)
+    writer_a = threading.Thread(
+        target=eventlog.append, args=(EventKind.STATUS_CHANGED,), kwargs={"detail": "A"}
+    )
+    writer_b = threading.Thread(
+        target=eventlog.append, args=(EventKind.STATUS_CHANGED,), kwargs={"detail": "B"}
+    )
+    writer_a.start()
+    assert entered.wait(timeout=2)
+    writer_b.start()
+    writer_b.join(timeout=0.2)  # unlocked, B would finish its rotation here
+    go.set()
+    writer_a.join(timeout=5)
+    writer_b.join(timeout=5)
+
+    rotated = path.with_suffix(".ndjson.1")
+    assert rotated.stat().st_size >= original_size
+    assert "before-rotation" in rotated.read_text()
+    assert {e.detail for e in eventlog.read() if e.detail in {"A", "B"}} == {"A", "B"}
+
+
+def test_a_stuck_lock_holder_delays_an_append_only_briefly() -> None:
+    """The TUI appends on its event-loop thread; a stopped holder must not freeze it."""
+    import fcntl
+    import time
+
+    path = eventlog.log_path()
+    lock = eventlog._lock_path(path)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        started = time.monotonic()
+        assert eventlog.append(EventKind.STATUS_CHANGED, detail="through") is True
+        assert time.monotonic() - started < 1.0
+    finally:
+        os.close(fd)
+    assert [e.detail for e in eventlog.read()] == ["through"]
