@@ -67,8 +67,13 @@ RUN_SCHEMA_VERSION = 1
 CLAIM_TIMEOUT_SEC = 10 * 60.0
 MAX_ATTEMPTS = 3
 # How long an update waits for runs/.lock. Every holder does a read and a
-# rename; a quarter of a second already means something is wedged.
+# rename; a quarter of a second already means something is wedged. The tick
+# (a worker, a CLI, a timer) can afford to wait a little longer than that.
 _LOCK_TIMEOUT_SEC = 2.0
+# What a caller on the Textual event loop waits instead (the f screen's
+# approve / deny): the whole UI is frozen for as long as it waits, so it
+# gives up quickly and says "busy, try again" rather than hang.
+UI_LOCK_TIMEOUT_SEC = 0.2
 # Terminal runs older than this are deleted by the tick, with their payload
 # and exit file. Their story stays in the event log.
 PRUNE_AFTER_DAYS = 30.0
@@ -290,48 +295,50 @@ class Run:
         exit_code = data.get("exit_code")
         return cls(
             run_id=run_id,
-            flow=_str(data.get("flow")),
-            ticket=_str(data.get("ticket")),
-            trigger=_str(data.get("trigger")),
-            generation=_str(data.get("generation")),
+            flow=as_str(data.get("flow")),
+            ticket=as_str(data.get("ticket")),
+            trigger=as_str(data.get("trigger")),
+            generation=as_str(data.get("generation")),
             state=state,
-            created_at=_str(data.get("created_at")),
-            updated_at=_str(data.get("updated_at")),
+            created_at=as_str(data.get("created_at")),
+            updated_at=as_str(data.get("updated_at")),
             stale=data.get("stale") is True,
-            attempts=_int(data.get("attempts")),
-            reason=_str(data.get("reason")),
-            window=_str(data.get("window")),
-            pane=_str(data.get("pane")),
-            payload_path=_str(data.get("payload_path")),
+            attempts=as_int(data.get("attempts")),
+            reason=as_str(data.get("reason")),
+            window=as_str(data.get("window")),
+            pane=as_str(data.get("pane")),
+            payload_path=as_str(data.get("payload_path")),
             exit_code=exit_code
             if isinstance(exit_code, int) and not isinstance(exit_code, bool)
             else None,
-            kind=_str(data.get("kind")),
-            title=_str(data.get("title")),
-            from_status=_str(data.get("from_status")),
-            to_status=_str(data.get("to_status")),
-            from_status_id=_str(data.get("from_status_id")),
-            status_id=_str(data.get("status_id")),
-            seq=_int(data.get("seq")),
-            launched_at=_str(data.get("launched_at")),
-            event=_str(data.get("event")),
-            pr_number=_int(data.get("pr_number")),
-            pr_url=_str(data.get("pr_url")),
-            head_sha=_str(data.get("head_sha")),
-            session_id=_str(data.get("session_id")),
-            approved_at=_str(data.get("approved_at")),
-            action=_str(data.get("action")),
-            block_key=_str(data.get("block_key")),
-            tmux_server=_str(data.get("tmux_server")),
-            schema_version=_int(data.get("schema_version")) or RUN_SCHEMA_VERSION,
+            kind=as_str(data.get("kind")),
+            title=as_str(data.get("title")),
+            from_status=as_str(data.get("from_status")),
+            to_status=as_str(data.get("to_status")),
+            from_status_id=as_str(data.get("from_status_id")),
+            status_id=as_str(data.get("status_id")),
+            seq=as_int(data.get("seq")),
+            launched_at=as_str(data.get("launched_at")),
+            event=as_str(data.get("event")),
+            pr_number=as_int(data.get("pr_number")),
+            pr_url=as_str(data.get("pr_url")),
+            head_sha=as_str(data.get("head_sha")),
+            session_id=as_str(data.get("session_id")),
+            approved_at=as_str(data.get("approved_at")),
+            action=as_str(data.get("action")),
+            block_key=as_str(data.get("block_key")),
+            tmux_server=as_str(data.get("tmux_server")),
+            schema_version=as_int(data.get("schema_version")) or RUN_SCHEMA_VERSION,
         )
 
 
-def _str(value: object) -> str:
+def as_str(value: object) -> str:
+    """``value`` when it is a string, else "" — for decoding fields of on-disk JSON."""
     return value if isinstance(value, str) else ""
 
 
-def _int(value: object) -> int:
+def as_int(value: object) -> int:
+    """``value`` when it is a non-negative int (never a bool), else 0 (negatives clamp to 0)."""
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
     return max(0, value)
@@ -459,17 +466,20 @@ def update(
     *,
     expect: Iterable[RunState],
     now: datetime | None = None,
+    lock_timeout: float | None = None,
     **changes: Any,
 ) -> Run | None:
     """Compare-and-set: apply ``changes`` only if the run is still in ``expect``.
 
-    Re-reads the run under ``runs/.lock``. Returns the updated run, or None
-    when the lock could not be taken, the run is gone, or its state is no
-    longer one the caller expected — in which case the caller's view was
-    stale and it must not act on it.
+    Re-reads the run under ``runs/.lock``, waiting at most ``lock_timeout``
+    for it (None: :data:`_LOCK_TIMEOUT_SEC`). Returns the updated run, or None when the lock could not be
+    taken, the run is gone, or its state is no longer one the caller
+    expected — in which case the caller's view was stale and it must not act
+    on it.
     """
     allowed = frozenset(expect)
-    with locked(_lock_path(), timeout=_LOCK_TIMEOUT_SEC) as acquired:
+    wait = _LOCK_TIMEOUT_SEC if lock_timeout is None else lock_timeout
+    with locked(_lock_path(), timeout=wait) as acquired:
         if not acquired:
             return None
         current = load(run_id)
@@ -522,17 +532,21 @@ def resolve(ref: str, candidates: Iterable[Run] | None = None) -> tuple[Run | No
     return matches[0], ""
 
 
-def approve(run_id: str, *, now: datetime | None = None) -> tuple[Run | None, str]:
+def approve(
+    run_id: str, *, now: datetime | None = None, lock_timeout: float | None = None
+) -> tuple[Run | None, str]:
     """``awaiting_confirm`` → ``claimed``; the next tick dispatches it.
 
     The approval is stamped (``approved_at``): a start= run launches only
-    with one, and a held approval ages out after ``confirm_ttl``.
+    with one, and a held approval ages out after ``confirm_ttl``. A caller
+    on the UI thread passes :data:`UI_LOCK_TIMEOUT_SEC`.
     """
     moment = now or _now()
     updated = update(
         run_id,
         expect={RunState.AWAITING_CONFIRM},
         now=moment,
+        lock_timeout=lock_timeout,
         state=RunState.CLAIMED,
         reason="approved",
         approved_at=iso(moment),
@@ -542,10 +556,14 @@ def approve(run_id: str, *, now: datetime | None = None) -> tuple[Run | None, st
     return updated, f"approved {run_id} — the next tick dispatches it"
 
 
-def deny(run_id: str) -> tuple[Run | None, str]:
-    """``awaiting_confirm`` → ``denied``."""
+def deny(run_id: str, *, lock_timeout: float | None = None) -> tuple[Run | None, str]:
+    """``awaiting_confirm`` → ``denied``. See :func:`approve` for ``lock_timeout``."""
     updated = update(
-        run_id, expect={RunState.AWAITING_CONFIRM}, state=RunState.DENIED, reason="denied"
+        run_id,
+        expect={RunState.AWAITING_CONFIRM},
+        lock_timeout=lock_timeout,
+        state=RunState.DENIED,
+        reason="denied",
     )
     if updated is None:
         return None, _refusal(run_id, "deny")
@@ -559,7 +577,7 @@ def _refusal(run_id: str, verb: str) -> str:
         return f"cannot {verb} {run_id}: no such run"
     if current.state is not RunState.AWAITING_CONFIRM:
         return f"cannot {verb} {run_id}: it is {current.state}, not awaiting_confirm"
-    return f"cannot {verb} {run_id}: the run file is locked — try again"
+    return f"cannot {verb} {run_id}: the run files are busy — try again"
 
 
 # --- events, payloads, exit codes, pause ---------------------------------------------

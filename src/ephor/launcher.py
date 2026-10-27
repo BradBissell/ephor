@@ -130,6 +130,35 @@ def fetch_base(root: Path, base: str) -> bool:
     return True
 
 
+# What a flow branches off when the repo will not say. The same default
+# ``ephor start`` has always used.
+FALLBACK_BASE = "origin/main"
+
+
+def default_base(root: Path) -> str:
+    """The remote default branch of the repo at ``root``, as ``origin/<name>``.
+
+    A flow that creates a worktree has nobody at the keyboard to pass
+    ``--base``, and a repo whose trunk is ``master`` or ``develop`` has an
+    ``origin/main`` that is stale or missing — the worktree would be rooted
+    on the wrong history, or refused. ``origin/HEAD`` is what the clone
+    recorded as the default branch; when it was never set (a repo created
+    with ``git init`` and a remote added later), an ``origin/main`` or
+    ``origin/master`` that exists is next, and :data:`FALLBACK_BASE` last.
+    Local git only: nothing is fetched here.
+    """
+    git = ["/usr/bin/env", "git", "-C", str(root)]
+    code, out, _ = _run([*git, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+    name = out.strip()
+    if code == 0 and name.startswith("origin/") and name != "origin/HEAD":
+        return name
+    for candidate in ("origin/main", "origin/master"):
+        code, _, _ = _run([*git, "rev-parse", "--verify", "--quiet", f"refs/remotes/{candidate}"])
+        if code == 0:
+            return candidate
+    return FALLBACK_BASE
+
+
 def _remotes(root: Path) -> set[str]:
     code, out, _ = _run(["/usr/bin/env", "git", "-C", str(root), "remote"])
     if code != 0:

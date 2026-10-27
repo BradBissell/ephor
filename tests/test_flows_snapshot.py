@@ -12,13 +12,11 @@ from typing import Any
 import pytest
 
 from ephor import board, eventlog
-from ephor.filelock import locked
 from ephor.flows import printable, ticket_sort_key
 from ephor.flows import snapshot as snap
 from ephor.flows.snapshot import (
     DROP_AFTER_UNSEEN,
     PrState,
-    RefreshStatus,
     SessionSeen,
     Snapshot,
     TicketState,
@@ -367,7 +365,7 @@ def test_pr_and_session_observations_round_trip() -> None:
     assert snap.load() == new
 
 
-# --- fetch / refresh ----------------------------------------------------------
+# --- fetch / transitions ------------------------------------------------------
 
 
 def test_fetch_scopes_the_search_to_the_board() -> None:
@@ -384,43 +382,12 @@ def test_fetch_scopes_the_search_to_the_board() -> None:
     ]
 
 
-def test_refresh_needs_a_config_a_sound_board_and_jira() -> None:
-    assert snap.refresh(None).status is RefreshStatus.NO_CONFIG
-    broken = _config(columns=[])
-    assert snap.refresh(broken).status is RefreshStatus.BOARD_INVALID
-    assert snap.refresh(_config()).status is RefreshStatus.JIRA_OFF
-    assert not snap.snapshot_path().exists()
-
-
-@pytest.mark.usefixtures("jira_on")
-def test_a_failed_search_writes_nothing() -> None:
+def test_log_transitions_writes_one_event_per_move() -> None:
     first, _ = snap.advance(None, [_issue("DR-1", "To Do", "1")], now=T0)
-    snap.save(first)
-    before = snap.snapshot_path().read_text()
-
-    result = snap.refresh(_config(), search=lambda *a, **k: None)
-    assert result.status is RefreshStatus.SEARCH_FAILED
-    assert "left as it was" in result.message
-    assert snap.snapshot_path().read_text() == before
-    assert eventlog.read() == []
-
-
-@pytest.mark.usefixtures("jira_on")
-def test_refresh_persists_the_snapshot_and_logs_each_move() -> None:
-    first, _ = snap.advance(None, [_issue("DR-1", "To Do", "1")], now=T0)
-    snap.save(first)
-
-    result = snap.refresh(
-        _config(),
-        search=lambda *a, **k: [_issue("DR-1", "In Progress", "3"), _issue("DR-2", "To Do", "1")],
+    _, moves = snap.advance(
+        first, [_issue("DR-1", "In Progress", "3"), _issue("DR-2", "To Do", "1")], now=T0
     )
-    assert result.ok
-    assert [t.key for t in result.transitions] == ["DR-1", "DR-2"]
-    stored = snap.load()
-    assert stored is not None
-    assert stored.tickets["DR-1"].seq == 1
-    assert stored.scope == snap.board_scope(_config().board)
-
+    snap.log_transitions(moves)
     events = [e for e in eventlog.read() if e.kind is eventlog.EventKind.TICKET_TRANSITIONED]
     assert [(e.ticket, e.detail) for e in events] == [
         ("DR-1", "To Do → In Progress"),
@@ -431,47 +398,10 @@ def test_refresh_persists_the_snapshot_and_logs_each_move() -> None:
     assert events[0].extra["status_id"] == "3"
 
 
-@pytest.mark.usefixtures("jira_on")
-def test_a_dry_run_writes_nothing_at_all() -> None:
-    result = snap.refresh(
-        _config(), dry_run=True, search=lambda *a, **k: [_issue("DR-1", "To Do", "1")]
-    )
-    assert result.ok
-    assert result.snapshot is not None
-    assert "DR-1" in result.snapshot.tickets
-    assert not snap.flows_dir().exists()
-    assert eventlog.read() == []
-
-
-@pytest.mark.usefixtures("jira_on")
-def test_a_held_tick_lock_means_someone_else_is_writing() -> None:
-    called: list[bool] = []
-
-    def search(*_a: object, **_k: object) -> list[Issue]:
-        called.append(True)
-        return []
-
-    with locked(snap.tick_lock_path()) as held:
-        assert held
-        result = snap.refresh(_config(), search=search)
-    assert result.status is RefreshStatus.LOCKED
-    assert called == []  # no search, no write: the holder is doing both
-    assert not snap.snapshot_path().exists()
-
-
-@pytest.mark.usefixtures("jira_on")
-def test_refresh_uses_jira_api_search_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    from ephor import jira_api
-
-    seen: list[str] = []
-
-    def search(jql: str, fields: tuple[str, ...] = ()) -> list[Issue]:
-        seen.append(jql)
-        return [_issue("DR-9", "To Do", "1")]
-
-    monkeypatch.setattr(jira_api, "search", search)
-    assert snap.refresh(_config()).ok
-    assert seen and seen[0].startswith("project in (DR)")
+def test_there_is_no_rule_less_refresh() -> None:
+    """Saving a snapshot consumes its moves; only the tick (rules included) may do it."""
+    assert not hasattr(snap, "refresh")
+    assert not hasattr(snap, "refresh_locked")
 
 
 # --- display helpers ----------------------------------------------------------

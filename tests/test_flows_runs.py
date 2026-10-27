@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -104,6 +105,24 @@ def test_update_refuses_while_another_holder_has_the_lock(monkeypatch: pytest.Mo
     assert (
         runs.update("DR-1.review.10-1", expect={RunState.AWAITING_CONFIRM}, reason="x") is not None
     )
+
+
+def test_a_ui_approve_gives_up_quickly_and_says_busy() -> None:
+    """The f screen answers on the event loop: it must not freeze behind runs/.lock."""
+    runs.create(_run())
+    with locked(runs.runs_dir() / ".lock", timeout=0) as held:
+        assert held
+        began = time.monotonic()
+        approved, message = runs.approve("DR-1.review.10-1", lock_timeout=runs.UI_LOCK_TIMEOUT_SEC)
+        denied, deny_message = runs.deny("DR-1.review.10-1", lock_timeout=runs.UI_LOCK_TIMEOUT_SEC)
+        waited = time.monotonic() - began
+    assert approved is None and denied is None
+    assert "busy" in message and "try again" in message
+    assert "busy" in deny_message
+    assert runs.UI_LOCK_TIMEOUT_SEC <= 0.25
+    assert waited < 1.0
+    stored = runs.load("DR-1.review.10-1")
+    assert stored is not None and stored.state is RunState.AWAITING_CONFIRM
 
 
 def test_approve_and_deny_only_answer_an_awaiting_run() -> None:

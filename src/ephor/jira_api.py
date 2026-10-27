@@ -33,6 +33,7 @@ No configuration means no network call, not a failed one.
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -151,6 +152,22 @@ def missing_credentials() -> str:
         if not _credential(part):
             gaps.append(f"{part} ({', '.join(names[:-1])} or {names[-1]})")
     return "; ".join(gaps)
+
+
+def identity() -> str:
+    """A short fingerprint of *who* the credentials sign in as: site plus email.
+
+    Lets a cached answer about "me" (the accountId behind ``/myself``) be
+    tied to the account it was fetched for, so pointing ephor at another
+    site or user re-asks instead of matching rules against a stranger's id.
+    The token is left out: rotating it does not change who you are. "" when
+    Jira is not configured.
+    """
+    creds = credentials()
+    if creds is None:
+        return ""
+    who = f"{creds.base_url.lower()}\n{creds.email.strip().lower()}"
+    return hashlib.sha256(who.encode()).hexdigest()[:16]
 
 
 def is_configured() -> bool:

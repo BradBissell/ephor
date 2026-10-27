@@ -216,8 +216,13 @@ class FlowsScreen(ModalScreen[None]):
                 "awaiting confirmation can be approved or denied[/]"
             )
             return
-        verb = runs.approve if approve else runs.deny
-        updated, message = verb(row.flow_run.run_id)
+        # On the event loop: wait for runs/.lock only briefly, and report
+        # "busy, try again" rather than freeze the whole dashboard behind it.
+        run_id = row.flow_run.run_id
+        if approve:
+            updated, message = runs.approve(run_id, lock_timeout=runs.UI_LOCK_TIMEOUT_SEC)
+        else:
+            updated, message = runs.deny(run_id, lock_timeout=runs.UI_LOCK_TIMEOUT_SEC)
         self._say(markup_text(message))
         if updated is None:
             # Someone else answered it, or a tick expired it: show what it is now.

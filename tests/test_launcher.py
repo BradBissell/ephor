@@ -170,6 +170,32 @@ def test_fetch_base_runs_for_a_real_remote(tmp_path: Path, monkeypatch) -> None:
     assert any("fetch" in a for a in calls)
 
 
+def test_default_base_follows_the_remotes_default_branch(tmp_path: Path) -> None:
+    """A flow's worktree branches off the repo's own trunk, not always origin/main."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+
+    # Nothing known about origin at all: the historical default.
+    assert launcher.default_base(repo) == launcher.FALLBACK_BASE
+    # No origin/HEAD, but an origin/master exists.
+    git("update-ref", "refs/remotes/origin/master", "HEAD")
+    assert launcher.default_base(repo) == "origin/master"
+    # origin/HEAD, as a clone records it, wins.
+    git("update-ref", "refs/remotes/origin/develop", "HEAD")
+    git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop")
+    assert launcher.default_base(repo) == "origin/develop"
+    # Not a repo: still an answer.
+    assert launcher.default_base(tmp_path / "missing") == launcher.FALLBACK_BASE
+
+
 def test_link_env_files_symlinks_rather_than_copies(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

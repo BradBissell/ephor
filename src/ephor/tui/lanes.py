@@ -97,7 +97,7 @@ def gather(*, refresh: bool) -> LaneData:
     The tick runs only when there is a board.toml whose ``[board]`` is valid
     and Jira is configured; otherwise this just reads what is on disk, which
     is how lanes still render from a snapshot another process wrote. With no
-    flow rules the tick is exactly the snapshot refresh.
+    flow rules the tick is just the board refresh.
     """
     config = board.load()
     result: RefreshResult | None = None

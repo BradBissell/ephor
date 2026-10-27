@@ -32,6 +32,7 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -55,6 +56,7 @@ class StartFn(Protocol):
         *,
         title: str,
         provider: str,
+        base: str,
         cwd: Path,
         prompt: str,
         window_name: str,
@@ -62,6 +64,12 @@ class StartFn(Protocol):
         target_session: str,
         extra_env: dict[str, str] | None,
     ) -> StartResult: ...
+
+
+class DefaultBaseFn(Protocol):
+    """:func:`ephor.launcher.default_base`, as far as a runner calls it."""
+
+    def __call__(self, root: Path, /) -> str: ...
 
 
 class OpenWindowFn(Protocol):
@@ -92,6 +100,7 @@ def _start(
     *,
     title: str,
     provider: str,
+    base: str,
     cwd: Path,
     prompt: str,
     window_name: str,
@@ -103,6 +112,7 @@ def _start(
         ticket_raw,
         title=title,
         provider=provider,
+        base=base,
         cwd=cwd,
         prompt=prompt,
         window_name=window_name,
@@ -127,12 +137,17 @@ def _open_window(
     )
 
 
+def _default_base(root: Path, /) -> str:
+    return launcher.default_base(root)
+
+
 @dataclass(frozen=True)
 class Launchers:
-    """The two launcher entry points a runner uses, injectable for tests."""
+    """The launcher entry points a runner uses, injectable for tests."""
 
     start: StartFn = field(default=_start)
     open_window: OpenWindowFn = field(default=_open_window)
+    default_base: DefaultBaseFn = field(default=_default_base)
 
 
 @dataclass(frozen=True)
@@ -215,6 +230,9 @@ def _launch_agent(
             run.ticket,
             title=run.title,
             provider=rule.provider,
+            # The repo's own trunk, not a hard-coded origin/main: a flow has
+            # nobody at the keyboard to pass --base.
+            base=tools.default_base(repo),
             cwd=repo,
             prompt=prompt,
             window_name=name,
@@ -306,17 +324,23 @@ _NO_SERVER_RE = re.compile(r"no server running|error connecting to", re.IGNORECA
 
 @dataclass(frozen=True)
 class LivePanes:
-    """Every pane tmux has right now, and which server it is.
+    """Every pane tmux has right now, which server it is, and which are flow windows.
 
     ``server`` is ``<pid>.<start_time>``: pane ids are a per-server counter
     that restarts at %0, so after a reboot or a ``kill-server`` the pane id
     a run recorded can name an unrelated pane. A run records the server its
     pane was opened on, and a different server means its pane is gone.
     ``server`` is "" when no server is running (and ``panes`` is empty).
+
+    ``flows`` maps a run id to the pane of the flow window opened for it
+    (see :func:`flow_run_of`), from the same listing — one ``list-panes``
+    answers both "is this run's pane alive" and "did an unrecorded attempt
+    leave a window".
     """
 
     server: str
     panes: frozenset[str]
+    flows: Mapping[str, str] = field(default_factory=dict, hash=False)
 
     def has(self, pane: str, server: str = "") -> bool:
         """True when ``pane`` (opened on ``server``, if known) still exists."""
@@ -329,9 +353,9 @@ def live_panes() -> LivePanes | None:
     """Every tmux pane that exists right now, or None when tmux did not answer.
 
     None is "unknown", never "every pane is gone": a tick that cannot reach
-    the tmux server must not mark every launched run finished. A tmux that
-    says there is no server at all *has* answered, and the answer is no
-    panes.
+    the tmux server must not mark every launched run finished, nor read "no
+    such window" and relaunch. A tmux that says there is no server at all
+    *has* answered, and the answer is no panes — and so no flow windows.
     """
     try:
         proc = subprocess.run(
@@ -341,8 +365,9 @@ def live_panes() -> LivePanes | None:
                 "list-panes",
                 "-a",
                 "-F",
-                # The server's pid and start time, then the pane.
-                "#{pid}.#{start_time}\t#{pane_id}",
+                # The server's pid and start time, the pane, and what it was
+                # started with (last: it is free text and may hold a tab).
+                "#{pid}.#{start_time}\t#{pane_id}\t#{pane_start_command}",
             ],
             capture_output=True,
             text=True,
@@ -357,13 +382,19 @@ def live_panes() -> LivePanes | None:
         return None
     server = ""
     panes: set[str] = set()
+    flows: dict[str, str] = {}
     for line in proc.stdout.splitlines():
-        ident, _, pane = line.strip().rpartition("\t")
-        if not pane.strip():
+        ident, _, rest = line.partition("\t")
+        pane, _, command = rest.partition("\t")
+        pane = pane.strip()
+        if not pane:
             continue
-        panes.add(pane.strip())
+        panes.add(pane)
         server = server or ident.strip()
-    return LivePanes(server=server, panes=frozenset(panes))
+        run_id = flow_run_of(command)
+        if run_id:
+            flows.setdefault(run_id, pane)
+    return LivePanes(server=server, panes=frozenset(panes), flows=flows)
 
 
 def flow_panes() -> dict[str, str] | None:
@@ -373,34 +404,11 @@ def flow_panes() -> dict[str, str] | None:
     the run file could not be written) is found here by the run id in the
     pane's start command, so a retry adopts that window instead of opening a
     second one. None is "unknown": the caller must not read it as "no such
-    window" and relaunch.
+    window" and relaunch. No tmux server at all is an answer — no windows —
+    exactly as :func:`live_panes` reads it, so a blocked retry can move on.
     """
-    try:
-        proc = subprocess.run(
-            [
-                "/usr/bin/env",
-                "tmux",
-                "list-panes",
-                "-a",
-                "-F",
-                "#{pane_id}\t#{pane_start_command}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_TMUX_TIMEOUT_SEC,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    found: dict[str, str] = {}
-    for line in proc.stdout.splitlines():
-        pane, _, command = line.partition("\t")
-        run_id = flow_run_of(command)
-        if pane.strip() and run_id:
-            found.setdefault(run_id, pane.strip())
-    return found
+    live = live_panes()
+    return None if live is None else dict(live.flows)
 
 
 def flow_run_of(start_command: str) -> str:

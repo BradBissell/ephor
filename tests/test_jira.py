@@ -9,8 +9,10 @@ import pytest
 
 from ephor import gitinfo as gitinfo_module
 from ephor import jira as jira_module
+from ephor import work_items
 from ephor.jira import (
     TicketSource,
+    confident_ticket_for_agent,
     extract_ticket,
     match_for_agent,
     ticket_for_agent,
@@ -347,6 +349,59 @@ def test_llm_summary_is_the_least_confident_source(tmp_path: Path) -> None:
     assert match is not None
     assert match.source is TicketSource.SUMMARY
     assert not match.confident
+
+
+def test_a_promoted_guess_from_another_sessions_record_is_not_confident_for_acting(
+    tmp_path: Path,
+) -> None:
+    """DR-3's record (another session's) must not make a mention of DR-3 a fact here."""
+    jira_module.clear_cwd_cache()
+    plain = tmp_path / "shared-checkout"
+    plain.mkdir()
+    work_items.record("DR-3", session_id="owner-sid", confirmed=True)
+    bystander = _agent(
+        session_id="other-sid", cwd=str(plain), last_summary="DR-3 and DR-4 are waiting"
+    )
+    match = match_for_agent(bystander)
+    assert match is not None and match.source is TicketSource.PROMOTED
+    assert confident_ticket_for_agent(bystander) == ""
+
+    # The session the record belongs to does get it: that is its own fact.
+    owner = _agent(session_id="owner-sid", cwd=str(plain))
+    assert confident_ticket_for_agent(owner) == "DR-3"
+
+
+def test_promote_does_not_rewrite_a_record_that_already_says_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repaint re-promoting the same fact must not bump last_seen (or take the flock)."""
+    jira_module.clear_cwd_cache()
+    plain = tmp_path / "shared-checkout"
+    plain.mkdir()
+    agent = _agent(session_id="sid-1", cwd=str(plain), ticket="DR-7")
+    match = match_for_agent(agent)
+    assert match is not None and match.source is TicketSource.DECLARED
+    jira_module.promote(match, agent)
+    first = work_items.load("DR-7")
+    assert first is not None and first.confirmed and first.session_ids == ("sid-1",)
+
+    writes: list[str] = []
+    real_record = work_items.record
+
+    def counting(key: str, **kwargs: object) -> object:
+        writes.append(key)
+        return real_record(key, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(work_items, "record", counting)
+    jira_module.promote(match, agent)
+    assert writes == []
+
+    # News (another session taking the ticket) is still written.
+    other = _agent(session_id="sid-2", cwd=str(plain), ticket="DR-7")
+    jira_module.promote(match_for_agent(other), other)
+    assert writes == ["DR-7"]
+    stored = work_items.load("DR-7")
+    assert stored is not None and stored.session_ids == ("sid-2", "sid-1")
 
 
 # ---- the project allowlist -------------------------------------------------

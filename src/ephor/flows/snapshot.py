@@ -11,10 +11,12 @@ so the flows tick can run its rules in between them:
    the new snapshot, and the list of status :class:`Transition` s.
 3. :func:`save` — atomic rename, 0600, and always the *last* write of a tick.
 
-:func:`refresh` composes them under ``flows/tick.lock``. It is exactly a
-tick with no rules — and so it must not be used where rules exist: the moves
-it records would never be offered to them. The dashboard and ``ephor flows
-board --refresh`` run the real tick (:mod:`ephor.flows.tick`) instead.
+Only the flows tick (:mod:`ephor.flows.tick`) composes them, under
+``flows/tick.lock``, with the rules run in between. There is deliberately no
+rule-less "refresh" here: saving a snapshot consumes the moves it records,
+so a refresh that skipped the rules would silently swallow every move they
+should have fired on. The dashboard and ``ephor flows board --refresh`` run
+the tick; with no rules configured it is exactly that refresh anyway.
 
 Rules this file keeps, because the flows built on it depend on them:
 
@@ -47,7 +49,7 @@ and the flow tick adopts them instead of firing on them.
 The snapshot also carries fields only the flow tick reads (``rules_seen``,
 ``myself``, and the two observations :mod:`ephor.flows.triggers` compares
 from tick to tick: ``prs`` with ``pr_checked_at``, and ``sessions_seen``).
-A rule-less refresh carries them forward untouched — in particular it never
+:func:`advance` carries them forward untouched — in particular it never
 marks a rule as seen, so a rule the tick has not evaluated yet still starts
 in adopt mode.
 """
@@ -66,9 +68,9 @@ from pathlib import Path
 from typing import Any
 
 from ephor import eventlog, jira_api
-from ephor.board import BoardConfig, BoardSettings
-from ephor.filelock import locked
+from ephor.board import BoardSettings
 from ephor.flows import flows_dir, runs
+from ephor.flows.runs import as_int, as_str, iso, parse_iso
 from ephor.jira_api import Issue
 
 SNAPSHOT_FILE = "snapshot.json"
@@ -101,20 +103,6 @@ def tick_lock_path() -> Path:
 
 def _now() -> datetime:
     return datetime.now(UTC)
-
-
-def _iso(moment: datetime) -> str:
-    return moment.astimezone(UTC).isoformat(timespec="seconds")
-
-
-def _parse_iso(raw: str) -> datetime | None:
-    if not raw:
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -163,14 +151,14 @@ class TicketState:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> TicketState:
         return cls(
-            status=_str(data.get("status")),
-            status_id=_str(data.get("status_id")),
-            status_category=_str(data.get("status_category")),
-            assignee_id=_str(data.get("assignee_id")),
-            assignee=_str(data.get("assignee")),
-            title=_str(data.get("title")),
-            seq=_int(data.get("seq")),
-            unseen_ticks=_int(data.get("unseen_ticks")),
+            status=as_str(data.get("status")),
+            status_id=as_str(data.get("status_id")),
+            status_category=as_str(data.get("status_category")),
+            assignee_id=as_str(data.get("assignee_id")),
+            assignee=as_str(data.get("assignee")),
+            title=as_str(data.get("title")),
+            seq=as_int(data.get("seq")),
+            unseen_ticks=as_int(data.get("unseen_ticks")),
         )
 
     @classmethod
@@ -219,9 +207,9 @@ class PrState:
             return None
         return cls(
             number=number,
-            state=_str(data.get("state")),
-            head_sha=_str(data.get("head_sha")),
-            url=_str(data.get("url")),
+            state=as_str(data.get("state")),
+            head_sha=as_str(data.get("head_sha")),
+            url=as_str(data.get("url")),
         )
 
 
@@ -270,13 +258,13 @@ class SessionSeen:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SessionSeen | None:
-        ticket = _str(data.get("ticket"))
+        ticket = as_str(data.get("ticket"))
         if not ticket:
             return None
         return cls(
             ticket=ticket,
-            status=_str(data.get("status")),
-            pid=_int(data.get("pid")),
+            status=as_str(data.get("status")),
+            pid=as_int(data.get("pid")),
             settled=data.get("settled") is True,
         )
 
@@ -312,10 +300,10 @@ class DroppedTicket:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> DroppedTicket:
         return cls(
-            seq=_int(data.get("seq")),
-            dropped_at=_str(data.get("dropped_at")),
-            status=_str(data.get("status")),
-            status_id=_str(data.get("status_id")),
+            seq=as_int(data.get("seq")),
+            dropped_at=as_str(data.get("dropped_at")),
+            status=as_str(data.get("status")),
+            status_id=as_str(data.get("status_id")),
         )
 
 
@@ -349,6 +337,9 @@ class Snapshot:
     tickets: Mapping[str, TicketState] = field(default_factory=dict)
     rules_seen: tuple[str, ...] = ()
     myself: str = ""  # the configured user's Jira accountId, cached by the tick
+    # jira_api.identity() of the credentials ``myself`` was fetched with. A
+    # different site or email is a different "me", and is asked again.
+    myself_for: str = ""
     # When on_pr rules last asked gh about the board's tickets, and what it
     # said: ticket -> every PR that names it. A ticket with an entry (even
     # an empty one) has a baseline; only a change from it fires on_pr.
@@ -364,7 +355,7 @@ class Snapshot:
 
     @property
     def taken(self) -> datetime | None:
-        return _parse_iso(self.taken_at)
+        return parse_iso(self.taken_at)
 
     def age_sec(self, now: datetime | None = None) -> float | None:
         """Seconds since this snapshot was taken, or None when undated."""
@@ -383,6 +374,7 @@ class Snapshot:
             "taken_at": self.taken_at,
             "rules_seen": list(self.rules_seen),
             "myself": self.myself,
+            "myself_for": self.myself_for,
             "tickets": {key: t.to_dict() for key, t in sorted(self.tickets.items())},
             "pr_checked_at": self.pr_checked_at,
             "prs": {key: [pr.to_dict() for pr in found] for key, found in sorted(self.prs.items())},
@@ -425,29 +417,20 @@ class Snapshot:
                     dropped[key] = DroppedTicket.from_dict(value)
         rules = data.get("rules_seen")
         return cls(
-            taken_at=_str(data.get("taken_at")),
+            taken_at=as_str(data.get("taken_at")),
             tickets=tickets,
             rules_seen=tuple(r for r in rules if isinstance(r, str))
             if isinstance(rules, list)
             else (),
-            myself=_str(data.get("myself")),
-            pr_checked_at=_str(data.get("pr_checked_at")),
+            myself=as_str(data.get("myself")),
+            myself_for=as_str(data.get("myself_for")),
+            pr_checked_at=as_str(data.get("pr_checked_at")),
             prs=prs,
             sessions_seen=sessions,
             dropped=dropped,
-            scope=_str(data.get("scope")),
-            schema_version=_int(data.get("schema_version")) or SNAPSHOT_SCHEMA_VERSION,
+            scope=as_str(data.get("scope")),
+            schema_version=as_int(data.get("schema_version")) or SNAPSHOT_SCHEMA_VERSION,
         )
-
-
-def _str(value: object) -> str:
-    return value if isinstance(value, str) else ""
-
-
-def _int(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return 0
-    return max(0, value)
 
 
 # --- persistence ------------------------------------------------------------
@@ -526,7 +509,7 @@ def advance(
     disk; it is ignored when there is a previous snapshot.
     """
     moment = now or _now()
-    stamp = _iso(moment)
+    stamp = iso(moment)
     before: Mapping[str, TicketState] = previous.tickets if previous is not None else {}
     dropped: dict[str, DroppedTicket] = dict(previous.dropped) if previous is not None else {}
     floor: Mapping[str, int] = (seq_floor or {}) if previous is None else {}
@@ -604,7 +587,7 @@ def advance(
 
     keep = TOMBSTONE_KEEP_DAYS * 86400.0
     for key, tomb in list(dropped.items()):
-        when = _parse_iso(tomb.dropped_at)
+        when = parse_iso(tomb.dropped_at)
         if when is None or (moment - when).total_seconds() > keep:
             del dropped[key]
 
@@ -627,7 +610,7 @@ def log_transitions(transitions: Iterable[Transition]) -> None:
         )
 
 
-# --- the rule-less tick ------------------------------------------------------
+# --- the outcome of a tick, as the status lanes read it -----------------------
 
 
 class RefreshStatus(StrEnum):
@@ -668,72 +651,8 @@ class RefreshResult:
         }[self.status]
 
 
-def refresh(
-    config: BoardConfig | None,
-    *,
-    dry_run: bool = False,
-    search: Search | None = None,
-    now: datetime | None = None,
-) -> RefreshResult:
-    """Search, diff and persist the board, under ``tick.lock``. Blocking.
-
-    The lock is taken without waiting: a second refresh (another TUI, the
-    tick from ``ephor flows watch``) that finds it held returns ``LOCKED``
-    at once, because the holder is about to write the same answer. A
-    dry run takes no lock and writes nothing — not the snapshot, not an event.
-    """
-    problem = _precondition(config)
-    if problem is not None or config is None:
-        return RefreshResult(problem or RefreshStatus.NO_CONFIG)
-    if dry_run:
-        return refresh_locked(config, dry_run=True, search=search, now=now)
-    with locked(tick_lock_path(), timeout=0) as acquired:
-        if not acquired:
-            return RefreshResult(RefreshStatus.LOCKED, snapshot=load())
-        return refresh_locked(config, dry_run=False, search=search, now=now)
-
-
-def refresh_locked(
-    config: BoardConfig,
-    *,
-    dry_run: bool = False,
-    search: Search | None = None,
-    now: datetime | None = None,
-) -> RefreshResult:
-    """:func:`refresh` for a caller already holding ``tick.lock``."""
-    problem = _precondition(config)
-    if problem is not None:
-        return RefreshResult(problem)
-    previous = load()
-    issues = fetch(config.board, search=search)
-    if issues is None:
-        return RefreshResult(RefreshStatus.SEARCH_FAILED, snapshot=previous)
-    snapshot, transitions = advance(
-        previous, issues, now=now, seq_floor=baseline_seq_floor(previous)
-    )
-    snapshot = replace(snapshot, scope=board_scope(config.board))
-    if dry_run:
-        return RefreshResult(RefreshStatus.OK, snapshot=snapshot, transitions=tuple(transitions))
-    log_transitions(transitions)
-    # Written last: everything above can be repeated harmlessly by the next
-    # tick if this one dies before here.
-    if not save(snapshot):
-        return RefreshResult(RefreshStatus.WRITE_FAILED, snapshot=previous)
-    return RefreshResult(RefreshStatus.OK, snapshot=snapshot, transitions=tuple(transitions))
-
-
 def baseline_seq_floor(previous: Snapshot | None) -> dict[str, int]:
     """For a snapshot built from nothing: each ticket's next seq, from its run files."""
     if previous is not None:
         return {}
     return runs.next_seq_by_ticket()
-
-
-def _precondition(config: BoardConfig | None) -> RefreshStatus | None:
-    if config is None:
-        return RefreshStatus.NO_CONFIG
-    if not config.lanes_ok:
-        return RefreshStatus.BOARD_INVALID
-    if not jira_api.is_configured():
-        return RefreshStatus.JIRA_OFF
-    return None

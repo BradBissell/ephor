@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ephor import gitinfo
+from ephor.config import ticket_projects
 from ephor.constants import WORK_ATTENTION_PRIORITY, CiState, ReviewState, WorkAttention
 
 # A closed or merged PR is finished work: its URL and state will not change
@@ -322,13 +323,30 @@ def pr_for_ticket(cwd: Path, ticket: str) -> PullRequest | None:
 
 # A ticket-shaped key anywhere in a title or branch name. Bounded on the left
 # so `xdr-12` is not read as DR-12, and on the right so DR-12 is not a prefix
-# of DR-123.
+# of DR-123. Case-insensitive so a lower-case branch (`bb/dr-12-tidy`) still
+# names its ticket; :func:`_ticket_keys` decides which hits are real keys.
 _TICKET_KEY_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{1,9}-\d+)(?![0-9])", re.IGNORECASE)
 
 
-def _first_ticket_key(text: str) -> str:
-    match = _TICKET_KEY_RE.search(text or "")
-    return match.group(1).upper() if match else ""
+def _ticket_keys(text: str, wanted: str) -> list[str]:
+    """Every ticket key in ``text``, upper-cased, in order.
+
+    Branch names are full of ``LETTERS-DIGITS`` words that are not tickets
+    (``node-20``, ``py-312``, ``ubuntu-24``), and reading one as a key would
+    let it outvote the real one. So a lower-case hit counts only when its
+    project is the wanted ticket's or one ``$EPHOR_TICKET_PROJECTS`` names;
+    an upper-case one counts unless that allowlist is set and leaves it out.
+    """
+    allowed = ticket_projects()
+    wanted_project = wanted.split("-", 1)[0]
+    keys: list[str] = []
+    for match in _TICKET_KEY_RE.finditer(text or ""):
+        raw = match.group(1)
+        key = raw.upper()
+        project = key.split("-", 1)[0]
+        if project == wanted_project or project in allowed or (not allowed and raw == key):
+            keys.append(key)
+    return keys
 
 
 def _names_ticket(pr: PullRequest, ticket: str) -> bool:
@@ -339,16 +357,22 @@ def _names_ticket(pr: PullRequest, ticket: str) -> bool:
     or "blocked by DR-12" is common in a PR that belongs to another ticket.
     A flow keyed on the wrong ticket's PR would review the wrong code, so:
 
-    * the first ticket key in the branch name decides, else the first one in
-      the title — and it must be ``ticket`` exactly;
+    * a branch name that names any ticket decides: the PR is ``ticket``'s
+      when the key appears in it anywhere (``deps/NODE-20-DR-12`` is
+      DR-12's), and another ticket's when it does not;
+    * else the first ticket key in the title decides, exactly — a title
+      saying "DR-99: follow-up to DR-12" is DR-99's;
     * the body counts only when neither of those names any ticket at all,
       and then only as a closing-style line (``Closes DR-12``,
       ``Jira: DR-12``), never a passing mention.
     """
     wanted = ticket.upper()
-    own = _first_ticket_key(pr.head_ref) or _first_ticket_key(pr.title)
-    if own:
-        return own == wanted
+    branch_keys = _ticket_keys(pr.head_ref, wanted)
+    if branch_keys:
+        return wanted in branch_keys
+    title_keys = _ticket_keys(pr.title, wanted)
+    if title_keys:
+        return title_keys[0] == wanted
     closing = re.compile(
         rf"(?im)^\s*(?:closes|fixes|resolves|jira|ticket)\b[:\s]+{re.escape(wanted)}(?![0-9])"
     )

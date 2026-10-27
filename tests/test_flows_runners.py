@@ -199,6 +199,7 @@ def test_a_worktree_agent_flow_passes_the_flow_env_to_the_launcher(tmp_path: Pat
         *,
         title: str,
         provider: str,
+        base: str,
         cwd: Path,
         prompt: str,
         window_name: str,
@@ -210,6 +211,7 @@ def test_a_worktree_agent_flow_passes_the_flow_env_to_the_launcher(tmp_path: Pat
             ticket=ticket,
             title=title,
             provider=provider,
+            base=base,
             cwd=cwd,
             prompt=prompt,
             window_name=window_name,
@@ -226,9 +228,11 @@ def test_a_worktree_agent_flow_passes_the_flow_env_to_the_launcher(tmp_path: Pat
         repo_is_worktree=False,
         payload=tmp_path / "p.json",
         settings=FlowSettings(),
-        launchers=runners.Launchers(start=start),
+        launchers=runners.Launchers(start=start, default_base=lambda root: "origin/develop"),
     )
     assert outcome.ok and outcome.pane == "%3"
+    # The repo's own default branch, not a hard-coded origin/main.
+    assert seen["base"] == "origin/develop"
     assert seen["extra_env"] == {
         "EPHOR_FLOW_RUN": RUN.run_id,
         "EPHOR_FLOW_PAYLOAD": str(tmp_path / "p.json"),
@@ -310,7 +314,7 @@ def test_flow_run_of_round_trips_what_open_window_builds() -> None:
 
 
 def test_flow_panes(monkeypatch: pytest.MonkeyPatch) -> None:
-    listing = f'%1\t"bash"\n%4\t{_FLOW_PANE}\n%5\t{_FLOW_PANE}\n\n'
+    listing = f'41.17\t%1\t"bash"\n41.17\t%4\t{_FLOW_PANE}\n41.17\t%5\t{_FLOW_PANE}\n\n'
     seen: list[list[str]] = []
 
     def ok(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
@@ -320,13 +324,25 @@ def test_flow_panes(monkeypatch: pytest.MonkeyPatch) -> None:
     def down(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess([], 1, stdout="", stderr="no server running")
 
+    def broken(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 1, stdout="", stderr="lost server")
+
     def slow(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired("tmux", 5)
 
     monkeypatch.setattr(subprocess, "run", ok)
     assert runners.flow_panes() == {"DR-1.notify.10-1": "%4"}
     assert "#{pane_start_command}" in seen[0][-1]
+    # One listing answers both questions: the panes, the server, the flows.
+    live = runners.live_panes()
+    assert live is not None
+    assert live.server == "41.17" and live.panes == {"%1", "%4", "%5"}
+    assert live.flows == {"DR-1.notify.10-1": "%4"}
+    # No server running is an answer, the same one live_panes gives: no
+    # windows at all — so a blocked retry can move on instead of waiting.
     monkeypatch.setattr(subprocess, "run", down)
+    assert runners.flow_panes() == {}
+    monkeypatch.setattr(subprocess, "run", broken)
     assert runners.flow_panes() is None
     monkeypatch.setattr(subprocess, "run", slow)
     assert runners.flow_panes() is None

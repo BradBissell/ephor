@@ -144,7 +144,7 @@ Each flow is its own `[[flow]]` table.
 | `assignee` | no (`"me"`) | `"me"` fires only for tickets assigned to you (compared by Jira accountId), `"any"` for every ticket on the board. |
 | `mode` | no (`"confirm"`) | `"confirm"` waits for you to approve each run. `"auto"` dispatches on the tick that created it, and is **only allowed on `command =` flows**. |
 | `provider` | no (`"claude"`) | `start =` only: which agent CLI to launch. |
-| `worktree` | no (`false`) | `start =` only. `true` creates or reuses the ticket's worktree through `ephor start`. `false` opens the agent in the ticket's existing worktree, or else in the repo root. |
+| `worktree` | no (`false`) | `start =` only. `true` creates or reuses the ticket's worktree through `ephor start`, branching a new one off the repo's default branch (`origin/HEAD`, else `origin/main` or `origin/master`). `false` opens the agent in the ticket's existing worktree, or else in the repo root. |
 
 **Templates.** `start` and `command` may use `{ticket}`, `{title}` and
 `{status}` and nothing else. Write `{{` and `}}` for literal braces.
@@ -267,7 +267,7 @@ Before a claimed run launches, the guards are checked in this order:
    fact — a pin, `EPHOR_TICKET`, its branch — not a session that merely
    mentions the key), a session was launched on it in the last 10 minutes
    (a dashboard restart seeing existing sessions does not count), or its
-   work record was touched in the last 10 minutes. A session scan that
+   work record names a session that is still live. A session scan that
    fails blocks too: an unknown count is not zero;
 5. an uncached re-read of the ticket from Jira. An `on_enter` run whose
    ticket has already left the status is superseded, and so is any

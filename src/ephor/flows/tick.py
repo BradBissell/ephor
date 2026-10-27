@@ -1,6 +1,6 @@
 """``ephor flows tick``: look at the board once, and act on what moved.
 
-A tick is the rule-less snapshot refresh (:mod:`ephor.flows.snapshot`) with
+A tick is a board refresh (:mod:`ephor.flows.snapshot`: fetch, advance, save) with
 the flow rules run in the middle of it::
 
     take tick.lock → search Jira → diff → create runs → tend old runs
@@ -31,9 +31,9 @@ the board did — so on that tick no rule fires on a ticket merely appearing.
 **Guards, in order,** before anything is launched: the pause flag, the
 hourly cap across all flows, the per-ticket breaker, and — for flows that
 start an agent — the cap on live agents and the launch guard (an agent is
-already on this ticket, or one was started in the last ten minutes, or its
-work record was touched in the last ten minutes, or this same tick already
-launched one there). Then the ticket is re-read
+already on this ticket, or one was launched there in the last ten minutes,
+or its work record names a live session, or this same tick already launched
+one there). Then the ticket is re-read
 from Jira, uncached: a search is eventually consistent, and an agent must
 not start on a status the ticket has already left (a re-read with no status
 is unknown, and blocks). A guard that says "not now" parks the run as
@@ -101,8 +101,8 @@ from ephor.jira_api import Issue
 from ephor.state.models import AgentState
 from ephor.work_items import WorkItem
 
-# The launch guard's memory: a session started, or a work record touched,
-# this recently counts as "someone is already on this ticket".
+# The launch guard's memory: a session launched on a ticket this recently
+# counts as "someone is already on this ticket".
 LAUNCH_GUARD_SEC = 10 * 60.0
 _HOUR = 3600.0
 _STATUS_TRIGGERS = frozenset({Trigger.ON_ENTER, Trigger.ON_EXIT})
@@ -125,6 +125,10 @@ def _search(jql: str, fields: tuple[str, ...]) -> list[Issue] | None:
 
 def _myself() -> str | None:
     return jira_api.myself()
+
+
+def _jira_identity() -> str:
+    return jira_api.identity()
 
 
 def _fetch_fresh(key: str) -> Issue | None:
@@ -188,10 +192,6 @@ def _live_panes() -> runners.LivePanes | None:
     return runners.live_panes()
 
 
-def _flow_panes() -> dict[str, str] | None:
-    return runners.flow_panes()
-
-
 def _find_prs(repo: Path, key: str) -> list[PullRequest] | None:
     return github.find_prs_for_ticket(repo, key)
 
@@ -206,6 +206,7 @@ def _pid_alive(pid: int) -> bool:
 class TickDeps:
     search: Callable[[str, tuple[str, ...]], list[Issue] | None] = _search
     myself: Callable[[], str | None] = _myself
+    jira_identity: Callable[[], str] = _jira_identity
     fetch_fresh: Callable[[str], Issue | None] = _fetch_fresh
     sessions: Callable[[], list[AgentState]] = _sessions
     ticket_of: Callable[[AgentState], str] = _ticket_of
@@ -213,7 +214,6 @@ class TickDeps:
     launch_evidence: Callable[[str, float], bool] = _launch_evidence
     work_item: Callable[[str], WorkItem | None] = _work_item
     live_panes: Callable[[], runners.LivePanes | None] = _live_panes
-    flow_panes: Callable[[], dict[str, str] | None] = _flow_panes
     find_prs: Callable[[Path, str], list[PullRequest] | None] = _find_prs
     pid_alive: Callable[[int], bool] = _pid_alive
     launchers: runners.Launchers = field(default_factory=runners.Launchers)
@@ -399,14 +399,18 @@ def _tick_locked(
         if scope_changed and any(r.trigger in _STATUS_TRIGGERS for r in rules):
             notes.append("board scope changed — tickets new to the search were adopted")
 
-    myself = snap.myself
+    # The cached accountId is only "me" for the credentials it was fetched
+    # with: after a switch of site or user, ask again rather than match
+    # assignee = "me" rules against somebody else's id.
+    who = deps.jira_identity()
+    myself = snap.myself if snap.myself_for == who else ""
     if not myself and any(r.assignee is Assignee.ME for r in rules):
         myself = deps.myself() or ""
         if not myself:
             # Unknown never means unmet: write nothing, so the moves this
             # tick saw are still moves when the next tick can match them.
             return TickResult(TickStatus.MYSELF_FAILED, snapshot=previous, dry_run=dry_run)
-    snap = replace(snap, myself=myself)
+    snap = replace(snap, myself=myself, myself_for=who if myself else "")
 
     context = _Context(deps)
     snap, events = _observe(config, snap, rules, context, now)
@@ -437,7 +441,7 @@ def _tick_locked(
     # A session observation that is not running (no on_session rule in
     # effect, e.g. while board.toml has errors) is unknown, not "not idle".
     watching_sessions = any(r.trigger is Trigger.ON_SESSION for r in rules)
-    _tend(ledger, config, snap, deps, watching_sessions=watching_sessions)
+    _tend(ledger, config, snap, context, watching_sessions=watching_sessions)
     if config.dispatch_ok:
         if runs.is_paused():
             notes.insert(0, "paused (ephor flows resume)")
@@ -694,13 +698,11 @@ def _tend(
     ledger: _Ledger,
     config: BoardConfig,
     snap: Snapshot,
-    deps: TickDeps,
+    context: _Context,
     *,
     watching_sessions: bool,
 ) -> None:
     """Expire, supersede and finish runs, before anything new is dispatched."""
-    panes: runners.LivePanes | None = None
-    panes_read = False
     for run in sorted(ledger.runs.values(), key=lambda r: (r.created_at, r.run_id)):
         if run.state is RunState.AWAITING_CONFIRM:
             _tend_awaiting(ledger, config, snap, run, watching_sessions=watching_sessions)
@@ -710,9 +712,7 @@ def _tend(
             elif _held_too_long(run, config, ledger.now):
                 _cancel(ledger, run, RunState.EXPIRED, HELD_TOO_LONG)
         elif run.state is RunState.LAUNCHED:
-            if not panes_read:
-                panes, panes_read = deps.live_panes(), True
-            _tend_launched(ledger, run, panes)
+            _tend_launched(ledger, run, context.panes())
 
 
 HELD_TOO_LONG = "held past confirm_ttl"
@@ -830,8 +830,12 @@ class _Context:
     _all_sessions_read: bool = False
     _sessions: list[AgentState] | None = None
     _starts: dict[str, str] | None = None
-    _flow_panes: dict[str, str] | None = None
-    _flow_panes_read: bool = False
+    # One `tmux list-panes -a` per tick answers every pane question: is a
+    # launched run's pane alive, did an unrecorded attempt leave a window,
+    # which server a new pane is on.
+    _panes: runners.LivePanes | None = None
+    _panes_read: bool = False
+    _panes_reread: bool = False
 
     def all_sessions(self) -> list[AgentState] | None:
         """Every session state file, DEAD ones included; None when the scan failed."""
@@ -855,11 +859,39 @@ class _Context:
             self._starts = self.deps.recent_starts(LAUNCH_GUARD_SEC)
         return self._starts
 
-    def flow_panes(self) -> dict[str, str] | None:
+    def panes(self) -> runners.LivePanes | None:
+        """This tick's tmux listing; None when tmux did not answer."""
+        if not self._panes_read:
+            self._panes, self._panes_read = self.deps.live_panes(), True
+        return self._panes
+
+    def flow_panes(self) -> Mapping[str, str] | None:
         """run id -> pane of every live flow window; None when tmux did not answer."""
-        if not self._flow_panes_read:
-            self._flow_panes, self._flow_panes_read = self.deps.flow_panes(), True
-        return self._flow_panes
+        live = self.panes()
+        return None if live is None else live.flows
+
+    def server_of(self, pane: str) -> str:
+        """The tmux server ``pane`` lives on (see :class:`runners.LivePanes`), or "" if unknown.
+
+        A pane this tick just opened is not in the listing taken before it,
+        but it was opened on the same socket, so it is on the server that
+        listing names. Only when there was no server to name — this launch
+        started one — is tmux asked again, once; a pane still not found
+        records "" (unknown), which :meth:`runners.LivePanes.has` accepts.
+        """
+        if not pane:
+            return ""
+        live = self.panes()
+        if live is not None and pane in live.panes:
+            return live.server
+        if live is not None and live.server:
+            return live.server
+        if live is not None and not self._panes_reread:
+            self._panes_reread = True
+            self._panes = live = self.deps.live_panes()
+            if live is not None and pane in live.panes:
+                return live.server
+        return ""
 
 
 def _launches_within(
@@ -1036,7 +1068,7 @@ def _recover_attempt(ledger: _Ledger, context: _Context, run: Run) -> bool:
         state=RunState.LAUNCHED,
         window=runners.window_name(run.ticket, run.flow),
         pane=pane,
-        tmux_server=_server_of(context, pane),
+        tmux_server=context.server_of(pane),
         payload_path=str(payload) if payload.exists() else run.payload_path,
         reason=reason,
     )
@@ -1109,15 +1141,12 @@ def _launch_guard(ledger: _Ledger, context: _Context, ticket: str) -> tuple[str,
             "launch_guard:started",
             f"launch guard: a session was started on {ticket} {_ago(started, ledger.now)}",
         )
+    # Not the work record's ``last_seen``: every passive write bumps it (the
+    # dashboard promoting a key, a Jira status folded in on repaint), so it
+    # says "somebody looked at this ticket", not "somebody started work on
+    # it". A start is what the launched SESSION_STARTED above records.
     item = context.deps.work_item(ticket)
     if item is not None:
-        if (age := runs.age_sec(item.last_seen, ledger.now)) is not None and (
-            age < LAUNCH_GUARD_SEC
-        ):
-            return (
-                "launch_guard:work_record",
-                f"launch guard: {ticket}'s work record was updated {_ago(item.last_seen, ledger.now)}",
-            )
         live_ids = {a.session_id for a in context.live_sessions()}
         if any(sid in live_ids for sid in item.session_ids):
             return (
@@ -1211,14 +1240,6 @@ def _pr_state_of(run: Run, snap: Snapshot) -> str:
     return ""
 
 
-def _server_of(context: _Context, pane: str) -> str:
-    """The tmux server ``pane`` lives on (see :class:`runners.LivePanes`), or "" if unknown."""
-    if not pane:
-        return ""
-    live = context.deps.live_panes()
-    return live.server if live is not None and pane in live.panes else ""
-
-
 def _launch(
     ledger: _Ledger,
     config: BoardConfig,
@@ -1297,7 +1318,7 @@ def _launch(
         state=RunState.LAUNCHED,
         window=outcome.window,
         pane=outcome.pane,
-        tmux_server=_server_of(context, outcome.pane),
+        tmux_server=context.server_of(outcome.pane),
         payload_path=str(payload),
         reason=f"launched{where}",
     )

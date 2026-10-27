@@ -11,6 +11,7 @@ from textual.content import Content
 
 from ephor import board, jira_api
 from ephor.config import SCHEMA_VERSION, config_dir
+from ephor.filelock import locked
 from ephor.flows import runs
 from ephor.flows import snapshot as snap
 from ephor.flows import tick as flows_tick
@@ -214,6 +215,35 @@ async def test_f_then_y_approves_and_asks_for_a_tick(
         await pilot.press("escape")
         await pilot.pause()
         assert not isinstance(app.screen, FlowsScreen)
+
+
+@pytest.mark.asyncio
+async def test_y_while_the_run_files_are_busy_says_so_instead_of_freezing(
+    fleet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = EphorApp(manager=StateManager(fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        monkeypatch.setattr(app, "_refresh_board", lambda: None)
+        await pilot.press("f")
+        await pilot.pause()
+        timeouts: list[float | None] = []
+        real = runs.update
+
+        def spy(run_id: str, **kwargs: object) -> Run | None:
+            timeouts.append(kwargs.get("lock_timeout"))  # type: ignore[arg-type]
+            return real(run_id, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(runs, "update", spy)
+        with locked(runs.runs_dir() / ".lock", timeout=0) as held:
+            assert held
+            await pilot.press("y")
+            await pilot.pause()
+        assert timeouts == [runs.UI_LOCK_TIMEOUT_SEC]
+        assert "busy" in str(app.screen.query_one("#flows-status").render())
+        stored = runs.load("DR-3.review.10-1")
+        assert stored is not None and stored.state is RunState.AWAITING_CONFIRM
 
 
 @pytest.mark.asyncio

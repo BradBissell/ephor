@@ -371,10 +371,24 @@ def confident_ticket_for_agent(agent: AgentState) -> str:
     For callers that *act* on the answer — the flows tick's launch guard and
     its ``on_session`` triggers. A prose guess ("get-peer-reviews: DR-3 and
     DR-4 are waiting") is fine for a dashboard label, but it must not hold a
-    review back, or fire ``died`` for a ticket the session only mentioned.
+    review back, or fire ``died`` for a ticket the session only mentioned —
+    and neither must a guess that was promoted only because *some* session's
+    work record confirms that key.
     """
     match = match_for_agent(agent)
-    return match.key.upper() if match is not None and match.confident else ""
+    if match is None or not match.confident:
+        return ""
+    if match.source is TicketSource.PROMOTED:
+        # PROMOTED covers two different things. A read-back of *this*
+        # session's own record is a fact some earlier probe established for
+        # it. A prose guess promoted because the key has a confirmed record
+        # at all is not: that record may belong to another session entirely,
+        # and "this session mentioned DR-3" must not hold DR-3's review back
+        # or fire ``died`` for DR-3 when it exits. Only the former counts.
+        own = promoted_for_session(getattr(agent, "session_id", None))
+        if not own or own.upper() != match.key.upper():
+            return ""
+    return match.key.upper()
 
 
 # session_id -> promoted ticket, rebuilt on a short TTL. Without this the
@@ -433,14 +447,43 @@ def promote(match: TicketMatch | None, agent: AgentState) -> None:
     # make the repo root, and whatever branch it has out, the ticket's own:
     # the flow tick would then run a worktree = true flow in the main tree.
     owned = gitinfo.is_linked_worktree(ctx.toplevel)
+    session_id = getattr(agent, "session_id", None)
+    branch = (ctx.branch or "") if owned else ""
+    worktree = (ctx.toplevel or "") if owned else ""
+    repo = Path(ctx.toplevel).name if ctx.toplevel else ""
+    if _already_recorded(match.key, session_id, branch=branch, worktree=worktree, repo=repo):
+        # The dashboard calls this on every repaint, twice a second. A write
+        # that would change nothing but ``last_seen`` is a flock and a rename
+        # per session per frame for no information.
+        return
     work_items.record(
         match.key,
-        session_id=getattr(agent, "session_id", None),
-        branch=(ctx.branch or "") if owned else "",
-        worktree=(ctx.toplevel or "") if owned else "",
-        repo=Path(ctx.toplevel).name if ctx.toplevel else "",
+        session_id=session_id,
+        branch=branch,
+        worktree=worktree,
+        repo=repo,
         confirmed=True,
     )
     # The index this write invalidates is the one the very next repaint
     # reads, so expire it now rather than letting the TTL do it later.
     _promotion_index_expires = 0.0
+
+
+def _already_recorded(
+    key: str, session_id: str | None, *, branch: str, worktree: str, repo: str
+) -> bool:
+    """True when ``key``'s record already says everything :func:`promote` would write.
+
+    Mirrors :func:`ephor.work_items.record`'s merge: an empty value writes
+    nothing, so only a non-empty one that differs is news, and the session
+    must already be the record's head (the merge moves it to the front).
+    """
+    item = work_items.load(key)
+    if item is None or not item.confirmed:
+        return False
+    if session_id and (not item.session_ids or item.session_ids[0] != session_id):
+        return False
+    return all(
+        not new or new == old
+        for new, old in ((branch, item.branch), (worktree, item.worktree), (repo, item.repo))
+    )

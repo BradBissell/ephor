@@ -148,6 +148,7 @@ class FakeLaunch:
         *,
         title: str,
         provider: str,
+        base: str,
         cwd: Path,
         prompt: str,
         window_name: str,
@@ -160,6 +161,7 @@ class FakeLaunch:
                 "ticket": ticket,
                 "title": title,
                 "provider": provider,
+                "base": base,
                 "cwd": cwd,
                 "prompt": prompt,
                 "window_name": window_name,
@@ -187,10 +189,18 @@ class World:
         self.server = "100.1"
         # run id -> pane of the flow windows tmux reports; None = tmux silent.
         self.flow_panes: dict[str, str] | None = {}
+        self.pane_listings = 0
         # ticket -> what `gh pr list --search` says; a missing key is "no PRs".
         self.prs: dict[str, list[PullRequest] | None] = {}
         self.pr_calls: list[tuple[Path, str]] = []
         self.dead_pids: set[int] = set()
+
+    def live_panes(self) -> runners.LivePanes | None:
+        """One `tmux list-panes -a`: the panes, their server, and the flow windows."""
+        self.pane_listings += 1
+        if self.panes is None or self.flow_panes is None:
+            return None
+        return runners.LivePanes(self.server, frozenset(self.panes), dict(self.flow_panes))
 
     def find_prs(self, repo: Path, key: str) -> list[PullRequest] | None:
         self.pr_calls.append((repo, key))
@@ -206,16 +216,13 @@ class World:
             ticket_of=lambda agent: agent.ticket.upper(),
             recent_starts=lambda _since: dict(self.starts),
             work_item=self.work.get,
-            live_panes=lambda: (
-                None
-                if self.panes is None
-                else runners.LivePanes(self.server, frozenset(self.panes))
-            ),
-            flow_panes=lambda: None if self.flow_panes is None else dict(self.flow_panes),
+            live_panes=self.live_panes,
             find_prs=self.find_prs,
             pid_alive=lambda pid: pid not in self.dead_pids,
             launchers=runners.Launchers(
-                start=self.launch.start, open_window=self.launch.open_window
+                start=self.launch.start,
+                open_window=self.launch.open_window,
+                default_base=lambda root: "origin/main",
             ),
         )
 
@@ -360,6 +367,29 @@ def test_myself_is_cached_in_the_snapshot(world: World) -> None:
     _baseline(world, config)
     _move_to_review(world, config, T0 + timedelta(minutes=1))
     assert world.jira.myself_calls == 1
+
+
+def test_myself_is_fetched_again_when_the_credentials_change(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(REVIEW)
+    _baseline(world, config)
+    assert world.jira.myself_calls == 1
+    world.tick(config, T0 + timedelta(minutes=1))
+    assert world.jira.myself_calls == 1
+
+    # Another user on the same site is another "me".
+    monkeypatch.setenv("EPHOR_JIRA_EMAIL", "someone-else@example.com")
+    world.jira.account = "acct-other"
+    world.tick(config, T0 + timedelta(minutes=2))
+    assert world.jira.myself_calls == 2
+    stored = snap.load()
+    assert stored is not None and stored.myself == "acct-other"
+
+    # A rotated token is the same account: no new question.
+    monkeypatch.setenv("EPHOR_JIRA_TOKEN", "rotated")
+    world.tick(config, T0 + timedelta(minutes=3))
+    assert world.jira.myself_calls == 2
 
 
 def test_an_unknown_myself_writes_nothing(world: World) -> None:
@@ -639,14 +669,24 @@ def test_the_launch_guard_refuses_a_ticket_someone_is_on(
     elif how == "started":
         world.starts = {"DR-1": "2026-10-20T12:01:30+00:00"}
     else:
-        world.work["DR-1"] = WorkItem(
-            key="DR-1", last_seen=(T0 + timedelta(minutes=-5)).isoformat()
-        )
+        # A live session the ticket's work record names, though nothing
+        # binds that session to the ticket by fact any more.
+        world.sessions = [_agent("s1")]
+        world.work["DR-1"] = WorkItem(key="DR-1", session_ids=("s1",))
     world.tick(config, T0 + timedelta(minutes=2))
     run = _only_run()
     assert run.state is RunState.BLOCKED
     assert run.reason.startswith("launch guard")
     assert world.launch.windows == []
+
+
+def test_a_recently_touched_work_record_alone_does_not_block(world: World, repo: Path) -> None:
+    """``last_seen`` moves on every passive write (a repaint promoting the key); it is not a start."""
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _approved_review(world, config)
+    world.work["DR-1"] = WorkItem(key="DR-1", last_seen=(T0 + timedelta(minutes=1)).isoformat())
+    world.tick(config, T0 + timedelta(minutes=2))
+    assert _only_run().state is RunState.LAUNCHED
 
 
 def test_a_dead_session_on_the_ticket_does_not_block(world: World, repo: Path) -> None:
@@ -1345,6 +1385,16 @@ def test_a_retry_waits_while_tmux_cannot_say_what_is_running(world: World) -> No
     relaunched = _only_run()
     assert (relaunched.state, relaunched.attempts) == (RunState.LAUNCHED, 2)
     assert len(world.launch.windows) == 2
+
+
+def test_a_retry_with_no_tmux_server_running_relaunches(world: World) -> None:
+    """No server is an answer (no window can exist), not "tmux did not answer"."""
+    config = _config(NOTIFY)
+    _crash_after_window(world, config)
+    world.panes, world.server, world.flow_panes = set(), "", {}
+    world.tick(config, T0 + timedelta(minutes=12))
+    relaunched = _only_run()
+    assert (relaunched.state, relaunched.attempts) == (RunState.LAUNCHED, 2)
 
 
 def test_a_relaunch_clears_a_half_written_exit_file(world: World) -> None:
@@ -2055,16 +2105,16 @@ def test_an_approve_racing_expiry_is_still_checked_for_currency(
 def test_a_block_whose_reason_counts_up_logs_one_event(world: World, repo: Path) -> None:
     config = _config(REVIEW, repos={"DR": str(repo)})
     _approved_review(world, config)
-    world.work["DR-1"] = WorkItem(key="DR-1", last_seen=(T0 + timedelta(minutes=1)).isoformat())
+    world.starts = {"DR-1": (T0 + timedelta(minutes=1)).isoformat()}
     for minute in range(3, 9):
         result = world.tick(config, T0 + timedelta(minutes=minute))
     run = _only_run()
     assert run.state is RunState.BLOCKED
-    assert run.block_key == "launch_guard:work_record"
+    assert run.block_key == "launch_guard:started"
     assert len(_events(eventlog.EventKind.FLOW_BLOCKED)) == 1
     # The tick still reports the up-to-date reason.
     (note,) = [a for a in result.actions if a.verb == "blocked"]
-    assert note.detail.endswith("updated 7m ago")
+    assert note.detail.endswith("started on DR-1 7m ago")
 
 
 def test_a_block_for_a_different_guard_is_logged(world: World, repo: Path) -> None:
@@ -2113,6 +2163,69 @@ def test_no_tmux_server_at_all_finishes_launched_runs(world: World, repo: Path) 
     world.panes, world.server = set(), ""  # what live_panes reports for "no server running"
     world.tick(config, T0 + timedelta(minutes=3))
     assert _only_run().state is RunState.DONE
+
+
+def test_a_tick_lists_tmux_panes_once(world: World) -> None:
+    """Launches, adoptions and the launched-run check share one `list-panes -a`."""
+    config = _config(NOTIFY)
+    world.jira.put("DR-1", "In Progress", "3")
+    world.jira.put("DR-2", "In Progress", "3")
+    world.tick(config, T0)
+    world.jira.put("DR-1", "Peer Review", "10")
+    world.jira.put("DR-2", "Peer Review", "10")
+    before = world.pane_listings
+    world.tick(config, T0 + timedelta(minutes=1))
+    launched = runs.list_runs()
+    assert [r.state for r in launched] == [RunState.LAUNCHED, RunState.LAUNCHED]
+    assert {r.tmux_server for r in launched} == {"100.1"}
+    assert world.pane_listings - before == 1
+    # The next tick checks both launched panes off the same listing.
+    world.panes = {r.pane for r in launched}
+    before = world.pane_listings
+    world.tick(config, T0 + timedelta(minutes=2))
+    assert world.pane_listings - before == 1
+
+
+def test_a_launch_that_starts_the_tmux_server_asks_once_more_for_it(world: World) -> None:
+    config = _config(NOTIFY)
+    world.panes, world.server = set(), ""  # no server running yet
+    real = world.launch.open_window
+
+    def starting_the_server(
+        name: str,
+        cwd: Path,
+        command: str,
+        env: dict[str, str],
+        *,
+        detached: bool = False,
+        target_session: str = "",
+    ) -> tuple[str | None, str, str]:
+        window, pane, message = real(
+            name, cwd, command, env, detached=detached, target_session=target_session
+        )
+        assert world.panes is not None
+        world.server = "300.3"
+        world.panes.add(pane)
+        return window, pane, message
+
+    world.launch.open_window = starting_the_server  # type: ignore[method-assign]
+    _baseline(world, config)
+    before = world.pane_listings
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    assert _only_run().tmux_server == "300.3"
+    assert world.pane_listings - before <= 2
+
+
+def test_a_pane_opened_after_an_empty_listing_is_looked_up_once_more(world: World) -> None:
+    context = flows_tick._Context(world.deps())
+    world.panes, world.server = set(), ""
+    assert context.panes() == runners.LivePanes("", frozenset())
+    # The launch started the server; the listing above predates it.
+    world.panes, world.server = {"%1", "%2"}, "300.3"
+    assert context.server_of("%1") == "300.3"
+    assert context.server_of("%2") == "300.3"
+    assert context.server_of("") == ""
+    assert world.pane_listings == 2
 
 
 # --- final review: only facts tie a session to a ticket -------------------------------------

@@ -384,6 +384,36 @@ def test_find_prs_for_ticket_trusts_the_branch_over_the_title(
     assert [p.number for p in prs] == [3, 2]
 
 
+def test_find_prs_for_ticket_is_not_outvoted_by_version_words_in_the_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`node-20` is not a ticket, and a branch naming DR-12 anywhere is DR-12's."""
+    stdout = json.dumps(
+        [
+            _ticket_pr(5, "bump node", headRefName="deps/node-20-DR-12"),
+            _ticket_pr(4, "bump node", headRefName="deps/NODE-20-DR-12"),
+            _ticket_pr(3, "DR-12 bump", headRefName="deps/node-20"),
+            _ticket_pr(2, "other", headRefName="deps/DR-99-node-20"),
+        ]
+    )
+    monkeypatch.setattr(gh.subprocess, "run", _fake_gh(stdout))
+    prs = gh.find_prs_for_ticket(tmp_path, "DR-12")
+    assert prs is not None
+    assert [p.number for p in prs] == [5, 4, 3]
+
+
+def test_find_prs_for_ticket_respects_the_configured_projects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With $EPHOR_TICKET_PROJECTS set, an upper-case non-project word is not a key."""
+    monkeypatch.setenv("EPHOR_TICKET_PROJECTS", "DR")
+    stdout = json.dumps([_ticket_pr(6, "UTF-8 fix", body="Closes DR-12")])
+    monkeypatch.setattr(gh.subprocess, "run", _fake_gh(stdout))
+    prs = gh.find_prs_for_ticket(tmp_path, "DR-12")
+    assert prs is not None
+    assert [p.number for p in prs] == [6]
+
+
 def test_find_prs_for_ticket_treats_a_full_page_as_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

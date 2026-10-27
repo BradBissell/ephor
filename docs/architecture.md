@@ -286,10 +286,11 @@ start folded.
 
 The lanes are fed by `flows/snapshot.json`, which the TUI refreshes on a
 worker thread every 60 seconds when a `board.toml` exists and Jira is
-configured (`ephor.flows.snapshot.refresh`: one JQL search, a pure diff
-against the previous snapshot, `TICKET_TRANSITIONED` events, then the
-atomic write). That refresh is a flows tick with no rules; the tick reuses
-`fetch` / `advance` / `save` and runs its rules between them.
+configured, by running a flows tick (`ephor.flows.tick.run`: one JQL search
+via `snapshot.fetch`, a pure diff against the previous snapshot via
+`snapshot.advance`, the flow rules, `TICKET_TRANSITIONED` events, then the
+atomic `snapshot.save`). There is no rule-less refresh: saving a snapshot
+consumes the moves in it, so every writer must run the rules first.
 
 Board tickets that have no live session are drawn as **ticket rows**, with
 their own row-id prefix (`"\x00tkt:"`, beside the group headers'
