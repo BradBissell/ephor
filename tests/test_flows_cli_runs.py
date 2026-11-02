@@ -13,6 +13,7 @@ from ephor.cli import main
 from ephor.config import config_dir
 from ephor.flows import runners, runs
 from ephor.flows import snapshot as snap
+from ephor.flows import tick as flows_tick
 from ephor.flows.runs import Run, RunState
 from ephor.flows.snapshot import Snapshot, TicketState
 from ephor.jira_api import Issue
@@ -31,6 +32,12 @@ assignee = "any"
 """
 
 
+@pytest.fixture(autouse=True)
+def _no_coalescing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests tick back to back on the real clock; coalescing has its own tests."""
+    monkeypatch.setattr(flows_tick, "COALESCE_SEC", 0.0)
+
+
 def _write_board(text: str = _BOARD) -> None:
     config_dir().mkdir(parents=True, exist_ok=True)
     (config_dir() / board.BOARD_FILE).write_text(text)
@@ -45,6 +52,7 @@ def jira(monkeypatch: pytest.MonkeyPatch) -> dict[str, Issue]:
     monkeypatch.setattr(jira_api, "search", lambda jql, fields=(), **_: list(issues.values()))
     monkeypatch.setattr(jira_api, "fetch_fresh", lambda key: issues.get(key))
     monkeypatch.setattr(jira_api, "myself", lambda: "acct-me")
+    monkeypatch.setattr(jira_api, "flagged_field_id", lambda: "")
     monkeypatch.setattr(runners, "live_panes", lambda: None)
     monkeypatch.setattr(runners, "flow_panes", dict)
     return issues
@@ -363,10 +371,12 @@ assignee = "any"
 """
     )
     found: list[PullRequest] = []
-    monkeypatch.setattr(github, "find_prs_for_ticket", lambda path, key: list(found))
+    monkeypatch.setattr(
+        github, "list_repo_prs", lambda path: github.RepoPrs(prs=tuple(found), complete=True)
+    )
     jira["DR-1"] = Issue(key="DR-1", status="In Progress", status_id="3", title="One")
     assert main(["flows", "tick"]) == 0
-    found.append(PullRequest(number=7, url="https://x/pull/7", state="OPEN"))
+    found.append(PullRequest(number=7, url="https://x/pull/7", state="OPEN", head_ref="bb/DR-1-x"))
     stored = snap.load()
     assert stored is not None
     snap.save(Snapshot(**{**stored.__dict__, "pr_checked_at": ""}))
@@ -449,3 +459,114 @@ def test_check_runs_the_board_search(
     ((jql, kw),) = asked
     assert "project in (DR)" in jql
     assert kw == {"page_size": 1, "max_pages": 1}
+
+
+# --- show, retry, explain, ls filters, check warnings, coalescing --------------------------
+
+
+def test_ls_filters_by_ticket_and_flow(capsys: pytest.CaptureFixture[str]) -> None:
+    _awaiting("DR-1.review.10-1")
+    _awaiting("DR-1.notify.10-1")
+    _awaiting("DR-2.review.10-1")
+    assert main(["flows", "ls", "--ticket", "dr-1", "--flow", "review"]) == 0
+    out = capsys.readouterr().out
+    assert "DR-1.review.10-1" in out
+    assert "DR-1.notify.10-1" not in out and "DR-2.review.10-1" not in out
+
+
+def test_show_prints_the_run_its_payload_and_its_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _awaiting("DR-1.notify.10-1", RunState.FAILED)
+    assert runs.write_payload("DR-1.notify.10-1", {"ticket": "DR-1", "title": "One"})
+    runs.log_path("DR-1.notify.10-1").write_text("starting\nboom\x1b[31m\n")
+    assert main(["flows", "show", "DR-1.notify"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("DR-1.notify.10-1\n")
+    assert "state:        failed" in out
+    assert "attempts:     0" in out
+    assert '"title": "One"' in out
+    assert "output, last 2 line(s)" in out and "boom" in out
+    assert "\x1b" not in out  # the output is ticket-adjacent text: control characters go
+
+
+def test_retry_rearms_and_refuses(capsys: pytest.CaptureFixture[str]) -> None:
+    _awaiting("DR-1.notify.10-1", RunState.STUCK)
+    assert main(["flows", "retry", "DR-1.notify.10-1"]) == 0
+    assert "re-armed DR-1.notify.10-1" in capsys.readouterr().out
+    run = runs.load("DR-1.notify.10-1")
+    assert run is not None and run.state is RunState.AWAITING_CONFIRM
+    assert main(["flows", "retry", "DR-1.notify.10-1"]) == 1
+    assert "it is awaiting_confirm" in capsys.readouterr().err
+
+
+def test_explain_prints_each_rule_and_its_gate(
+    jira: dict[str, Issue], windows: list[dict[str, Any]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_board()
+    jira["DR-1"] = Issue(key="DR-1", status="In Progress", status_id="3", title="One")
+    assert main(["flows", "tick"]) == 0
+    capsys.readouterr()
+    assert main(["flows", "explain", "DR-1"]) == 0
+    out = capsys.readouterr().out
+    assert "notify: does not fire — status match" in out
+    assert "DR-1 is in In Progress, not Peer Review" in out
+    assert main(["flows", "explain", "DR-1", "nope"]) == 1
+    assert "no flow named 'nope'" in capsys.readouterr().err
+    assert windows == []
+
+
+def test_check_shows_warnings_and_the_missing_tmux_session(
+    jira: dict[str, Issue], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("TMUX", raising=False)
+    _write_board(_BOARD.replace('on_enter = "Peer Review"', 'on_enter = "Peer Reveiw"'))
+    assert main(["flows", "check"]) == 0  # warnings disable nothing
+    out = capsys.readouterr().out
+    assert "warn: [[flow]] notify: on_enter = 'Peer Reveiw' is not in any [board] column" in out
+    assert "warn: [flows] tmux_session is empty" in out
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+    assert main(["flows", "check"]) == 0
+    assert "tmux_session is empty" not in capsys.readouterr().out
+
+
+def test_check_cross_checks_statuses_against_the_snapshot(
+    jira: dict[str, Issue], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("TMUX", "x")
+    _write_board()
+    assert snap.save(
+        Snapshot(taken_at=datetime.now(UTC).isoformat(), tickets={"DR-1": TicketState("QA")})
+    )
+    assert main(["flows", "check"]) == 0
+    assert "no ticket on the board is in that status" in capsys.readouterr().out
+
+
+def test_doctor_shows_board_warnings_as_warn(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("TMUX", "x")
+    _write_board(_BOARD.replace('on_enter = "Peer Review"', 'on_enter = "Peer Reveiw"'))
+    main(["doctor"])
+    out = capsys.readouterr().out
+    assert "[warn] board" in out and "Peer Reveiw" in out
+
+
+def test_tick_coalesces_unless_forced(
+    jira: dict[str, Issue],
+    windows: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(flows_tick, "COALESCE_SEC", 45.0)
+    _write_board()
+    jira["DR-1"] = Issue(key="DR-1", status="In Progress", status_id="3", title="One")
+    assert main(["flows", "tick"]) == 0
+    capsys.readouterr()
+    jira["DR-1"] = Issue(key="DR-1", status="Peer Review", status_id="10", title="One")
+    assert main(["flows", "tick"]) == 0
+    assert "skipped: the snapshot is" in capsys.readouterr().out
+    assert runs.list_runs() == []
+    assert main(["flows", "tick", "--force"]) == 0
+    assert "moved     DR-1" in capsys.readouterr().out
+    assert [r.run_id for r in runs.list_runs()] == ["DR-1.notify.10-1"]

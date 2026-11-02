@@ -16,8 +16,8 @@ The modules:
 * :mod:`ephor.flows.tick` — the tick itself: rules, adopt mode, guards and
   dispatch, run between the snapshot's diff and its write.
 * :mod:`ephor.flows.triggers` — the ``on_pr`` and ``on_session``
-  observations (``gh`` per ticket, the session state files), diffed against
-  the snapshot's previous ones like the statuses are.
+  observations (one ``gh`` listing per repo, the session state files),
+  diffed against the snapshot's previous ones like the statuses are.
 * :mod:`ephor.flows.runs` — one file per flow firing, claimed by an
   exclusive create and moved through its states by compare-and-set.
 * :mod:`ephor.flows.runners` — how a run is launched: a detached tmux window.

@@ -8,7 +8,7 @@ from __future__ import annotations
 from textual.widgets import Static
 
 from ephor.state.models import StatusSummary
-from ephor.tui.lanes import markup_text
+from ephor.tui.text import markup_text
 
 # Hex colors mirror tui/theme.tcss; rich markup needs literal hex, not $vars.
 # (label, summary-attr, hex-color) — display order kept stable.
@@ -25,12 +25,24 @@ _FLOW = "#EBCB8B"
 _FLOW_BAD = "#f85149"
 
 
-def format_header(summary: StatusSummary, flows_awaiting: int = 0, flows_problem: str = "") -> str:
+def format_header(
+    summary: StatusSummary,
+    flows_awaiting: int = 0,
+    flows_problem: str = "",
+    *,
+    flows_queued: int = 0,
+    flows_blocked: int = 0,
+    flows_stuck: int = 0,
+    flows_any: bool = False,
+) -> str:
     """Pure formatter — extracted from the widget so tests can assert on text.
 
-    ``flows_awaiting`` is how many flow runs wait for your confirmation; the
-    cell appears only when there are some, since most dashboards have no
-    board.toml at all. ``flows_problem`` (see
+    The FLOWS cell appears whenever any flow badge is showing on the board
+    (``flows_any``, or any count), since most dashboards have no board.toml
+    at all: ``FLOW? 2`` for runs awaiting your confirmation, then ``⧗3`` for
+    agent runs queued for a free slot, ``⊘1``
+    for runs a guard is holding and ``⚠1`` for runs the tick gave up on,
+    and the ``(f)`` that opens them. ``flows_problem`` (see
     :meth:`ephor.tui.lanes.Lanes.health`) adds a ``FLOWS ✗`` cell saying why
     the board or its flows are not working.
     """
@@ -42,8 +54,16 @@ def format_header(summary: StatusSummary, flows_awaiting: int = 0, flows_problem
         else:
             cells.append(f"[dim]{label} 0[/]")
     cells.append(f"[bold {_PRIMARY}]TOTAL {summary.total}[/]")
-    if flows_awaiting:
-        cells.append(f"[bold {_FLOW}]FLOW? {flows_awaiting}[/] [dim](f)[/]")
+    if flows_awaiting or flows_queued or flows_blocked or flows_stuck or flows_any:
+        parts = [f"[bold {_FLOW}]FLOW? {flows_awaiting}[/]" if flows_awaiting else "[bold]FLOWS[/]"]
+        if flows_queued:
+            parts.append(f"[#8be9fd]⧗{flows_queued}[/]")
+        if flows_blocked:
+            parts.append(f"[#d29922]⊘{flows_blocked}[/]")
+        if flows_stuck:
+            parts.append(f"[bold {_FLOW_BAD}]⚠{flows_stuck}[/]")
+        parts.append("[dim](f)[/]")
+        cells.append(" ".join(parts))
     if flows_problem:
         cells.append(f"[bold {_FLOW_BAD}]FLOWS ✗[/] [dim]{markup_text(flows_problem, 90)}[/]")
     return "  ".join(cells)
@@ -53,6 +73,24 @@ class HeaderBar(Static):
     """Status counters across the top of the dashboard."""
 
     def update_summary(
-        self, summary: StatusSummary, flows_awaiting: int = 0, flows_problem: str = ""
+        self,
+        summary: StatusSummary,
+        flows_awaiting: int = 0,
+        flows_problem: str = "",
+        *,
+        flows_queued: int = 0,
+        flows_blocked: int = 0,
+        flows_stuck: int = 0,
+        flows_any: bool = False,
     ) -> None:
-        self.update(format_header(summary, flows_awaiting, flows_problem))
+        self.update(
+            format_header(
+                summary,
+                flows_awaiting,
+                flows_problem,
+                flows_queued=flows_queued,
+                flows_blocked=flows_blocked,
+                flows_stuck=flows_stuck,
+                flows_any=flows_any,
+            )
+        )

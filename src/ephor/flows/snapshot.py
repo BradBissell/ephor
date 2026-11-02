@@ -24,17 +24,20 @@ Rules this file keeps, because the flows built on it depend on them:
 missing half the board would read, next time, as half the board having moved.
 
 **Absence is not movement.** A ticket missing from one search is kept, with
-``unseen_ticks`` bumped, and produces no transition — search results are
-eventually consistent, and a ticket can drop out of a JQL for reasons that
-have nothing to do with its status (reassigned, a filter edited). It is
-forgotten only after :data:`DROP_AFTER_UNSEEN` searches in a row miss it.
+``unseen_ticks`` bumped and ``unseen_since`` stamped, and produces no
+transition — search results are eventually consistent, and a ticket can drop
+out of a JQL for reasons that have nothing to do with its status (reassigned,
+a filter edited). It is forgotten only once every search for
+:data:`DROP_AFTER_UNSEEN_SEC` has missed it. A duration, not a count of
+searches: ticks come at whatever cadence the dashboard, ``flows watch`` or a
+timer happens to run, and "an hour" should mean an hour under all of them.
 
 **``seq`` counts entries, not time.** Every time a ticket's status differs
 from the previous snapshot, its ``seq`` goes up by one. ``(status_id, seq)``
 therefore names one *visit* to a status: a ticket that leaves Peer Review
 and comes back is a new visit with a new name, while the same visit seen on a
 hundred ticks keeps one. That pair is what a flow's run is keyed on.
-A ticket forgotten after :data:`DROP_AFTER_UNSEEN` leaves a small tombstone
+A ticket forgotten after :data:`DROP_AFTER_UNSEEN_SEC` leaves a small tombstone
 (``dropped``: its last seq and status). If it comes back in that same status
 it never moved, and it resumes its old visit — no transition, nothing fires
 again. If it comes back anywhere else it continues from its old seq: the run
@@ -46,8 +49,15 @@ search itself (projects plus JQL). When it changes, the tickets the new
 search brings in were not *moved* there — the window onto the board was —
 and the flow tick adopts them instead of firing on them.
 
+**When a ticket entered its status** (``entered_at``) is the tick's own
+clock on the tick that saw the move. A ticket seen for the first time has no
+such tick, so it borrows Jira's ``statuscategorychangedate`` and is marked
+``entered_estimated``: that field moves only when the status *category*
+changes, so it is the earliest the current status can have begun, not when
+it did. The lanes use it to age a card; nothing fires on it.
+
 The snapshot also carries fields only the flow tick reads (``rules_seen``,
-``myself``, and the two observations :mod:`ephor.flows.triggers` compares
+``myself``, the Flagged field's id, and the two observations :mod:`ephor.flows.triggers` compares
 from tick to tick: ``prs`` with ``pr_checked_at``, and ``sessions_seen``).
 :func:`advance` carries them forward untouched — in particular it never
 marks a rule as seen, so a rule the tick has not evaluated yet still starts
@@ -77,11 +87,10 @@ SNAPSHOT_FILE = "snapshot.json"
 TICK_LOCK_FILE = "tick.lock"
 SNAPSHOT_SCHEMA_VERSION = 1
 
-# How many searches in a row may miss a ticket before it is forgotten. At the
-# TUI's one-minute cadence that is an hour: long enough to ride out a flaky
-# JQL or a ticket briefly reassigned, short enough that the file does not
-# accumulate every ticket you have ever owned.
-DROP_AFTER_UNSEEN = 60
+# How long every search must miss a ticket before it is forgotten: long
+# enough to ride out a flaky JQL or a ticket briefly reassigned, short enough
+# that the file does not accumulate every ticket you have ever owned.
+DROP_AFTER_UNSEEN_SEC = 3600.0
 # How long a dropped ticket's tombstone is kept. A returning ticket only
 # needs its old seq while the run files of its earlier visit still exist
 # (runs.PRUNE_AFTER_DAYS after they finish), plus some slack.
@@ -89,7 +98,14 @@ TOMBSTONE_KEEP_DAYS = runs.PRUNE_AFTER_DAYS + 7.0
 
 # What the board search asks Jira for. Everything a lane or a flow rule
 # reads, and nothing else — an issue document is otherwise tens of kilobytes.
-SEARCH_FIELDS: tuple[str, ...] = ("summary", "status", "assignee")
+# The site's "Flagged" custom field is appended when its id is known (see
+# :func:`search_fields`); its id differs from one Jira site to the next.
+SEARCH_FIELDS: tuple[str, ...] = ("summary", "status", "assignee", "statuscategorychangedate")
+
+
+def search_fields(flagged_field: str = "") -> tuple[str, ...]:
+    """:data:`SEARCH_FIELDS`, plus the Flagged field when its id is known."""
+    return (*SEARCH_FIELDS, flagged_field) if flagged_field else SEARCH_FIELDS
 
 
 def snapshot_path() -> Path:
@@ -117,6 +133,20 @@ class TicketState:
     title: str = ""
     seq: int = 0
     unseen_ticks: int = 0
+    # When the first of the searches that have since missed it ran ("" while
+    # on the board). It is what DROP_AFTER_UNSEEN_SEC is measured from.
+    unseen_since: str = ""
+    # When the ticket entered its current status (see the module docstring),
+    # and whether that is Jira's category-change date standing in for it.
+    entered_at: str = ""
+    entered_estimated: bool = False
+    # Jira's "Flagged" (impediment) is set on the issue.
+    flagged: bool = False
+    # The status it was in before the move that brought it to this one ("" if
+    # it appeared on the board in it) — what on_enter's ``from =`` compares,
+    # and what ``ephor flows explain`` names for an on_exit rule.
+    from_status: str = ""
+    from_status_id: str = ""
 
     @property
     def status_identity(self) -> str:
@@ -146,6 +176,12 @@ class TicketState:
             "title": self.title,
             "seq": self.seq,
             "unseen_ticks": self.unseen_ticks,
+            "unseen_since": self.unseen_since,
+            "entered_at": self.entered_at,
+            "entered_estimated": self.entered_estimated,
+            "flagged": self.flagged,
+            "from_status": self.from_status,
+            "from_status_id": self.from_status_id,
         }
 
     @classmethod
@@ -159,6 +195,12 @@ class TicketState:
             title=as_str(data.get("title")),
             seq=as_int(data.get("seq")),
             unseen_ticks=as_int(data.get("unseen_ticks")),
+            unseen_since=as_str(data.get("unseen_since")),
+            entered_at=as_str(data.get("entered_at")),
+            entered_estimated=data.get("entered_estimated") is True,
+            flagged=data.get("flagged") is True,
+            from_status=as_str(data.get("from_status")),
+            from_status_id=as_str(data.get("from_status_id")),
         )
 
     @classmethod
@@ -172,7 +214,11 @@ class TicketState:
             title=issue.title,
             seq=seq,
             unseen_ticks=0,
+            flagged=issue.flagged,
         )
+
+
+CI_VALUES = frozenset({"pass", "fail", "pending"})
 
 
 @dataclass(frozen=True)
@@ -183,6 +229,7 @@ class PrState:
     state: str = ""  # OPEN | MERGED | CLOSED, as gh reports it
     head_sha: str = ""
     url: str = ""
+    ci: str = ""  # pass | fail | pending | "" (unknown, or no checks)
 
     @property
     def is_open(self) -> bool:
@@ -198,6 +245,7 @@ class PrState:
             "state": self.state,
             "head_sha": self.head_sha,
             "url": self.url,
+            "ci": self.ci,
         }
 
     @classmethod
@@ -210,6 +258,7 @@ class PrState:
             state=as_str(data.get("state")),
             head_sha=as_str(data.get("head_sha")),
             url=as_str(data.get("url")),
+            ci=as_str(data.get("ci")) if data.get("ci") in CI_VALUES else "",
         )
 
 
@@ -241,12 +290,16 @@ class SessionSeen:
     ``settled`` is "IDLE, with no event for at least ``[flows] settle``".
     ``pid`` is kept so a session whose state file has since been deleted can
     still be told apart: a dead process was a death, a live one was not.
+    ``idle_since`` is the session's last hook event while settled — the
+    start of this idle spell, and so what names it: an ``on_session =
+    "idle"`` run fires once per spell, not once per session.
     """
 
     ticket: str
     status: str
     pid: int = 0
     settled: bool = False
+    idle_since: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -254,6 +307,7 @@ class SessionSeen:
             "status": self.status,
             "pid": self.pid,
             "settled": self.settled,
+            "idle_since": self.idle_since,
         }
 
     @classmethod
@@ -266,6 +320,7 @@ class SessionSeen:
             status=as_str(data.get("status")),
             pid=as_int(data.get("pid")),
             settled=data.get("settled") is True,
+            idle_since=as_str(data.get("idle_since")),
         )
 
 
@@ -345,6 +400,14 @@ class Snapshot:
     # an empty one) has a baseline; only a change from it fires on_pr.
     pr_checked_at: str = ""
     prs: Mapping[str, tuple[PrState, ...]] = field(default_factory=dict)
+    # ticket -> the repo its ``prs`` entry was read from. A different repo
+    # (a worktree appeared or went away) is a different question, and its
+    # answer is a fresh baseline rather than a burst of opened/merged.
+    pr_repos: Mapping[str, str] = field(default_factory=dict)
+    # The site's "Flagged" custom field id ("" when it has none), and the
+    # jira_api.identity() it was looked up for, like ``myself_for``.
+    flagged_field: str = ""
+    flagged_for: str = ""
     # session id -> what the last tick saw of it (on_session rules only).
     sessions_seen: Mapping[str, SessionSeen] = field(default_factory=dict)
     # Tickets forgotten after DROP_AFTER_UNSEEN, so a return gets a new seq.
@@ -368,6 +431,10 @@ class Snapshot:
         """Tickets the latest search returned — the ones a lane should draw."""
         return {key: t for key, t in self.tickets.items() if t.on_board}
 
+    def prs_for(self, key: str) -> tuple[PrState, ...]:
+        """``key``'s pull requests as last observed (empty when none, or unknown)."""
+        return tuple(self.prs.get((key or "").strip().upper(), ()))
+
     def to_json(self) -> str:
         payload = {
             "schema_version": self.schema_version,
@@ -378,6 +445,9 @@ class Snapshot:
             "tickets": {key: t.to_dict() for key, t in sorted(self.tickets.items())},
             "pr_checked_at": self.pr_checked_at,
             "prs": {key: [pr.to_dict() for pr in found] for key, found in sorted(self.prs.items())},
+            "pr_repos": dict(sorted(self.pr_repos.items())),
+            "flagged_field": self.flagged_field,
+            "flagged_for": self.flagged_for,
             "sessions_seen": {
                 sid: seen.to_dict() for sid, seen in sorted(self.sessions_seen.items())
             },
@@ -402,6 +472,12 @@ class Snapshot:
                 found = _prs_from(value)
                 if isinstance(key, str) and key and found is not None:
                     prs[key] = found
+        raw_repos = data.get("pr_repos")
+        pr_repos: dict[str, str] = {}
+        if isinstance(raw_repos, dict):
+            for key, value in raw_repos.items():
+                if isinstance(key, str) and key and isinstance(value, str):
+                    pr_repos[key] = value
         raw_sessions = data.get("sessions_seen")
         sessions: dict[str, SessionSeen] = {}
         if isinstance(raw_sessions, dict):
@@ -426,6 +502,9 @@ class Snapshot:
             myself_for=as_str(data.get("myself_for")),
             pr_checked_at=as_str(data.get("pr_checked_at")),
             prs=prs,
+            pr_repos=pr_repos,
+            flagged_field=as_str(data.get("flagged_field")),
+            flagged_for=as_str(data.get("flagged_for")),
             sessions_seen=sessions,
             dropped=dropped,
             scope=as_str(data.get("scope")),
@@ -484,12 +563,14 @@ def board_scope(board: BoardSettings) -> str:
     return hashlib.sha256(board.search_jql().encode()).hexdigest()[:12]
 
 
-def fetch(board: BoardSettings, *, search: Search | None = None) -> list[Issue] | None:
+def fetch(
+    board: BoardSettings, *, search: Search | None = None, flagged_field: str = ""
+) -> list[Issue] | None:
     """Every ticket on the board, or None when the search failed. Blocking."""
     if not board.projects:
         return None
     run = search or jira_api.search
-    return run(board.search_jql(), SEARCH_FIELDS)
+    return run(board.search_jql(), search_fields(flagged_field))
 
 
 def advance(
@@ -517,6 +598,11 @@ def advance(
     transitions: list[Transition] = []
     seen: set[str] = set()
 
+    # A ticket seen for the first time (or carried over from a snapshot
+    # written before entered_at existed) borrows Jira's category-change date.
+    def estimated(issue: Issue) -> dict[str, Any]:
+        return {"entered_at": issue.status_changed_at, "entered_estimated": True}
+
     for issue in issues:
         key = issue.key.strip().upper()
         if not key or key in seen:
@@ -541,10 +627,10 @@ def advance(
             ):
                 # Back in the status it was dropped in: the same visit, so no
                 # transition, and nothing fires a second time for it.
-                tickets[key] = replace(fresh, seq=tomb.seq)
+                tickets[key] = replace(fresh, seq=tomb.seq, **estimated(issue))
                 continue
             seq = tomb.seq + 1 if tomb is not None else floor.get(key, 0)
-            tickets[key] = replace(fresh, seq=seq)
+            tickets[key] = replace(fresh, seq=seq, **estimated(issue))
             if previous is not None:
                 transitions.append(
                     Transition(
@@ -560,7 +646,14 @@ def advance(
             continue
         if fresh.status_identity != old.status_identity:
             seq = old.seq + 1
-            tickets[key] = replace(fresh, seq=seq)
+            tickets[key] = replace(
+                fresh,
+                seq=seq,
+                entered_at=stamp,
+                entered_estimated=False,
+                from_status=old.status,
+                from_status_id=old.status_id,
+            )
             transitions.append(
                 Transition(
                     key=key,
@@ -572,14 +665,29 @@ def advance(
                 )
             )
         else:
-            tickets[key] = replace(fresh, seq=old.seq)
+            entered = (
+                {"entered_at": old.entered_at, "entered_estimated": old.entered_estimated}
+                if old.entered_at
+                else estimated(issue)
+            )
+            tickets[key] = replace(
+                fresh,
+                seq=old.seq,
+                from_status=old.from_status,
+                from_status_id=old.from_status_id,
+                **entered,
+            )
 
     for key, old in before.items():
         if key in seen:
             continue
-        unseen = old.unseen_ticks + 1
-        if unseen <= DROP_AFTER_UNSEEN:
-            tickets[key] = replace(old, unseen_ticks=unseen)
+        # The clock starts at the first search that missed it. A snapshot
+        # written before unseen_since existed starts it now: late, never early.
+        since = old.unseen_since or stamp
+        missing = parse_iso(since)
+        gone_for = (moment - missing).total_seconds() if missing is not None else 0.0
+        if gone_for <= DROP_AFTER_UNSEEN_SEC:
+            tickets[key] = replace(old, unseen_ticks=old.unseen_ticks + 1, unseen_since=since)
         else:
             dropped[key] = DroppedTicket(
                 seq=old.seq, dropped_at=stamp, status=old.status, status_id=old.status_id
@@ -628,6 +736,9 @@ class RefreshResult:
     status: RefreshStatus
     snapshot: Snapshot | None = None
     transitions: tuple[Transition, ...] = ()
+    # What went wrong, in more words than the status ("HTTP 401: …", "rate
+    # limited until 12:04"). Replaces the stock message when it is set.
+    detail: str = ""
 
     @property
     def ok(self) -> bool:
@@ -635,6 +746,8 @@ class RefreshResult:
 
     @property
     def message(self) -> str:
+        if self.detail and self.status is not RefreshStatus.OK:
+            return self.detail
         if self.status is RefreshStatus.OK:
             count = len(self.snapshot.on_board()) if self.snapshot else 0
             moved = len(self.transitions)

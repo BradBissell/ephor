@@ -16,12 +16,19 @@ After the claim, the run moves through a small state machine::
 
     awaiting_confirm ──approve──► claimed ──► launched ──► done | failed
           │                         │  ▲
-          ├─deny──► denied          ▼  │ (retried while the generation is current)
+          ├─deny──► denied          ▼  │ (retried, with backoff, while the generation is current)
           └─ttl / ticket moved──► expired      blocked
                                     │
-          generation moved on, or the flow was edited ──► superseded
+          generation moved on, or the flow was edited ──► expired
           held (claimed / blocked) past confirm_ttl ──► expired
+          queued (blocked on max_active_agents) past queue_ttl ──► expired
           too many attempts, or an agent attempt unaccounted for ──► stuck
+          stuck / failed / expired ──``ephor flows retry``──► awaiting_confirm
+
+There is one "it no longer applies" state, ``expired``, whatever the cause:
+the confirmation window ran out, the ticket moved on, or the flow was edited.
+The reason says which. (Older files may say ``superseded``, the name the
+second half of that once had; they load as ``expired`` with their reason.)
 
 Every change after the claim is a **compare-and-set** under the
 ``runs/.lock`` sidecar: the file is re-read under the lock, its state checked
@@ -61,11 +68,14 @@ PAUSED_FILE = "paused"
 RUN_SCHEMA_VERSION = 1
 
 # A launch that began (attempts was bumped) but never reported a pane is
-# retried after this long, up to MAX_ATTEMPTS times, and then marked stuck.
-# Ten minutes is long enough that a slow `git worktree add` is not mistaken
-# for a crash, and the launch guard's own window is the same length.
+# retried after this long, and then marked stuck once MAX_ATTEMPTS have been
+# made. Ten minutes is long enough that a slow `git worktree add` is not
+# mistaken for a crash, and the launch guard's own window is the same length.
+# A launch that *failed* (tmux said no) is retried with an exponential
+# backoff instead (ephor.flows.tick.retry_delay): 1, 2, 4 and 8 minutes, so
+# five attempts span a quarter of an hour of tmux being down.
 CLAIM_TIMEOUT_SEC = 10 * 60.0
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 5
 # How long an update waits for runs/.lock. Every holder does a read and a
 # rename; a quarter of a second already means something is wedged. The tick
 # (a worker, a CLI, a timer) can afford to wait a little longer than that.
@@ -91,8 +101,11 @@ class RunState(StrEnum):
     FAILED = "failed"
     DENIED = "denied"
     EXPIRED = "expired"
-    SUPERSEDED = "superseded"
     STUCK = "stuck"
+
+
+# A state an older ephor wrote, read as the state that replaced it.
+_LEGACY_STATES = {"superseded": RunState.EXPIRED}
 
 
 # States a run never leaves. Stuck is among them: it is the tick giving up,
@@ -103,10 +116,13 @@ TERMINAL_STATES = frozenset(
         RunState.FAILED,
         RunState.DENIED,
         RunState.EXPIRED,
-        RunState.SUPERSEDED,
         RunState.STUCK,
     }
 )
+# Terminal states a human may re-arm with ``ephor flows retry``: the ones
+# where the tick gave up, or the event aged out, rather than a person saying
+# no (denied) or the flow running to completion (done).
+RETRYABLE_STATES = frozenset({RunState.STUCK, RunState.FAILED, RunState.EXPIRED})
 # States the tick still has work to do on.
 PENDING_STATES = frozenset(
     {RunState.AWAITING_CONFIRM, RunState.CLAIMED, RunState.BLOCKED, RunState.LAUNCHED}
@@ -194,6 +210,22 @@ def session_generation(session_id: str) -> str:
     return "s" + hashlib.sha256((session_id or "").encode()).hexdigest()[:11]
 
 
+def idle_generation(session_id: str, idle_since: str) -> str:
+    """``<session token>-<spell>``: one idle spell of one session (``on_session = "idle"``).
+
+    The spell is named by when it began (the session's last hook event
+    before it went quiet), as digits: ``2026-10-20T12:00:05+00:00`` becomes
+    ``20261020120005``. A session that goes idle twice has two spells, and
+    an idle flow fires on each.
+    """
+    moment = parse_iso(idle_since)
+    if moment is not None:
+        spell = moment.astimezone(UTC).strftime("%Y%m%d%H%M%S")
+    else:
+        spell = "t" + hashlib.sha256((idle_since or "").encode()).hexdigest()[:10]
+    return f"{session_generation(session_id)}-{spell}"
+
+
 def make_run_id(ticket: str, flow: str, generation: str) -> str:
     return f"{ticket.upper()}.{flow}.{generation}"
 
@@ -241,12 +273,14 @@ class Run:
     pr_url: str = ""
     head_sha: str = ""
     session_id: str = ""
+    # on_session = "idle": the start of the idle spell it fired on.
+    idle_since: str = ""
     # When a human approved it ("" for a run that never waited for one). A
     # start= run must carry it to launch, and an approved run that is held
     # past confirm_ttl counts its age from here.
     approved_at: str = ""
     # What the rule ran when this run was created (FlowRule.action_fingerprint).
-    # A run whose rule now runs something else is superseded rather than
+    # A run whose rule now runs something else is expired rather than
     # launched: an approval is for the thing that was shown, not whatever
     # board.toml says at dispatch time.
     action: str = ""
@@ -257,6 +291,17 @@ class Run:
     # The tmux server (pid.start_time) the run's pane belongs to. Pane ids
     # restart at %0 with a new server, so a pane id alone outlives its pane.
     tmux_server: str = ""
+    # When the latest launch attempt began. ``launched_at`` is only stamped
+    # when a window actually opened — it is what the hourly caps count — so
+    # an attempt that failed (tmux down) costs the caps nothing, and this is
+    # what "a launch is in progress" and the retry backoff are timed from.
+    attempt_at: str = ""
+    # A failed attempt is not retried before this (exponential backoff).
+    retry_at: str = ""
+    # How many times a human re-armed it with ``ephor flows retry``, and when
+    # it last was: a re-armed run's confirm_ttl counts from then.
+    retries: int = 0
+    rearmed_at: str = ""
     schema_version: int = RUN_SCHEMA_VERSION
 
     @property
@@ -288,8 +333,9 @@ class Run:
         run_id = data.get("run_id")
         if not isinstance(run_id, str) or not valid_run_id(run_id):
             return None
+        raw_state = str(data.get("state"))
         try:
-            state = RunState(str(data.get("state")))
+            state = _LEGACY_STATES.get(raw_state) or RunState(raw_state)
         except ValueError:
             return None
         exit_code = data.get("exit_code")
@@ -324,10 +370,15 @@ class Run:
             pr_url=as_str(data.get("pr_url")),
             head_sha=as_str(data.get("head_sha")),
             session_id=as_str(data.get("session_id")),
+            idle_since=as_str(data.get("idle_since")),
             approved_at=as_str(data.get("approved_at")),
             action=as_str(data.get("action")),
             block_key=as_str(data.get("block_key")),
             tmux_server=as_str(data.get("tmux_server")),
+            attempt_at=as_str(data.get("attempt_at")),
+            retry_at=as_str(data.get("retry_at")),
+            retries=as_int(data.get("retries")),
+            rearmed_at=as_str(data.get("rearmed_at")),
             schema_version=as_int(data.get("schema_version")) or RUN_SCHEMA_VERSION,
         )
 
@@ -353,6 +404,25 @@ def run_path(run_id: str) -> Path:
 
 def exit_path(run_id: str) -> Path:
     return runs_dir() / f"{run_id}.exit"
+
+
+def log_path(run_id: str) -> Path:
+    """Where a ``command =`` flow's wrapper tees its stdout and stderr (appended per attempt)."""
+    return runs_dir() / f"{run_id}.log"
+
+
+def read_log_tail(run_id: str, lines: int = 20, max_bytes: int = 64 * 1024) -> list[str] | None:
+    """The last ``lines`` lines of the run's output log, or None when it has none."""
+    try:
+        with log_path(run_id).open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+    except OSError:
+        return None
+    text = data.decode(errors="replace")
+    return text.splitlines()[-lines:] if lines > 0 else []
 
 
 def exit_tmp_path(run_id: str) -> Path:
@@ -383,6 +453,16 @@ def _write_tmp(directory: Path, text: str, prefix: str) -> Path:
         Path(tmp).unlink(missing_ok=True)
         raise
     return Path(tmp)
+
+
+def write_atomic(target: Path, text: str) -> bool:
+    """Write ``text`` to ``target`` (0600) by atomic rename. False when the disk says no."""
+    try:
+        tmp = _write_tmp(target.parent, text, f".tmp.{target.name}.")
+        os.replace(tmp, target)
+    except OSError:
+        return False
+    return True
 
 
 def create(run: Run) -> bool:
@@ -553,6 +633,7 @@ def approve(
     )
     if updated is None:
         return None, _refusal(run_id, "approve")
+    log_event(eventlog.EventKind.FLOW_APPROVED, updated, "approved")
     return updated, f"approved {run_id} — the next tick dispatches it"
 
 
@@ -569,6 +650,48 @@ def deny(run_id: str, *, lock_timeout: float | None = None) -> tuple[Run | None,
         return None, _refusal(run_id, "deny")
     log_event(eventlog.EventKind.FLOW_CANCELLED, updated, "denied")
     return updated, f"denied {run_id}"
+
+
+def retry(
+    run_id: str, *, now: datetime | None = None, lock_timeout: float | None = None
+) -> tuple[Run | None, str]:
+    """Re-arm a stuck, failed or expired run: back to ``awaiting_confirm``, attempts reset.
+
+    It waits for a yes like any new run, and the tick still judges it: if
+    the event that fired it is over (the ticket moved on, the PR closed) or
+    its flow has since been edited, it expires again on the next tick, with
+    the reason. Its confirm_ttl counts from now. The approval it may once
+    have had is dropped — a retry is a new question.
+    """
+    moment = now or _now()
+    current = load(run_id)
+    updated = update(
+        run_id,
+        expect=RETRYABLE_STATES,
+        now=moment,
+        lock_timeout=lock_timeout,
+        state=RunState.AWAITING_CONFIRM,
+        reason=f"re-armed (was {current.state}: {current.reason})"[:200]
+        if current is not None
+        else "re-armed",
+        attempts=0,
+        retry_at="",
+        approved_at="",
+        block_key="",
+        exit_code=None,
+        retries=(current.retries + 1) if current is not None else 1,
+        rearmed_at=iso(moment),
+    )
+    if updated is None:
+        if current is None:
+            return None, f"cannot retry {run_id}: no such run"
+        if current.state not in RETRYABLE_STATES:
+            allowed = ", ".join(sorted(str(s) for s in RETRYABLE_STATES))
+            return None, f"cannot retry {run_id}: it is {current.state} (only {allowed} retry)"
+        return None, f"cannot retry {run_id}: the run files are busy — try again"
+    clear_exit(run_id)
+    log_event(eventlog.EventKind.FLOW_REARMED, updated, "re-armed by ephor flows retry")
+    return updated, f"re-armed {run_id} — it is awaiting confirmation again"
 
 
 def _refusal(run_id: str, verb: str) -> str:
@@ -674,6 +797,8 @@ def prune(now: datetime | None = None, max_age_days: float = PRUNE_AFTER_DAYS) -
             exit_path(run.run_id).unlink(missing_ok=True)
         with contextlib.suppress(OSError):
             payload_path(run.run_id).unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            log_path(run.run_id).unlink(missing_ok=True)
     return removed
 
 
@@ -694,12 +819,54 @@ _BADGE_PRIORITY = {
 }
 
 
+# --- the agent queue --------------------------------------------------------------------
+
+# The block_key of a run held only because every agent slot is taken
+# (``max_active_agents``). Such a run is queued, not blocked: it waits its
+# turn, first approved first launched, and ages out after ``queue_ttl``
+# rather than ``confirm_ttl``.
+QUEUED_KEY = "queued"
+
+
+def is_queued(run: Run) -> bool:
+    """True when ``run`` is waiting for an agent slot."""
+    return run.state is RunState.BLOCKED and run.block_key == QUEUED_KEY
+
+
+def queue_key(run: Run) -> tuple[str, str]:
+    """Where ``run`` stands in line: approved first goes first (created, for auto runs)."""
+    return (run.approved_at or run.created_at, run.run_id)
+
+
+def queue(all_runs: Iterable[Run]) -> list[Run]:
+    """The queued runs, in the order they will launch."""
+    return sorted((r for r in all_runs if is_queued(r)), key=queue_key)
+
+
+def queue_positions(all_runs: Iterable[Run]) -> dict[str, int]:
+    """run_id -> 1-based place in the agent queue, for the queued runs."""
+    return {r.run_id: n for n, r in enumerate(queue(all_runs), start=1)}
+
+
+# What each badge glyph means, in the order a legend should list them.
+BADGE_LEGEND: tuple[tuple[str, str], ...] = (
+    ("⏸", "awaiting your confirmation (approve / deny)"),
+    ("…", "approved, dispatching on the next tick"),
+    ("⧗", "queued: waiting for a free agent slot (max_active_agents)"),
+    ("⊘", "blocked by a guard; retried while its event holds"),
+    ("▶", "launched: its window is running"),
+    ("⚠", "stuck: the tick gave up (ephor flows retry)"),
+)
+
+
 def badge(run: Run) -> str:
     """The short label a row shows for ``run`` (``⏸ review?``, ``▶ review`` …)."""
     if run.state is RunState.AWAITING_CONFIRM:
         return f"⏸ {run.flow}?" + (" (stale)" if run.stale else "")
     if run.state is RunState.CLAIMED:
         return f"… {run.flow}"
+    if is_queued(run):
+        return f"⧗ {run.flow}"
     if run.state is RunState.BLOCKED:
         return f"⊘ {run.flow}"
     if run.state is RunState.LAUNCHED:

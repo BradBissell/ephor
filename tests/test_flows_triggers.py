@@ -9,16 +9,27 @@ import pytest
 
 from ephor import board
 from ephor.board import Trigger
+from ephor.constants import CiState
 from ephor.flows import runs, triggers
 from ephor.flows.snapshot import PrState, SessionSeen, Snapshot, TicketState
-from ephor.github import PullRequest
+from ephor.github import PullRequest, RepoPrs
 from ephor.state.models import AgentState, Notification
 
 T0 = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
 
 
-def _gh(number: int, state: str = "OPEN") -> PullRequest:
-    return PullRequest(number=number, url=f"u{number}", state=state, head_sha=f"sha{number}")
+def _gh(number: int, state: str = "OPEN", *, ticket: str = "") -> PullRequest:
+    return PullRequest(
+        number=number,
+        url=f"u{number}",
+        state=state,
+        head_sha=f"sha{number}",
+        head_ref=f"feature/{ticket}-x" if ticket else "",
+    )
+
+
+def _listing(*prs: PullRequest, complete: bool = True) -> RepoPrs:
+    return RepoPrs(prs=prs, complete=complete)
 
 
 # --- generations -------------------------------------------------------------------
@@ -57,45 +68,156 @@ def test_pr_events_name_new_opens_reopens_and_merges() -> None:
         PrState(3, "MERGED"),  # merged
         PrState(4, "MERGED"),  # still merged
         PrState(5, "OPEN"),  # new
-        PrState(6, "MERGED"),  # opened and merged between two lookups
+        PrState(6, "MERGED"),  # never seen open: history, not an event
         PrState(7, "CLOSED"),  # opened and abandoned between two lookups
     )
     found = [(e.generation, e.value) for e in triggers.pr_events("DR-1", before, after)]
-    assert found == [("pr2", "opened"), ("pr3", "merged"), ("pr5", "opened"), ("pr6", "merged")]
+    assert found == [("pr2", "opened"), ("pr3", "merged"), ("pr5", "opened")]
     assert all(e.trigger is Trigger.ON_PR for e in triggers.pr_events("DR-1", before, after))
+
+
+def test_merged_fires_only_for_a_pr_last_seen_open() -> None:
+    """Regression (B1): a closed PR, or one first seen merged, never fires merged."""
+    before = (PrState(1, "CLOSED"), PrState(2, "OPEN"))
+    after = (PrState(1, "MERGED"), PrState(2, "MERGED"), PrState(3, "MERGED"))
+    found = [(e.generation, e.value) for e in triggers.pr_events("DR-1", before, after)]
+    assert found == [("pr2", "merged")]
+
+
+def test_a_new_pr_from_a_per_ticket_search_is_not_an_opening() -> None:
+    found = triggers.pr_events("DR-1", (), (PrState(5, "OPEN"),), new_may_open=False)
+    assert found == []
+
+
+def _repo_per_ticket(root: Path) -> triggers.RepoFor:
+    def repo_for(key: str) -> Path:
+        path = root / key
+        path.mkdir(exist_ok=True)
+        return path
+
+    return repo_for
 
 
 def test_observe_prs_baselines_keeps_unknowns_and_drops_departed_tickets(tmp_path: Path) -> None:
     tickets = {k: TicketState(status="In Progress") for k in ("DR-1", "DR-2", "DR-3", "DR-4")}
+    repo_for = _repo_per_ticket(tmp_path)
     previous = {
         "DR-1": (PrState(1, "OPEN"),),
         "DR-2": (PrState(2, "OPEN"),),
         "DR-9": (PrState(9, "OPEN"),),  # no longer in the snapshot
     }
-    answers: dict[str, list[PullRequest] | None] = {
-        "DR-1": [_gh(1, "MERGED")],
+    repos = {key: str(tmp_path / key) for key in ("DR-1", "DR-2", "DR-9")}
+    answers: dict[str, RepoPrs | None] = {
+        "DR-1": _listing(_gh(1, "MERGED", ticket="DR-1")),
         "DR-2": None,  # gh did not answer
-        "DR-3": [_gh(3)],  # first look: baseline
+        "DR-3": _listing(_gh(3, ticket="DR-3")),  # first look: baseline
     }
 
-    def find(repo: Path, key: str) -> list[PullRequest] | None:
-        if key == "DR-4":
+    def list_prs(repo: Path) -> RepoPrs | None:
+        if repo.name == "DR-4":
             raise RuntimeError("boom")
-        return answers[key]
+        return answers[repo.name]
 
-    observed, events = triggers.observe_prs(
+    seen = triggers.observe_prs(
         previous,
         ["DR-1", "DR-2", "DR-3", "DR-4"],
         tickets=tickets,
-        repo_for=lambda key: tmp_path,
-        find=find,
+        repo_for=repo_for,
+        list_prs=list_prs,
+        find=lambda repo, key: None,
+        previous_repos=repos,
     )
-    assert observed == {
+    assert seen.prs == {
         "DR-1": (PrState(1, "MERGED", "sha1", "u1"),),
         "DR-2": (PrState(2, "OPEN"),),
         "DR-3": (PrState(3, "OPEN", "sha3", "u3"),),
     }
-    assert [(e.key, e.value) for e in events] == [("DR-1", "merged")]
+    assert seen.repos == {key: str(tmp_path / key) for key in ("DR-1", "DR-2", "DR-3")}
+    assert [(e.key, e.value) for e in seen.events] == [("DR-1", "merged")]
+
+
+def test_one_listing_per_repo_answers_every_ticket_in_it(tmp_path: Path) -> None:
+    calls: list[Path] = []
+
+    def list_prs(repo: Path) -> RepoPrs:
+        calls.append(repo)
+        rollup = PullRequest(
+            number=8, url="u8", state="OPEN", head_ref="bb/DR-2-y", ci=CiState.FAILING
+        )
+        return _listing(_gh(7, ticket="DR-1"), rollup, _gh(9, ticket="DR-12"))
+
+    tickets = {k: TicketState() for k in ("DR-1", "DR-2", "DR-3")}
+    seen = triggers.observe_prs(
+        {},
+        ["DR-1", "DR-2", "DR-3"],
+        tickets=tickets,
+        repo_for=lambda key: tmp_path,
+        list_prs=list_prs,
+        find=lambda repo, key: pytest.fail("no per-ticket search for a complete listing"),
+    )
+    assert calls == [tmp_path]
+    assert {k: [p.number for p in v] for k, v in seen.prs.items()} == {
+        "DR-1": [7],
+        "DR-2": [8],
+        "DR-3": [],
+    }
+    assert seen.prs["DR-2"][0].ci == "fail"
+
+
+def test_a_repo_change_rebaselines_silently(tmp_path: Path) -> None:
+    """Regression (B1): a worktree appearing made every PR in it fire."""
+    tickets = {"DR-1": TicketState()}
+    old = tmp_path / "root"
+    new = tmp_path / "worktree"
+    previous = {"DR-1": (PrState(1, "OPEN"),)}
+    seen = triggers.observe_prs(
+        previous,
+        ["DR-1"],
+        tickets=tickets,
+        repo_for=lambda key: new,
+        list_prs=lambda repo: _listing(
+            _gh(1, "MERGED", ticket="DR-1"), _gh(2, "OPEN", ticket="DR-1")
+        ),
+        find=lambda repo, key: None,
+        previous_repos={"DR-1": str(old)},
+    )
+    assert seen.events == []
+    assert seen.repos == {"DR-1": str(new)}
+    assert [p.number for p in seen.prs["DR-1"]] == [1, 2]
+    # A snapshot from before pr_repos existed re-baselines too.
+    again = triggers.observe_prs(
+        previous,
+        ["DR-1"],
+        tickets=tickets,
+        repo_for=lambda key: new,
+        list_prs=lambda repo: _listing(_gh(1, "MERGED", ticket="DR-1")),
+        find=lambda repo, key: None,
+    )
+    assert again.events == []
+
+
+def test_a_pr_aged_off_a_full_listing_is_asked_about_alone(tmp_path: Path) -> None:
+    tickets = {"DR-1": TicketState(), "DR-2": TicketState()}
+    asked: list[str] = []
+
+    def find(repo: Path, key: str) -> list[PullRequest]:
+        asked.append(key)
+        return [_gh(1, "MERGED", ticket="DR-1"), _gh(3, "OPEN", ticket="DR-1")]
+
+    seen = triggers.observe_prs(
+        {"DR-1": (PrState(1, "OPEN"),), "DR-2": ()},
+        ["DR-1", "DR-2"],
+        tickets=tickets,
+        repo_for=lambda key: tmp_path,
+        list_prs=lambda repo: _listing(_gh(50, ticket="DR-9"), complete=False),
+        find=find,
+        previous_repos={"DR-1": str(tmp_path), "DR-2": str(tmp_path)},
+    )
+    assert asked == ["DR-1"]  # DR-2 had nothing to age off
+    # The merge of the PR it had seen open fires; the old PR the search newly
+    # turned up (#3) is a baseline, not an opening.
+    assert [(e.key, e.value, e.generation) for e in seen.events] == [("DR-1", "merged", "pr1")]
+    assert seen.prs["DR-2"] == ()
 
 
 def test_a_ticket_that_leaves_the_lookup_is_rebaselined_when_it_returns(tmp_path: Path) -> None:
@@ -103,39 +225,40 @@ def test_a_ticket_that_leaves_the_lookup_is_rebaselined_when_it_returns(tmp_path
     # keys) while a teammate opens and merges #40; then it comes back. The
     # merge happened while ephor was not looking: a baseline, not an event.
     tickets = {"DR-5": TicketState(status="In Progress"), "DR-6": TicketState()}
-    answers: dict[str, list[PullRequest] | None] = {"DR-5": [], "DR-6": []}
+    listing = _listing()
 
-    def observe(
-        previous: dict[str, tuple[PrState, ...]], keys: list[str]
-    ) -> tuple[dict[str, tuple[PrState, ...]], list[triggers.TriggerEvent]]:
+    def observe(previous: triggers.PrObservation | None, keys: list[str]) -> triggers.PrObservation:
         return triggers.observe_prs(
-            previous,
+            previous.prs if previous else {},
             iter(keys),  # an iterable consumed once, as the tick passes it
             tickets=tickets,
             repo_for=lambda key: tmp_path,
-            find=lambda repo, key: answers[key],
+            list_prs=lambda repo: listing,
+            find=lambda repo, key: None,
+            previous_repos=previous.repos if previous else {},
         )
 
-    observed, events = observe({}, ["DR-5", "DR-6"])
-    assert observed == {"DR-5": (), "DR-6": ()} and events == []
-    observed, events = observe(observed, ["DR-6"])
-    assert "DR-5" not in observed and events == []
-    answers["DR-5"] = [_gh(40, "MERGED")]
-    observed, events = observe(observed, ["DR-5", "DR-6"])
-    assert events == []
-    assert observed["DR-5"] == (PrState(40, "MERGED", "sha40", "u40"),)
+    seen = observe(None, ["DR-5", "DR-6"])
+    assert seen.prs == {"DR-5": (), "DR-6": ()} and seen.events == []
+    seen = observe(seen, ["DR-6"])
+    assert "DR-5" not in seen.prs and seen.events == []
+    listing = _listing(_gh(40, "OPEN", ticket="DR-5"))
+    seen = observe(seen, ["DR-5", "DR-6"])
+    assert seen.events == []
+    assert seen.prs["DR-5"] == (PrState(40, "OPEN", "sha40", "u40"),)
 
 
 def test_observe_prs_skips_tickets_with_no_repo() -> None:
-    calls: list[str] = []
-    observed, events = triggers.observe_prs(
+    calls: list[Path] = []
+    seen = triggers.observe_prs(
         {},
         ["DR-1"],
         tickets={"DR-1": TicketState()},
         repo_for=lambda key: None,
-        find=lambda repo, key: calls.append(key) or [],
+        list_prs=lambda repo: calls.append(repo) or _listing(),
+        find=lambda repo, key: None,
     )
-    assert (observed, events, calls) == ({}, [], [])
+    assert (seen.prs, seen.events, calls) == ({}, [], [])
 
 
 def _rule(**extra: object) -> board.FlowRule:

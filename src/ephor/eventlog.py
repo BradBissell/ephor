@@ -61,12 +61,21 @@ class EventKind(StrEnum):
     NOTIFIED = "notified"
     # Written by the flows tick (ephor.flows). A transition is a Jira status
     # change the tick observed between two snapshots; the FLOW_* kinds trace a
-    # run (extra: run_id, flow, generation, reason) from dispatch to its end.
+    # run (extra: run_id, flow, generation, reason, state) from the event that
+    # created it to its end: created → approved → dispatched (a window
+    # opened) → finished (done / failed), or blocked on the way, or ended as
+    # expired (it no longer applies), stuck (the tick gave up) or cancelled
+    # (denied). Rearmed is `ephor flows retry` putting it back to awaiting.
     TICKET_TRANSITIONED = "ticket_transitioned"
+    FLOW_CREATED = "flow_created"
+    FLOW_APPROVED = "flow_approved"
     FLOW_DISPATCHED = "flow_dispatched"
     FLOW_BLOCKED = "flow_blocked"
     FLOW_FINISHED = "flow_finished"
     FLOW_CANCELLED = "flow_cancelled"
+    FLOW_EXPIRED = "flow_expired"
+    FLOW_STUCK = "flow_stuck"
+    FLOW_REARMED = "flow_rearmed"
 
 
 @dataclass(frozen=True)

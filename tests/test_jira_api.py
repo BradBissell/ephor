@@ -338,3 +338,107 @@ def test_request_returns_none_on_any_failure_reading_the_body(
     assert jira_api.search("project = DR") is None
     assert jira_api.myself() is None
     assert jira_api.fetch_fresh("DR-1") is None
+
+
+# --- failure detail, Retry-After, Flagged -----------------------------------------------
+
+
+def _http_error(code: int, body: bytes, headers: dict[str, str] | None = None) -> object:
+    import email.message
+    import io
+
+    message = email.message.Message()
+    for name, value in (headers or {}).items():
+        message[name] = value
+
+    def failing(request, timeout):
+        raise jira_api.urllib.error.HTTPError(
+            request.full_url, code, "Bad Request", message, io.BytesIO(body)
+        )
+
+    return failing
+
+
+def test_a_failed_search_keeps_the_status_and_jiras_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+    body = b'{"errorMessages": ["Field \'Reviewer\' does not exist or you do not have permission"]}'
+    monkeypatch.setattr(jira_api.urllib.request, "urlopen", _http_error(400, body))
+    assert jira_api.search("Reviewer = currentUser()") is None
+    error = jira_api.last_error()
+    assert error is not None and error.status == 400
+    assert (
+        error.summary == "HTTP 400: Field 'Reviewer' does not exist or you do not have permission"
+    )
+    assert error.retry_after is None
+
+
+def test_a_429_carries_its_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch)
+    monkeypatch.setattr(
+        jira_api.urllib.request, "urlopen", _http_error(429, b"", {"Retry-After": "120"})
+    )
+    assert jira_api.search("x") is None
+    error = jira_api.last_error()
+    assert error is not None and (error.status, error.retry_after) == (429, 120.0)
+    assert error.summary.startswith("HTTP 429")
+
+
+def test_a_success_clears_the_last_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch)
+    monkeypatch.setattr(jira_api.urllib.request, "urlopen", _http_error(500, b"oops"))
+    assert jira_api.search("x") is None
+    assert jira_api.last_error() is not None
+    monkeypatch.setattr(
+        jira_api.urllib.request,
+        "urlopen",
+        lambda request, timeout: _FakeResponse(b'{"issues": [], "isLast": true}'),
+    )
+    assert jira_api.search("x") == []
+    assert jira_api.last_error() is None
+
+
+def test_retry_after_reads_seconds_or_an_http_date() -> None:
+    assert jira_api._retry_after("30") == 30.0
+    assert jira_api._retry_after("") is None
+    assert jira_api._retry_after("soon") is None
+    assert jira_api._retry_after("Wed, 21 Oct 2015 07:28:00 GMT") == 0.0  # in the past
+
+
+def test_flagged_field_is_found_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch)
+    fields = [
+        {"id": "summary", "name": "Summary"},
+        {"id": "customfield_10021", "name": "Flagged"},
+    ]
+    monkeypatch.setattr(jira_api, "_request", lambda creds, path, body=None: fields)
+    assert jira_api.flagged_field_id() == "customfield_10021"
+    monkeypatch.setattr(jira_api, "_request", lambda creds, path, body=None: fields[:1])
+    assert jira_api.flagged_field_id() == ""  # the site has none: an answer
+    monkeypatch.setattr(jira_api, "_request", lambda creds, path, body=None: None)
+    assert jira_api.flagged_field_id() is None  # unknown: ask again later
+
+
+def test_search_reads_the_category_change_date_and_the_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+    page = {
+        "isLast": True,
+        "issues": [
+            {
+                "key": "DR-1",
+                "fields": {
+                    "status": {"name": "Peer Review", "id": "10"},
+                    "statuscategorychangedate": "2026-10-19T09:30:00.000-0400",
+                    "customfield_10021": [{"value": "Impediment"}],
+                },
+            },
+            {"key": "DR-2", "fields": {"status": {"name": "QA"}, "customfield_10021": None}},
+        ],
+    }
+    monkeypatch.setattr(jira_api, "_request", lambda creds, path, body=None: page)
+    one, two = jira_api.search("x", flagged_field="customfield_10021") or []
+    assert (one.status_changed_at, one.flagged) == ("2026-10-19T13:30:00+00:00", True)
+    assert (two.status_changed_at, two.flagged) == ("", False)

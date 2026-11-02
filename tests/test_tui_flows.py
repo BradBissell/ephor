@@ -247,7 +247,9 @@ async def test_y_while_the_run_files_are_busy_says_so_instead_of_freezing(
 
 
 @pytest.mark.asyncio
-async def test_f_then_n_denies_without_a_tick(fleet: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_f_then_n_n_denies_without_a_tick(
+    fleet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     app = EphorApp(manager=StateManager(fleet))
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -256,7 +258,13 @@ async def test_f_then_n_denies_without_a_tick(fleet: Path, monkeypatch: pytest.M
         monkeypatch.setattr(app, "_refresh_board", lambda: ticks.append(True))
         await pilot.press("f")
         await pilot.pause()
-        await pilot.press("n")
+        await pilot.press("n")  # deny moved off n: this only says so
+        await pilot.press("N")  # arms
+        await pilot.pause()
+        stored = runs.load("DR-3.review.10-1")
+        assert stored is not None and stored.state is RunState.AWAITING_CONFIRM
+        assert "press N again" in str(app.screen.query_one("#flows-status").render())
+        await pilot.press("N")
         await pilot.pause()
         stored = runs.load("DR-3.review.10-1")
         assert stored is not None and stored.state is RunState.DENIED
@@ -287,7 +295,7 @@ async def test_an_approve_during_a_tick_queues_another(
         await pilot.pause()
         await app.workers.wait_for_complete()
         started: list[bool] = []
-        monkeypatch.setattr(app, "_board_worker", lambda: started.append(True))
+        monkeypatch.setattr(app, "_board_worker", lambda force=False: started.append(True))
         app._refresh_board()
         assert started == [True]
         app._request_tick()  # one is in flight: queued, not started
@@ -456,3 +464,133 @@ async def test_status_grouping_without_a_board_says_where_to_look(tmp_path: Path
         while app._group_by != "status":
             app.action_cycle_grouping()
         assert toasts[-1] == "grouping: status — no board.toml, default lanes (see docs/flows.md)"
+
+
+# --- board improvements: header cell, deny confirm, live list, detail panel ---------------
+
+
+def test_the_flows_cell_shows_blocked_and_stuck_and_any_badge() -> None:
+    summary = StatusSummary()
+    shown = _plain(format_header(summary, 1, flows_blocked=2, flows_stuck=1))
+    assert "FLOW? 1 ⊘2 ⚠1 (f)" in shown
+    # No run awaiting, but something on the board carries a badge: still shown.
+    assert "FLOWS (f)" in _plain(format_header(summary, flows_any=True))
+    assert "FLOWS ⊘1 (f)" in _plain(format_header(summary, flows_blocked=1))
+
+
+def test_lanes_count_runs_for_the_header() -> None:
+    lanes = Lanes(
+        LaneData(
+            runs=(
+                _run(),
+                _run("DR-1.a.1-0", RunState.BLOCKED),
+                _run("DR-2.a.1-0", RunState.STUCK),
+                _run("DR-4.a.1-0", RunState.LAUNCHED),
+                _run("DR-5.a.1-0", RunState.DONE),
+            )
+        )
+    )
+    assert lanes.flow_counts() == (1, 0, 1, 1, True)
+    assert Lanes(LaneData(runs=(_run("DR-5.a.1-0", RunState.DONE),))).flow_counts() == (
+        0,
+        0,
+        0,
+        0,
+        False,
+    )
+
+
+def _queued(run_id: str, approved: str) -> Run:
+    return _run(
+        run_id,
+        RunState.BLOCKED,
+        block_key=runs.QUEUED_KEY,
+        approved_at=approved,
+        reason="queued: 4/4 agent slots busy",
+    )
+
+
+def test_queued_runs_are_counted_and_shown_apart_from_blocked() -> None:
+    from ephor.tui.flows_screen import run_detail_markup, run_markup
+
+    first = _queued("DR-1.review.10-1", "2026-11-02T10:00:00+00:00")
+    second = _queued("DR-2.review.10-1", "2026-11-02T10:05:00+00:00")
+    lanes = Lanes(LaneData(runs=(second, first, _run("DR-3.a.1-0", RunState.BLOCKED))))
+    assert lanes.flow_counts() == (0, 2, 1, 0, True)
+    assert lanes.badge_for("DR-1") == "⧗ review"
+    header = _plain(format_header(StatusSummary.from_agents([]), flows_queued=2, flows_blocked=1))
+    assert "FLOWS ⧗2 ⊘1 (f)" in header
+    assert _plain(run_markup(first)).startswith("queued")
+    detail = _plain(run_detail_markup(second, None, None, runs.queue([second, first])))
+    assert "queued #2 of 2" in detail
+
+
+def test_run_detail_expands_the_rule_from_board_toml() -> None:
+    from ephor.tui.flows_screen import run_detail_markup
+
+    config = _health_config(
+        _BOARD + '\n[repos]\nDR = "/tmp"\n\n[[flow]]\nname = "review"\non_enter = "Peer Review"\n'
+        'start = "/review-pr {ticket}"\n'
+    )
+    assert not config.errors, config.errors
+    tickets = {"DR-3": TicketState(status="Peer Review", title="Three [x]")}
+    shown = _plain(run_detail_markup(_run(), config, tickets))
+    assert "DR-3 Three [x]" in shown
+    assert "flow review · on_enter Peer Review" in shown
+    assert "start = /review-pr DR-3" in shown
+    gone = _plain(run_detail_markup(_run("DR-3.gone.1-0"), config, tickets))
+    assert "flow gone is not in board.toml" in gone
+    assert "no run selected" in _plain(run_detail_markup(None))
+
+
+@pytest.mark.asyncio
+async def test_the_screen_shows_the_highlighted_runs_detail(fleet: Path) -> None:
+    app = EphorApp(manager=StateManager(fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.press("f")
+        await pilot.pause()
+        detail = app.screen.query_one("#flows-detail")
+        assert "DR-3" in str(detail.render())
+        await pilot.press("j")
+        await pilot.pause()
+        assert "DR-1" in str(detail.render()) and "notify" in str(detail.render())
+
+
+@pytest.mark.asyncio
+async def test_n_once_then_late_does_not_deny(fleet: Path) -> None:
+    app = EphorApp(manager=StateManager(fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.press("f")
+        await pilot.pause()
+        await pilot.press("N")
+        screen = app.screen
+        assert isinstance(screen, FlowsScreen)
+        screen._deny_armed_at -= 3.0  # past the window: the next press only re-arms
+        await pilot.press("N")
+        await pilot.pause()
+        stored = runs.load("DR-3.review.10-1")
+        assert stored is not None and stored.state is RunState.AWAITING_CONFIRM
+
+
+@pytest.mark.asyncio
+async def test_the_open_screen_picks_up_new_runs(fleet: Path) -> None:
+    app = EphorApp(manager=StateManager(fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.press("f")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, FlowsScreen)
+        assert runs.create(_run("DR-9.review.1-0", age=timedelta(minutes=30)))
+        screen._schedule_reload()
+        await app.workers.wait_for_complete()
+        await screen.workers.wait_for_complete()
+        await pilot.pause()
+        ids = [row.flow_run.run_id for row in screen._rows]
+        assert ids[0] == "DR-9.review.1-0"  # oldest awaiting first
+        assert "2 awaiting" in str(screen.query_one("#flows-title").render())

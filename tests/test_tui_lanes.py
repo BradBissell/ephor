@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from ephor.jira_api import Issue
 from ephor.state.manager import StateManager
 from ephor.tui import app as app_module
 from ephor.tui.app import EphorApp
-from ephor.tui.lanes import LaneData, Lanes, markup_text, ticket_row_markup
+from ephor.tui.lanes import LaneCounts, LaneData, Lanes, markup_text, ticket_row_markup
 from ephor.tui.rows import (
     group_key_of,
     group_row_id,
@@ -202,9 +203,10 @@ def test_ticket_row_markup_shows_ticket_text_verbatim(title: str) -> None:
     record = _ticket("To Do", title, assignee="Ann")
     plain = Content.from_markup(ticket_row_markup("DR-3", record)).plain
     assert title in plain
+    assert plain.index("AN ") < plain.index(title)  # the assignee's initials lead the title
     # A trailing backslash must not swallow the closing tag after it, so
-    # the assignee that follows the title still renders as itself.
-    assert plain.rstrip().endswith("Ann")
+    # the PR cell that follows the title still renders as itself.
+    assert plain.rstrip().endswith("—")
     assert "[/]" not in plain.replace(title, "")
 
 
@@ -224,7 +226,7 @@ def test_markup_text_is_inert_for_every_markup_shape() -> None:
 
 
 def test_lane_header_markup_escapes_the_lane_name() -> None:
-    header = _lanes({}).header_markup("Blocked [/] \\", [], 0, False)
+    header = _lanes({}).header_markup("Blocked [/] \\", LaneCounts(), False)
     assert "Blocked [/] \\" in Content.from_markup(header).plain
 
 
@@ -324,7 +326,7 @@ async def test_lane_headers_count_sessionless_tickets(lanes_fleet: Path) -> None
         await pilot.pause()
         await _status_app(app)
         markup = app._group_header_markup("To Do", [])
-        assert "1 ticket(s) without a session" in markup
+        assert Content.from_markup(markup).plain.strip() == "▾ To Do 1"
         row = app._tickets_by_id[virtual_row_id("DR-3")]
         assert "DR-3" in str(row.render())
 
@@ -414,7 +416,7 @@ async def test_enter_on_a_ticket_row_describes_it_instead_of_jumping(
         await _cursor_on(app, virtual_row_id("DR-3"))
         await app.action_jump()
         assert jumped == []
-        assert toasts[-1] == "DR-3 · To Do — no session on this ticket"
+        assert toasts[-1] == "DR-3 · To Do — set EPHOR_JIRA_URL (or JIRA_URL) to open it in Jira"
 
 
 @pytest.mark.asyncio
@@ -519,13 +521,21 @@ async def test_the_dashboard_refreshes_the_snapshot_when_jira_is_configured(
     monkeypatch.setenv("EPHOR_JIRA_TOKEN", "t")
     searches: list[str] = []
 
-    def search(jql: str, fields: tuple[str, ...] = ()) -> list[Issue]:
+    def search(jql: str, fields: tuple[str, ...] = (), **_: object) -> list[Issue]:
         searches.append(jql)
         return [Issue(key="DR-8", status="QA", status_id="7", title="Eight")]
 
     monkeypatch.setattr(jira_api, "search", search)
     # The per-ticket lookups are not what this test is about; keep them offline.
     monkeypatch.setattr(jira_api, "_fetch", lambda *a, **k: None)
+    # Nor the one-off lookup of the site's Flagged field.
+    monkeypatch.setattr(jira_api, "flagged_field_id", lambda: "")
+    # The tick coalesces onto a snapshot younger than a minute; make this
+    # one old enough to be refreshed.
+    stale = snap.load()
+    assert stale is not None
+    old = (datetime.now(UTC) - timedelta(minutes=10)).isoformat(timespec="seconds")
+    assert snap.save(replace(stale, taken_at=old))
 
     app = EphorApp(manager=StateManager(lanes_fleet))
     async with app.run_test() as pilot:
@@ -570,7 +580,7 @@ async def test_board_refreshes_never_overlap(
     async with app.run_test() as pilot:
         await pilot.pause()
         await app.workers.wait_for_complete()
-        monkeypatch.setattr(app, "_board_worker", lambda: started.append(True))
+        monkeypatch.setattr(app, "_board_worker", lambda force=False: started.append(True))
         app._refresh_board()
         app._refresh_board()  # the first is still "running": skipped
         assert started == [True]
@@ -587,3 +597,401 @@ def test_a_badge_never_shifts_the_status_column() -> None:
     assert badged.index("Peer Review") == plain.index("Peer Review")
     assert badged.index("⏸ review?") > badged.index("Peer Review")
     assert badged.index("Fix bug") > badged.index("⏸ review?")
+
+
+# --- board improvements: placement, ages, glyphs ------------------------------------------
+
+from ephor.flows.snapshot import PrState  # noqa: E402
+from ephor.tui import prefs  # noqa: E402
+from ephor.tui.lanes import TicketRow, time_in_status  # noqa: E402
+from ephor.tui.widgets.session_row import plan_row  # noqa: E402
+
+_LIMITS_BOARD = """
+[board]
+projects = ["DR"]
+columns = [
+  "To Do",
+  { name = "In Progress", statuses = ["In Progress"], wip = 1, warn_after = "1d", alert_after = "3d" },
+  "Done",
+]
+"""
+
+
+def _ago(**delta: float) -> str:
+    return (datetime.now(UTC) - timedelta(**delta)).isoformat(timespec="seconds")
+
+
+def _limits_lanes(tickets: dict[str, TicketState], **data: Any) -> Lanes:
+    import tomllib
+
+    config = board.parse(tomllib.loads(_LIMITS_BOARD))
+    assert config.lanes_ok, config.board_errors
+    taken = data.pop("taken_at", datetime.now(UTC).isoformat())
+    prs = data.pop("prs", {})
+    return Lanes(
+        LaneData(config=config, snapshot=Snapshot(taken_at=taken, tickets=tickets, prs=prs), **data)
+    )
+
+
+def test_an_unmatched_done_status_folds_under_the_last_column() -> None:
+    lanes = _lanes(
+        {"DR-1": _ticket("Shipped", category="done"), "DR-2": _ticket("Icebox", category="new")}
+    )
+    rows = lanes.tickets_without_session(set())
+    assert [k for k, _ in rows["Done"]] == ["DR-1"]
+    assert [k for k, _ in rows["To Do"]] == ["DR-2"]
+    assert "Other" not in rows
+
+
+def test_other_holding_only_done_tickets_folds_unless_a_session_is_there() -> None:
+    # "Closed" is a done name with no category: it lands in Other.
+    lanes = _lanes({"DR-1": _ticket("Closed"), "DR-2": _ticket("Done", category="done")})
+    collapsed: set[str] = set()
+    lanes.apply_default_folds(collapsed)
+    assert collapsed == {"Done", "Other"}
+    lanes.reset_folds()
+    collapsed = set()
+    lanes.apply_default_folds(collapsed, frozenset({"Other"}))
+    assert collapsed == {"Done"}
+    # A live ticket in Other keeps it open.
+    lanes = _lanes({"DR-1": _ticket("Closed"), "DR-3": _ticket("Blocked")})
+    collapsed = set()
+    lanes.apply_default_folds(collapsed)
+    assert "Other" not in collapsed
+
+
+def test_ticket_rows_sort_oldest_in_status_first_unknown_last() -> None:
+    lanes = _lanes(
+        {
+            "DR-1": _ticket("To Do"),
+            "DR-2": _ticket("To Do", entered_at=_ago(hours=1)),
+            "DR-3": _ticket("To Do", entered_at=_ago(days=4)),
+            "DR-4": _ticket("To Do"),
+        }
+    )
+    assert [k for k, _ in lanes.tickets_without_session(set())["To Do"]] == [
+        "DR-3",
+        "DR-2",
+        "DR-1",
+        "DR-4",
+    ]
+
+
+def test_time_in_status_marks_estimates_and_colours_by_the_column_limits() -> None:
+    lanes = _limits_lanes({})
+    column = lanes.column("In Progress")
+    assert column is not None and column.wip == 1
+    assert time_in_status(_ticket("In Progress"), column) == ("", "dim")
+    assert time_in_status(_ticket("x", entered_at=_ago(minutes=12)), column) == ("12m", "dim")
+    text, style = time_in_status(
+        _ticket("x", entered_at=_ago(hours=30), entered_estimated=True), column
+    )
+    assert text == "~1d" and style == "#EBCB8B"
+    assert time_in_status(_ticket("x", entered_at=_ago(days=5)), column)[1] == "bold #f85149"
+    assert time_in_status(_ticket("x", entered_at=_ago(days=5)), None)[1] == "dim"
+
+
+def test_ticket_row_draws_age_flag_pr_and_ci() -> None:
+    pr = PrState(number=12, state="OPEN", url="https://github.com/o/r/pull/12", ci="fail")
+    lanes = _limits_lanes(
+        {
+            "DR-1": _ticket(
+                "In Progress", "Fix", entered_at=_ago(days=4), flagged=True, assignee="Ann Lee"
+            ),
+            "DR-2": _ticket("To Do", "Other", assignee="Bob"),
+        },
+        prs={"DR-1": (pr,)},
+    )
+    data = lanes.row_data("DR-1")
+    assert data.prs == (pr,) and data.show_assignee
+    markup = ticket_row_markup(
+        data.key, data.record, prs=data.prs, show_assignee=True, column=data.column, width=120
+    )
+    plain = Content.from_markup(markup).plain
+    assert plain.index("DR-1") < plain.index("4d") < plain.index("In Progress")
+    assert "⚑" in plain and "AL Fix" in plain
+    assert "bold #f85149]4d" in markup.replace(" ", " ")  # past alert_after
+    # The PR cell sits where a session row's work cell does, at this width.
+    layout = plan_row(120)
+    assert plain.index("#12 x") == layout.visible_width - layout.work
+    assert len(plain) == layout.visible_width
+
+
+def test_one_assignee_on_the_whole_board_hides_the_column() -> None:
+    lanes = _lanes(
+        {
+            "DR-1": _ticket("To Do", "A", assignee="Ann"),
+            "DR-2": _ticket("Done", "B", assignee="Ann"),
+        }
+    )
+    assert not lanes.row_data("DR-1").show_assignee
+    data = lanes.row_data("DR-1")
+    plain = Content.from_markup(
+        ticket_row_markup(data.key, data.record, show_assignee=data.show_assignee)
+    ).plain
+    assert "AN" not in plain
+
+
+def test_lane_header_shows_counts_wip_and_flow_glyphs() -> None:
+    lanes = _limits_lanes({})
+    counts = LaneCounts(rows=20, tickets=3, working=2, needs=1, blocked=1, stuck=1)
+    plain = Content.from_markup(lanes.header_markup("In Progress", counts, False)).plain
+    assert plain.strip() == "▾ In Progress 20 · 3/1 wip · ▶2 working · !1 needs you · ⊘1 · ⚠1"
+    over = lanes.header_markup("In Progress", counts, False)
+    assert "bold #f85149]3/1 wip" in over
+    # No wip limit, no wip part; a stale board dims the whole header.
+    todo = lanes.header_markup("To Do", LaneCounts(rows=2, tickets=2), True, stale=True)
+    assert Content.from_markup(todo).plain.strip() == "▸ To Do 2"
+    assert todo.startswith("  [dim]")
+
+
+def test_health_reports_an_old_snapshot_before_any_tick() -> None:
+    now = datetime.now(UTC)
+    old = Snapshot(taken_at=(now - timedelta(hours=2)).isoformat())
+    lanes = _limits_lanes({}, taken_at=old.taken_at)
+    assert lanes.last_result is None
+    assert "snapshot 2h old" in lanes.health(now)
+    fresh = _limits_lanes({})
+    assert fresh.health(now) == ""
+
+
+def test_board_line_shows_age_without_jira_and_warns_when_stale() -> None:
+    now = datetime.now(UTC)
+    lanes = _limits_lanes(
+        {"DR-1": _ticket("To Do")}, taken_at=(now - timedelta(minutes=5)).isoformat()
+    )
+    plain = Content.from_markup(lanes.board_line(2, now)).plain
+    assert plain == "board · 5m ago · 1 ticket · 2 off-board"
+    stale = _limits_lanes({}, taken_at=(now - timedelta(hours=3)).isoformat())
+    assert stale.is_stale(now)
+    assert "3h ago — stale" in Content.from_markup(stale.board_line(0, now)).plain
+    # An undated snapshot falls back on the file's mtime.
+    undated = _limits_lanes({}, taken_at="", snapshot_mtime=now.timestamp() - 120)
+    assert "2m ago" in Content.from_markup(undated.board_line(0, now)).plain
+    assert "no snapshot yet" in Content.from_markup(Lanes().board_line()).plain
+
+
+@pytest.mark.asyncio
+async def test_the_board_line_is_drawn_only_in_status_mode(lanes_fleet: Path) -> None:
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        line = app.query_one("#board-line")
+        assert not line.display
+        await _status_app(app)
+        assert line.display
+        plain = str(line.render())
+        assert plain.startswith("board · ") and "5 tickets" in plain
+        app.action_toggle_board()
+        await app._refresh_table()
+        assert not line.display
+
+
+@pytest.mark.asyncio
+async def test_lane_counts_are_computed_once_per_refresh(
+    lanes_fleet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _status_app(app)
+        calls: list[int] = []
+        real = app._lanes.tickets_without_session
+        monkeypatch.setattr(
+            app._lanes, "tickets_without_session", lambda *a: calls.append(1) or real(*a)
+        )
+        await app._refresh_table()
+        assert calls == [1]
+        assert len(app._headers_by_id) > 3
+
+
+@pytest.mark.asyncio
+async def test_brackets_step_between_lane_headers(lanes_fleet: Path) -> None:
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _status_app(app)
+        view = app.query_one("ListView")
+        view.index = app._sid_by_row.index("s1")
+        await pilot.press("right_square_bracket")
+        assert app._sid_by_row[view.index] == group_row_id("Review")
+        await pilot.press("left_square_bracket")
+        assert app._sid_by_row[view.index] == group_row_id("In Progress")
+        view.index = 0
+        await pilot.press("left_square_bracket")  # wraps to the last header
+        assert app._sid_by_row[view.index] == group_row_id("Unticketed")
+
+
+@pytest.mark.asyncio
+async def test_b_toggles_the_board_and_the_grouping_survives_a_restart(lanes_fleet: Path) -> None:
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_cycle_grouping()  # ticket
+        await pilot.press("B")
+        assert app._group_by == "status"
+        await pilot.press("B")
+        assert app._group_by == "ticket"
+        await pilot.press("B")
+    assert prefs.load_grouping(EphorApp.GROUPINGS) == "status"
+    again = EphorApp(manager=StateManager(lanes_fleet))
+    async with again.run_test() as pilot:
+        await pilot.pause()
+        assert again._group_by == "status"
+        assert group_row_id("To Do") in again._sid_by_row
+        await pilot.press("B")
+        assert again._group_by == "none"
+
+
+# --- ticket rows are actionable -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_n_twice_on_a_ticket_row_starts_an_agent_in_its_repo(
+    lanes_fleet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_board(_BOARD + f'\n[repos]\nDR = "{repo}"\n')
+    started: list[tuple[str, object]] = []
+
+    def fake_start(ticket: str, **kwargs: object) -> launcher.StartResult:
+        started.append((ticket, kwargs.get("cwd")))
+        return launcher.StartResult(True, "ok")
+
+    monkeypatch.setattr(launcher, "start", fake_start)
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        toasts: list[str] = []
+        app._set_toast = toasts.append  # type: ignore[method-assign]
+        await _cursor_on(app, virtual_row_id("DR-3"))
+        app._selected = {"s1", "s2"}
+        await pilot.press("N")
+        await app.workers.wait_for_complete()
+        assert started == []
+        assert "press N again" in toasts[-1]
+        await pilot.press("N")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        assert started == [("DR-3", str(repo))]
+        assert app._selected == {"s1", "s2"}
+
+
+@pytest.mark.asyncio
+async def test_n_on_a_ticket_row_without_a_repo_says_how_to_add_one(
+    lanes_fleet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started: list[object] = []
+    monkeypatch.setattr(launcher, "start", lambda *a, **k: started.append(a))
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        toasts: list[str] = []
+        app._set_toast = toasts.append  # type: ignore[method-assign]
+        await _cursor_on(app, virtual_row_id("DR-3"))
+        await pilot.press("N", "N")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert started == []
+        assert "[repos] DR" in toasts[-1].replace("\\[", "[")
+
+
+@pytest.mark.asyncio
+async def test_enter_and_j_open_the_ticket_in_jira(
+    lanes_fleet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EPHOR_JIRA_URL", "https://example.atlassian.net/")
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        opened: list[str] = []
+        monkeypatch.setattr(app, "open_url", lambda url, **_: opened.append(url))
+        await _cursor_on(app, virtual_row_id("DR-3"))
+        await pilot.press("enter")
+        await pilot.press("J")
+        app.query_one("ListView").index = app._sid_by_row.index("s1")
+        await pilot.press("J")
+        assert opened == [
+            "https://example.atlassian.net/browse/DR-3",
+            "https://example.atlassian.net/browse/DR-3",
+            "https://example.atlassian.net/browse/DR-1",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_o_on_a_ticket_row_opens_its_pr_else_jira(
+    lanes_fleet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EPHOR_JIRA_URL", "https://example.atlassian.net")
+    taken = datetime.now(UTC).isoformat(timespec="seconds")
+    assert snap.save(
+        Snapshot(
+            taken_at=taken,
+            tickets={"DR-3": _ticket("To Do", "Third"), "DR-5": _ticket("Blocked", "Fifth")},
+            prs={
+                "DR-3": (
+                    PrState(number=7, state="MERGED", url="https://gh/pull/7"),
+                    PrState(number=9, state="OPEN", url="https://gh/pull/9", ci="pass"),
+                )
+            },
+        )
+    )
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        opened: list[str] = []
+        monkeypatch.setattr(app, "open_url", lambda url, **_: opened.append(url))
+        await _cursor_on(app, virtual_row_id("DR-3"))
+        app._selected = {"s1"}
+        await pilot.press("o")
+        await _cursor_on(app, virtual_row_id("DR-5"))
+        await pilot.press("o")
+        assert opened == ["https://gh/pull/9", "https://example.atlassian.net/browse/DR-5"]
+        row = app._tickets_by_id[virtual_row_id("DR-3")]
+        assert isinstance(row, TicketRow)
+        assert "#9 v+1" in str(row.render())
+
+
+@pytest.mark.asyncio
+async def test_question_mark_shows_keys_and_the_badge_legend(lanes_fleet: Path) -> None:
+    from ephor.flows import runs
+    from ephor.tui.help_screen import HelpScreen
+
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpScreen)
+        text = str(app.screen.query_one("#help-text").render())
+        for glyph, meaning in runs.BADGE_LEGEND:
+            assert glyph in text and meaning in text
+        for key in ("B", "J", "[", "]", "N N"):
+            assert key in text
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, HelpScreen)
+
+
+@pytest.mark.asyncio
+async def test_r_forces_a_board_tick_past_coalescing(
+    lanes_fleet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Ticks skip a snapshot under a minute old; `r` is the explicit "look now".
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        real_gather = app_module.gather_lanes
+        forced: list[bool] = []
+
+        def fake_gather(*, refresh: bool, force: bool = False) -> LaneData:
+            forced.append(force)
+            return real_gather(refresh=False)
+
+        monkeypatch.setattr(app_module, "gather_lanes", fake_gather)
+        await app.action_refresh()
+        await app.workers.wait_for_complete()
+        assert forced == [True]

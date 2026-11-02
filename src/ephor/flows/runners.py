@@ -15,9 +15,9 @@ Two kinds of flow:
   duplicating it: ``launcher.start`` when the rule wants a fresh worktree,
   else an agent window (``launcher.agent_invocation`` + ``open_window``) in
   the ticket's existing worktree or the project's repo root.
-* ``command =`` runs any executable — a shell script, a LangGraph program,
+* ``command =`` runs any executable — a shell script, a Python program,
   anything — under a small ``sh`` wrapper that records its exit status in
-  ``runs/<run_id>.exit``.
+  ``runs/<run_id>.exit`` and tees its output to ``runs/<run_id>.log``.
 
 Every flow is told about its event the same way: ``EPHOR_FLOW_RUN`` (the run
 id), ``EPHOR_FLOW_PAYLOAD`` (a 0600 JSON file with the ticket, title,
@@ -39,7 +39,7 @@ from typing import Protocol
 
 from ephor import eventlog, launcher
 from ephor.board import FlowRule, FlowSettings
-from ephor.flows.runs import Run, exit_path, exit_tmp_path, valid_run_id
+from ephor.flows.runs import Run, exit_path, exit_tmp_path, log_path, valid_run_id
 from ephor.launcher import StartResult
 
 _TMUX_TIMEOUT_SEC = 5.0
@@ -174,6 +174,20 @@ def flow_env(run: Run, payload: Path) -> dict[str, str]:
     }
 
 
+def render_for(run: Run, rule: FlowRule, repo: Path | None) -> str:
+    """``rule``'s template rendered for ``run``: every placeholder the event carries."""
+    return rule.render(
+        ticket=run.ticket,
+        title=run.title,
+        status=run.matched_status,
+        from_status=run.from_status,
+        pr_url=run.pr_url,
+        pr_number=run.pr_number,
+        repo=str(repo) if repo is not None else "",
+        session_id=run.session_id,
+    )
+
+
 def launch(
     run: Run,
     rule: FlowRule,
@@ -214,7 +228,7 @@ def _launch_agent(
     settings: FlowSettings,
     tools: Launchers,
 ) -> LaunchOutcome:
-    prompt = rule.render(ticket=run.ticket, title=run.title, status=run.matched_status)
+    prompt = render_for(run, rule, repo)
     if prompt.lstrip().startswith("-"):
         # Validation makes a start= template begin with literal text, so this
         # is belt and braces — but a prompt that reaches the agent CLI as an
@@ -271,19 +285,23 @@ def _launch_agent(
 
 
 def command_wrapper(run_id: str) -> str:
-    """The ``sh`` line that runs ``$EPHOR_FLOW_COMMAND`` and records its exit status.
+    """The ``sh`` line that runs ``$EPHOR_FLOW_COMMAND``, tees its output, and records its exit.
 
     The command runs in its own ``sh -c`` rather than being pasted into the
     wrapper, so an ``exit`` or a trailing ``#`` comment in it cannot skip the
-    line that records the status. The status is written to a temporary name
-    and renamed into place, so a tick never reads half a number.
+    line that records the status. Its stdout and stderr go through ``tee
+    -a`` into ``runs/<run_id>.log`` (and still to the window); POSIX ``sh``
+    has no pipefail, so the status is captured *inside* the piped group,
+    written to a temporary name, and renamed into place after it — a tick
+    never reads half a number, and never the status of ``tee``.
     """
-    final = exit_path(run_id)
-    tmp = exit_tmp_path(run_id)
+    final = shlex.quote(str(exit_path(run_id)))
+    tmp = shlex.quote(str(exit_tmp_path(run_id)))
+    log = shlex.quote(str(log_path(run_id)))
     return (
-        'sh -c "$EPHOR_FLOW_COMMAND"; code=$?; '
-        f'printf "%s\\n" "$code" > {shlex.quote(str(tmp))} && '
-        f"mv -f {shlex.quote(str(tmp))} {shlex.quote(str(final))}"
+        f'{{ sh -c "$EPHOR_FLOW_COMMAND"; printf "%s\\n" "$?" > {tmp}; }} 2>&1 '
+        f"| tee -a {log}; "
+        f"[ -f {tmp} ] && mv -f {tmp} {final}"
     )
 
 
@@ -296,7 +314,7 @@ def _launch_command(
     settings: FlowSettings,
     tools: Launchers,
 ) -> LaunchOutcome:
-    rendered = rule.render(ticket=run.ticket, title=run.title, status=run.matched_status)
+    rendered = render_for(run, rule, repo)
     env = {
         **flow_env(run, payload),
         "EPHOR_FLOW_TITLE": run.title,

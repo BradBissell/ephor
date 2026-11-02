@@ -281,3 +281,96 @@ def test_badges_pick_the_most_pressing_run_per_ticket() -> None:
         "DR-1": "⏸ review?",
         "DR-3": "⚠ review stuck",
     }
+
+
+# --- superseded is expired; retry; legend; idle spells; output log -----------------------
+
+
+def test_an_old_superseded_run_loads_as_expired_with_its_reason() -> None:
+    runs.runs_dir().mkdir(parents=True, exist_ok=True)
+    raw = json.loads(_run(state=RunState.EXPIRED, reason="ticket moved on (now QA)").to_json())
+    raw["state"] = "superseded"
+    runs.run_path("DR-1.review.10-1").write_text(json.dumps(raw))
+    loaded = runs.load("DR-1.review.10-1")
+    assert loaded is not None
+    assert (loaded.state, loaded.reason) == (RunState.EXPIRED, "ticket moved on (now QA)")
+    assert "superseded" not in {str(s) for s in RunState}
+
+
+def test_the_badge_legend_names_every_badge_glyph() -> None:
+    glyphs = [glyph for glyph, _ in runs.BADGE_LEGEND]
+    for state in (
+        RunState.AWAITING_CONFIRM,
+        RunState.CLAIMED,
+        RunState.BLOCKED,
+        RunState.LAUNCHED,
+        RunState.STUCK,
+    ):
+        assert runs.badge(_run(state=state)).split()[0] in glyphs
+    assert all(meaning for _, meaning in runs.BADGE_LEGEND)
+
+
+@pytest.mark.parametrize("state", [RunState.STUCK, RunState.FAILED, RunState.EXPIRED])
+def test_retry_rearms_a_given_up_run(state: RunState) -> None:
+    assert runs.create(
+        _run(
+            state=state,
+            attempts=3,
+            reason="gave up",
+            approved_at=runs.iso(T0),
+            retry_at=runs.iso(T0),
+            exit_code=2,
+        )
+    )
+    runs.exit_path("DR-1.review.10-1").write_text("2\n")
+    later = T0 + timedelta(days=2)
+    updated, message = runs.retry("DR-1.review.10-1", now=later)
+    assert updated is not None, message
+    assert updated.state is RunState.AWAITING_CONFIRM
+    assert (updated.attempts, updated.approved_at, updated.retry_at, updated.exit_code) == (
+        0,
+        "",
+        "",
+        None,
+    )
+    assert (updated.retries, updated.rearmed_at) == (1, runs.iso(later))
+    assert updated.reason.startswith(f"re-armed (was {state}")
+    assert runs.read_exit("DR-1.review.10-1") is None
+    (event,) = [e for e in eventlog.read() if e.kind is eventlog.EventKind.FLOW_REARMED]
+    assert event.extra["run_id"] == "DR-1.review.10-1"
+
+
+@pytest.mark.parametrize(
+    "state", [RunState.AWAITING_CONFIRM, RunState.LAUNCHED, RunState.DONE, RunState.DENIED]
+)
+def test_retry_refuses_a_run_that_has_not_given_up(state: RunState) -> None:
+    assert runs.create(_run(state=state))
+    updated, message = runs.retry("DR-1.review.10-1")
+    assert updated is None and f"it is {state}" in message
+    assert runs.retry("DR-9.review.10-1")[1].endswith("no such run")
+
+
+def test_approve_is_logged() -> None:
+    assert runs.create(_run())
+    runs.approve("DR-1.review.10-1")
+    assert [e.kind for e in eventlog.read()] == [eventlog.EventKind.FLOW_APPROVED]
+
+
+def test_an_idle_generation_names_the_spell() -> None:
+    sid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    first = runs.idle_generation(sid, "2026-10-20T12:00:05+00:00")
+    assert first == "0f1e2d3c-4b5-20261020120005"
+    assert runs.idle_generation(sid, "2026-10-20T13:00:00+00:00") != first
+    assert runs.valid_run_id(runs.make_run_id("DR-1", "idle", first))
+    odd = runs.idle_generation(sid, "not a time")
+    assert runs.valid_run_id(runs.make_run_id("DR-1", "idle", odd))
+
+
+def test_the_output_log_tail_and_its_pruning() -> None:
+    assert runs.read_log_tail("DR-1.review.10-1") is None
+    runs.runs_dir().mkdir(parents=True, exist_ok=True)
+    runs.log_path("DR-1.review.10-1").write_text("".join(f"line {n}\n" for n in range(50)))
+    assert runs.read_log_tail("DR-1.review.10-1", 3) == ["line 47", "line 48", "line 49"]
+    assert runs.create(_run(state=RunState.DONE))
+    runs.prune(T0 + timedelta(days=runs.PRUNE_AFTER_DAYS + 1))
+    assert not runs.log_path("DR-1.review.10-1").exists()

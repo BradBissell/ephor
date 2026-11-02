@@ -427,3 +427,45 @@ def test_find_prs_for_ticket_treats_a_full_page_as_unknown(
     argv = calls[0]
     assert "--limit" in argv
     assert argv[argv.index("--limit") + 1] == str(gh._TICKET_PR_LIMIT)
+
+
+def test_list_repo_prs_is_one_call_matched_locally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    rollup = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"}]
+    stdout = json.dumps(
+        [
+            _ticket_pr(3, "DR-12 second attempt", statusCheckRollup=rollup),
+            _ticket_pr(2, "DR-123 a longer key"),
+            _ticket_pr(1, "unrelated", "MERGED", headRefName="bb/DR-12-first"),
+        ]
+    )
+    monkeypatch.setattr(gh.subprocess, "run", _fake_cli(stdout, gh_calls=calls))
+    listing = gh.list_repo_prs(tmp_path, limit=50)
+    assert listing is not None and listing.complete
+    assert [p.number for p in listing.naming("DR-12")] == [3, 1]
+    assert [p.number for p in listing.naming("DR-123")] == [2]
+    assert gh.ci_word(listing.prs[0].ci) == "fail"
+    (argv,) = calls
+    assert "--search" not in argv
+    assert argv[argv.index("--state") + 1] == "all"
+    assert argv[argv.index("--limit") + 1] == "50"
+    assert "statusCheckRollup" in argv[argv.index("--json") + 1].split(",")
+
+
+def test_a_full_repo_listing_says_it_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout = json.dumps([_ticket_pr(n, f"DR-{n}") for n in range(1, 4)])
+    monkeypatch.setattr(gh.subprocess, "run", _fake_cli(stdout))
+    listing = gh.list_repo_prs(tmp_path, limit=3)
+    assert listing is not None and not listing.complete
+    monkeypatch.setattr(gh.subprocess, "run", _fake_cli("", gh_returncode=1))
+    assert gh.list_repo_prs(tmp_path) is None
+
+
+def test_ci_word_maps_the_rollup() -> None:
+    from ephor.constants import CiState
+
+    assert [gh.ci_word(s) for s in CiState] == ["pass", "fail", "pending", ""]

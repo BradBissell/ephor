@@ -33,14 +33,17 @@ No configuration means no network call, not a failed one.
 from __future__ import annotations
 
 import base64
+import email.utils
 import hashlib
 import http.client
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import quote
 
 # Tickets move on a human timescale. Ten minutes is far fresher than the
@@ -86,6 +89,11 @@ class Issue:
     # a display name but never an accountId.
     status_id: str = ""
     assignee_id: str = ""
+    # ``statuscategorychangedate``, as ISO-8601 UTC ("" when not asked for or
+    # absent): the last time the status *category* changed.
+    status_changed_at: str = ""
+    # The site's "Flagged" field is set (see :func:`flagged_field_id`).
+    flagged: bool = False
 
     @property
     def is_done(self) -> bool:
@@ -175,7 +183,20 @@ def is_configured() -> bool:
     return credentials() is not None
 
 
-def _parse_issue(key: str, payload: object) -> Issue | None:
+def _iso_utc(raw: object) -> str:
+    """Jira's ``2026-10-20T12:00:00.000+0000`` as ISO-8601 UTC, or "" when it is not one."""
+    if not isinstance(raw, str) or not raw:
+        return ""
+    try:
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC).isoformat(timespec="seconds")
+
+
+def _parse_issue(key: str, payload: object, flagged_field: str = "") -> Issue | None:
     if not isinstance(payload, dict):
         return None
     fields = payload.get("fields")
@@ -197,6 +218,9 @@ def _parse_issue(key: str, payload: object) -> Issue | None:
     if isinstance(who, dict):
         assignee = str(who.get("displayName") or who.get("name") or "")
         assignee_id = str(who.get("accountId") or "")
+    # Flagged is a multi-checkbox field: a list holding the "Impediment"
+    # option when set, null (or an empty list) when not.
+    flag = fields.get(flagged_field) if flagged_field else None
     return Issue(
         key=str(payload.get("key") or key),
         status=status_name,
@@ -205,7 +229,84 @@ def _parse_issue(key: str, payload: object) -> Issue | None:
         assignee=assignee,
         status_id=status_id,
         assignee_id=assignee_id,
+        status_changed_at=_iso_utc(fields.get("statuscategorychangedate")),
+        flagged=bool(flag) and isinstance(flag, list | dict | str),
     )
+
+
+@dataclass(frozen=True)
+class RequestError:
+    """Why the last request on this thread failed: enough to say so, and to back off.
+
+    ``status`` is the HTTP status (0 when there was no HTTP answer at all —
+    a timeout, a refused connection, a body that was not JSON). ``retry_after``
+    is the seconds a 429 (or 503) asked us to wait, when it said.
+    """
+
+    status: int
+    message: str
+    retry_after: float | None = None
+
+    @property
+    def summary(self) -> str:
+        """``HTTP 400: Field 'x' does not exist`` — short enough for a status line."""
+        head = f"HTTP {self.status}" if self.status else "no answer"
+        return f"{head}: {self.message}" if self.message else head
+
+
+# Per thread: the dashboard's Jira cell resolver and its flows tick run on
+# different workers, and one must not report the other's failure.
+_LAST = threading.local()
+_ERROR_TEXT_LIMIT = 160
+
+
+def last_error() -> RequestError | None:
+    """The failure of this thread's latest Jira request, or None if it succeeded."""
+    found = getattr(_LAST, "error", None)
+    return found if isinstance(found, RequestError) else None
+
+
+def _set_error(error: RequestError | None) -> None:
+    _LAST.error = error
+
+
+def _retry_after(raw: str | None) -> float | None:
+    """A ``Retry-After`` header — seconds, or an HTTP date — as seconds from now."""
+    if not raw:
+        return None
+    text = raw.strip()
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
+
+
+def _error_text(exc: urllib.error.HTTPError) -> str:
+    """Jira's own words for an HTTP error (``errorMessages``), trimmed; else the reason."""
+    text = ""
+    try:
+        body = exc.read(4096).decode(errors="replace")
+        payload = json.loads(body) if body.strip() else None
+    except (OSError, ValueError, RecursionError, http.client.HTTPException):
+        payload = None
+    if isinstance(payload, dict):
+        messages = payload.get("errorMessages")
+        parts = [m for m in messages if isinstance(m, str)] if isinstance(messages, list) else []
+        errors = payload.get("errors")
+        if isinstance(errors, dict):
+            parts.extend(f"{k}: {v}" for k, v in errors.items() if isinstance(v, str))
+        text = "; ".join(parts)
+    text = " ".join((text or str(exc.reason or "")).split())
+    if len(text) > _ERROR_TEXT_LIMIT:
+        text = text[: _ERROR_TEXT_LIMIT - 1] + "…"
+    return text
 
 
 def _request(creds: Credentials, path: str, body: dict[str, object] | None = None) -> object | None:
@@ -221,6 +322,7 @@ def _request(creds: Credentials, path: str, body: dict[str, object] | None = Non
     if not url.lower().startswith("https://"):
         # Refuse to send a bearer credential in the clear, even to a host the
         # user named themselves.
+        _set_error(RequestError(0, "the Jira URL is not https"))
         return None
     auth = base64.b64encode(f"{creds.email}:{creds.token}".encode()).decode()
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
@@ -237,14 +339,28 @@ def _request(creds: Credentials, path: str, body: dict[str, object] | None = Non
     try:
         with urllib.request.urlopen(request, timeout=_TIMEOUT_SEC) as response:  # noqa: S310
             parsed: object = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        # Kept, so "search failed" can say *why*: a 401 is a token, a 400 a
+        # JQL, a 429 a rate limit that also says how long to wait.
+        _set_error(
+            RequestError(
+                exc.code,
+                _error_text(exc),
+                _retry_after(exc.headers.get("Retry-After") if exc.headers else None),
+            )
+        )
+        return None
     except (
         urllib.error.URLError,
         http.client.HTTPException,  # IncompleteRead, BadStatusLine: not OSErrors
         OSError,
         ValueError,  # includes JSONDecodeError and UnicodeDecodeError
         RecursionError,  # pathologically nested JSON
-    ):
+    ) as exc:
+        reason = getattr(exc, "reason", None) or exc
+        _set_error(RequestError(0, " ".join(f"{type(exc).__name__}: {reason}".split())[:160]))
         return None
+    _set_error(None)
     return parsed
 
 
@@ -286,12 +402,46 @@ def myself() -> str | None:
     return account if isinstance(account, str) and account else None
 
 
+# What the site calls the impediment flag. Matched case-insensitively.
+FLAGGED_FIELD_NAME = "flagged"
+
+
+def flagged_field_id() -> str | None:
+    """The id of the site's "Flagged" custom field; "" when it has none; None when unknown.
+
+    The field is a custom field, so its id (``customfield_10021`` on one
+    site, something else on the next) is looked up once by name from
+    ``/rest/api/3/field`` and cached by the caller. None — Jira did not
+    answer — is "ask again later", never "this site has no Flagged".
+    """
+    creds = credentials()
+    if creds is None:
+        return None
+    payload = _request(creds, "/rest/api/3/field")
+    if not isinstance(payload, list):
+        return None
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        ident = item.get("id")
+        if (
+            isinstance(name, str)
+            and isinstance(ident, str)
+            and name.strip().lower() == FLAGGED_FIELD_NAME
+            and ident
+        ):
+            return ident
+    return ""
+
+
 def search(
     jql: str,
     fields: tuple[str, ...] = _DEFAULT_FIELDS,
     *,
     page_size: int = SEARCH_PAGE_SIZE,
     max_pages: int = SEARCH_MAX_PAGES,
+    flagged_field: str = "",
 ) -> list[Issue] | None:
     """Every issue ``jql`` matches, via ``POST /rest/api/3/search/jql``. Blocking.
 
@@ -303,6 +453,8 @@ def search(
     A failure on *any* page returns None, never a partial list. That is the
     rule the tick rests on — unknown never means unmet — and a list missing
     its second page would look exactly like fifty tickets leaving the board.
+    :func:`last_error` then says why. ``flagged_field`` names the field (one
+    of ``fields``) that :attr:`Issue.flagged` is read from.
     """
     creds = credentials()
     if creds is None or not jql.strip():
@@ -319,13 +471,16 @@ def search(
         if token:
             body["nextPageToken"] = token
         payload = _request(creds, "/rest/api/3/search/jql", body)
+        if payload is not None and not isinstance(payload, dict):
+            _set_error(RequestError(0, "the search answer was not an object"))
         if not isinstance(payload, dict):
             return None
         raw = payload.get("issues")
         if not isinstance(raw, list):
+            _set_error(RequestError(0, "the search answer had no issue list"))
             return None
         for item in raw:
-            issue = _parse_issue("", item)
+            issue = _parse_issue("", item, flagged_field)
             if issue is not None and issue.key:
                 issues.append(issue)
         next_token = payload.get("nextPageToken")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -555,3 +556,162 @@ def test_every_toml_snippet_in_the_flows_guide_is_valid() -> None:
         data = tomllib.loads(block)
         data.setdefault("board", {"projects": ["DR"]})
         assert board.parse(data).errors == (), block
+
+
+# --- column limits, category fallback ------------------------------------------------
+
+
+def test_columns_take_wip_and_ageing_limits() -> None:
+    config = _rules(
+        "",
+        header='[board]\nprojects = ["DR"]\ncolumns = ["To Do", '
+        '{ name = "Review", statuses = ["Peer Review"], wip = 4, warn_after = "36h", '
+        'alert_after = "3d" }, "Done"]\n',
+    )
+    assert config.errors == ()
+    review = config.board.columns[1]
+    assert (review.wip, review.warn_after, review.alert_after) == (4, 36 * 3600.0, 3 * 86400.0)
+    assert config.board.columns[0].wip is None
+
+
+@pytest.mark.parametrize(
+    ("limits", "problem"),
+    [
+        ("wip = 0", "wip must be a whole number"),
+        ("wip = true", "wip must be a whole number"),
+        ('warn_after = "soon"', "warn_after = 'soon' is not a duration"),
+        ('warn_after = "3d", alert_after = "1d"', "alert_after must not be shorter"),
+    ],
+)
+def test_bad_column_limits_are_board_errors(limits: str, problem: str) -> None:
+    config = _rules(
+        "",
+        header=f'[board]\nprojects = ["DR"]\ncolumns = [{{ name = "R", {limits} }}]\n',
+    )
+    assert any(problem in e for e in config.board_errors), config.board_errors
+
+
+def test_an_unmatched_status_falls_back_on_its_category() -> None:
+    settings = board.BoardSettings(
+        columns=(board.Column("Todo", ("to do",)), board.Column("Shipped", ("done",)))
+    )
+    assert settings.column_for("Won't Do", "done") == "Shipped"
+    assert settings.column_for("Backlog", "new") == "Todo"
+    assert settings.column_for("Blocked", "indeterminate") == board.OTHER_LANE
+    assert settings.column_for("Blocked") == board.OTHER_LANE
+    # A name a column claims wins over its category.
+    assert settings.column_for("to do", "done") == "Todo"
+
+
+# --- warnings --------------------------------------------------------------------------
+
+
+def test_a_status_in_no_column_is_a_warning_not_an_error() -> None:
+    config = _rules(
+        '[[flow]]\nname = "r"\non_enter = "Peer Reveiw"\nfrom = "In Progres"\n'
+        'start = "/review-pr {ticket}"\n',
+        header='[board]\nprojects = ["DR"]\ncolumns = ["In Progress", "Peer Review"]\n',
+    )
+    assert config.errors == () and config.dispatch_ok
+    assert len(config.warnings) == 2
+    assert "on_enter = 'Peer Reveiw' is not in any [board] column" in config.warnings[0]
+    assert "from = 'in progres'" in config.warnings[1]
+
+
+def test_a_status_no_ticket_is_in_warns_only_against_a_snapshot() -> None:
+    settings = board.BoardSettings(columns=(board.Column("Review", ("peer review",)),))
+    rule = board.FlowRule(name="r", trigger=Trigger.ON_EXIT, value="Peer Review", command="x")
+    assert board.status_warnings(settings, (rule,)) == []
+    found = board.status_warnings(settings, (rule,), frozenset({"qa"}))
+    assert len(found) == 1 and "no ticket on the board" in found[0]
+    assert board.status_warnings(settings, (rule,), frozenset({"peer review"})) == []
+
+
+# --- from, jql, repo, max_commands_per_hour, template fields ------------------------------
+
+
+def test_from_jql_and_repo_parse(tmp_path: Path) -> None:
+    config = _rules(
+        f'[[flow]]\nname = "r"\non_enter = "Peer Review"\nfrom = ["In Progress", "QA"]\n'
+        f'jql = "labels = needs-review"\nrepo = "{tmp_path}"\nstart = "/review-pr {{ticket}}"\n'
+    )
+    assert config.errors == ()
+    (rule,) = config.rules
+    assert rule.from_statuses == ("in progress", "qa")
+    assert (rule.jql, rule.repo) == ("labels = needs-review", str(tmp_path))
+    assert rule.matches_from("QA") and not rule.matches_from("To Do")
+    assert board.FlowRule(name="x", trigger=Trigger.ON_ENTER, value="a").matches_from("")
+
+
+@pytest.mark.parametrize(
+    ("extra", "problem"),
+    [
+        ('on_exit = "QA"\nfrom = "x"', "from applies only to on_enter"),
+        ('on_enter = "QA"\nfrom = []', "from must be a status name or a non-empty list"),
+        ('on_enter = "QA"\njql = "a = b ORDER BY c"', "cannot have an ORDER BY"),
+        ('on_enter = "QA"\nrepo = "relative/path"', "repo must be an absolute path"),
+        ('on_enter = "QA"\njql = 3', "jql must be a string"),
+    ],
+)
+def test_bad_rule_conditions_are_errors(extra: str, problem: str) -> None:
+    config = _rules(f'[[flow]]\nname = "r"\n{extra}\ncommand = "x"\n')
+    assert any(problem in e for e in config.flow_errors), config.flow_errors
+
+
+def test_from_and_jql_are_part_of_the_fingerprint_only_when_set() -> None:
+    plain = board.FlowRule(name="r", trigger=Trigger.ON_ENTER, value="QA", command="x")
+    # Unchanged from before the fields existed: no re-adopt on upgrade.
+    assert (
+        plain.fingerprint
+        == board.FlowRule(
+            name="r", trigger=Trigger.ON_ENTER, value="QA", command="y", repo="/x"
+        ).fingerprint
+    )
+    narrowed = board.FlowRule(
+        name="r", trigger=Trigger.ON_ENTER, value="QA", command="x", from_statuses=("a",)
+    )
+    filtered = board.FlowRule(
+        name="r", trigger=Trigger.ON_ENTER, value="QA", command="x", jql="labels = z"
+    )
+    assert len({plain.fingerprint, narrowed.fingerprint, filtered.fingerprint}) == 3
+    # repo is what the rule runs, so it is part of the action instead.
+    moved = board.FlowRule(name="r", trigger=Trigger.ON_ENTER, value="QA", command="x", repo="/x")
+    assert moved.action_fingerprint != plain.action_fingerprint
+
+
+def test_max_commands_per_hour_has_a_generous_default_and_parses() -> None:
+    assert board.FlowSettings().max_commands_per_hour == 60
+    config = _rules("[flows]\nmax_commands_per_hour = 5\n")
+    assert config.errors == () and config.flows.max_commands_per_hour == 5
+
+
+def test_the_new_template_fields_render_and_quote() -> None:
+    rule = board.FlowRule(
+        name="r",
+        trigger=Trigger.ON_PR,
+        value="opened",
+        command="note.sh {ticket} {pr_number} {pr_url} {from_status} {repo} {session_id}",
+    )
+    assert board._template_problem(rule.command) == ""
+    assert board._command_placeholder_problems(rule.command) == []
+    assert (
+        rule.render(ticket="DR-1", pr_number=12, pr_url="https://x/1", from_status="In Progress")
+        == "note.sh DR-1 12 https://x/1 'In Progress' '' ''"
+    )
+    # Unknown is empty, including a PR number of 0.
+    assert rule.render(ticket="DR-1", pr_number=0).startswith("note.sh DR-1 '' ")
+
+
+def test_a_rule_repo_overrides_and_never_falls_back(tmp_path: Path) -> None:
+    config = _rules(f'[repos]\nDR = "{tmp_path}"\n')
+    rule = board.FlowRule(
+        name="r", trigger=Trigger.ON_ENTER, value="QA", command="x", repo=str(tmp_path / "other")
+    )
+    assert config.repo_for_rule(rule, "DR-1") == (
+        None,
+        f"no repo: flow r repo = {tmp_path / 'other'} does not exist",
+    )
+    (tmp_path / "other").mkdir()
+    assert config.repo_for_rule(rule, "DR-1") == (tmp_path / "other", "rule")
+    plain = replace(rule, repo="")
+    assert config.repo_for_rule(plain, "DR-1") == (tmp_path, "repos.DR")
