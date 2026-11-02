@@ -875,6 +875,26 @@ def _cmd_doctor(*, provider: str = "all") -> int:
     recorded = len(work_items.load_all())
     ok(f"work items: {recorded} recorded", str(work_items.work_dir()))
 
+    # The board (board.toml) is opt-in too. Its errors stop every flow, so
+    # they are warnings here (the dashboard still runs); its warnings are
+    # things `ephor flows check` would also call out, and disable nothing.
+    from ephor import board
+    from ephor.flows import cli as flows_cli
+
+    config = board.load()
+    if config is None:
+        ok("board: not configured", f"create {board.board_path()} to turn the board on")
+    else:
+        if config.errors:
+            warn(
+                f"board: {len(config.errors)} error(s) in board.toml",
+                "no flow dispatches until they are fixed — `ephor flows check`",
+            )
+        else:
+            ok(f"board: {len(config.rules)} flow(s)", str(config.path))
+        for warning in flows_cli.check_warnings(config):
+            warn("board", warning)
+
     # Render results.
     icons = {"ok": "[ ok ]", "warn": "[warn]", "fail": "[FAIL]"}
     fails = sum(1 for level, _, _ in checks if level == "fail")

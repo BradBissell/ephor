@@ -109,10 +109,10 @@ src/ephor/
 ├── board.py                   ← board.toml: lanes, repos, flow rules (validated, errors collected)
 ├── flows/snapshot.py          ← board search → diff → flows/snapshot.json (the rule-less tick)
 ├── flows/tick.py              ← the flows tick: rules, adopt/stale, guards, dispatch
-├── flows/triggers.py          ← on_pr (gh per ticket) / on_session (state files) observations
+├── flows/triggers.py          ← on_pr (one gh listing per repo) / on_session (state files) observations
 ├── flows/runs.py              ← flows/runs/<run_id>.json: O_EXCL claims + compare-and-set states
-├── flows/runners.py           ← start= / command= in detached tmux windows, `.exit` wrapper
-├── flows/cli.py               ← `ephor flows ...` (board, tick, watch, ls, approve, deny, pause, resume, check)
+├── flows/runners.py           ← start= / command= in detached tmux windows, `.exit` + `.log` wrapper
+├── flows/cli.py               ← `ephor flows ...` (board, tick, watch, ls, show, explain, approve, deny, retry, pause, resume, check)
 ├── filelock.py                ← sidecar flock for stores written from more than one process
 └── notify.py                  ← opt-in push (ntfy/webhook); policy engine that decides
                                what is worth interrupting you for
@@ -145,8 +145,10 @@ deleted branch cannot turn a settled fact back into an amber guess).
 | `pending/<sid>.json` | ephor; **read + deleted** by the hook | none — create/consume |
 | `events.ndjson` | the TUI, the launcher, the flows tick | `events.ndjson.lock` flock around rotate + `O_APPEND` write |
 | `flows/snapshot.json` | the flows tick (TUI worker, `ephor flows watch` / `tick`, a systemd timer, `ephor flows board --refresh`) | `flows/tick.lock` (non-blocking — a tick that cannot take it returns and reads the holder's snapshot); atomic rename, 0600, written last |
-| `flows/runs/<run_id>.json` | the flows tick; approve/deny (CLI, TUI) | `O_EXCL` create claims a run; every later read-check-write (tick transitions, approve/deny) holds the `flows/runs/.lock` sidecar flock (short, blocking with timeout) and re-reads the state under it; approve/deny refuse unless the state is still `awaiting_confirm` |
+| `flows/runs/<run_id>.json` | the flows tick; approve/deny/retry (CLI, TUI) | `O_EXCL` create claims a run; every later read-check-write (tick transitions, approve/deny/retry) holds the `flows/runs/.lock` sidecar flock (short, blocking with timeout) and re-reads the state under it; approve/deny refuse unless the state is still `awaiting_confirm`, retry unless it is `stuck`, `failed` or `expired` |
 | `flows/runs/<run_id>.exit` | the `command =` wrapper in the flow's tmux window | none — written to a temp name and renamed; cleared by the tick before each attempt |
+| `flows/runs/<run_id>.log` | the `command =` wrapper (`tee -a`) | none — append-only, one writer per attempt |
+| `flows/backoff.json` | the flows tick, on a Jira 429 | none — atomic rename; removed by the next successful search |
 | `flows/payloads/<run_id>.json` | the flows tick | none — written once before launch, 0600 |
 | `flows/paused` | `ephor flows pause` / `resume` | none — presence is the flag |
 
@@ -161,7 +163,7 @@ quarter of a second proceeds unlocked, exactly as before, rather than wedging
 the dashboard — the TUI makes these writes on its event-loop thread.
 
 Run files need more than atomic rename: approve can read `awaiting_confirm`
-while a tick expires or supersedes the run, and approve's rename would then
+while a tick expires the run, and approve's rename would then
 bring it back as `claimed`. So every run update re-reads and re-checks the
 state under `flows/runs/.lock`. That is a separate lock from `flows/tick.lock`
 because the tick holds `tick.lock` across Jira and `gh` calls, and an approve
@@ -316,22 +318,31 @@ create, so the same event can never launch twice. The generation names the
 event: `<status_id>-<seq>` for `on_enter` / `on_exit` (one visit to a
 status), `pr<number>` for `on_pr`, and the session id's first twelve
 characters for `on_session`. A run moves `awaiting_confirm → claimed →
-launched → done | failed`, or ends `denied`, `expired`, `superseded` or
-`stuck`; `blocked` is a guard's "not now" and is retried while the event is
-still current. Guards run in a fixed order — pause flag, hourly cap,
-per-ticket breaker, then for agent flows the live-agent cap and the launch
-guard — followed by an uncached `GET issue` re-check. Flows launch in
-detached tmux windows named `flow:<KEY>:<flow>`; `command =` flows run under
-a wrapper that writes `runs/<run_id>.exit`, which a later tick folds into
-`done` / `failed`.
+launched → done | failed`, or ends `denied`, `expired` (whatever made it
+stop applying — the reason says which) or `stuck`; `ephor flows retry`
+re-arms a stuck, failed or expired one. `blocked` is a guard's "not now" and
+is retried while the event is still current — a failed launch with an
+exponential backoff. Guards run in a fixed order — pause flag, then for
+`command =` flows their own hourly cap, and for agent flows the hourly cap,
+the per-ticket breaker, the live-agent cap and the launch guard — followed
+by an uncached `GET issue` re-check. Flows launch in detached tmux windows
+named `flow:<KEY>:<flow>`; `command =` flows run under a wrapper that writes
+`runs/<run_id>.exit`, which a later tick folds into `done` / `failed`, and
+tees the output to `runs/<run_id>.log`. Every step of a run is an event-log
+line (`flow_created`, `flow_approved`, `flow_dispatched`, `flow_blocked`,
+`flow_finished`, `flow_expired`, `flow_stuck`, `flow_cancelled`,
+`flow_rearmed`).
 
 `on_pr` and `on_session` cannot be read off the board search, so
 `flows/triggers.py` keeps an observation of each in the snapshot and diffs
-it like the statuses: `prs` (ticket → every PR `gh pr list --search <KEY>`
-attributes to it, refreshed at most every `pr_interval`, stamped in
-`pr_checked_at`) and `sessions_seen` (session id → ticket, status, pid, and
-whether it has been idle past `settle`). A ticket's first PR lookup and a
-session's first sighting are baselines and fire nothing. `died` is a session
+it like the statuses: `prs` (ticket → every PR that names it, from one
+`gh pr list --state all` per repo matched locally, refreshed at most every
+`pr_interval`, stamped in `pr_checked_at`, with `pr_repos` recording which
+repo each answer came from) and `sessions_seen` (session id → ticket,
+status, pid, and since when it has been idle past `settle`). A ticket's
+first PR lookup, an answer from a different repo than last time, and a
+session's first sighting are baselines and fire nothing; `merged` fires only
+for a PR last seen open. `died` is a session
 last seen alive that is now DEAD — or whose state file the reconciler has
 already removed, when the pid it recorded is no longer running; a DEAD
 row whose process is alive (resume residue) is not a death. Each observation
@@ -341,5 +352,8 @@ effect it is cleared, so a rule added later starts from a fresh baseline.
 session stays idle; `merged` and `died` are final.
 
 The tick holds `tick.lock` for the duration of those `gh` calls (one per
-eligible ticket, every `pr_interval`), which is why `approve` / `deny` take
-the separate `flows/runs/.lock` instead.
+repo, every `pr_interval`), which is why `approve` / `deny` take the
+separate `flows/runs/.lock` instead. A tick that finds the snapshot younger
+than 45 seconds (and no approval newer than it) returns before asking Jira
+anything, so the dashboard, `flows watch` and a timer running together cost
+one search a minute, not three.

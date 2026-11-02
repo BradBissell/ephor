@@ -5,11 +5,15 @@ subcommand per phase:
 
 * ``board`` prints the status lanes from the last snapshot — the same lanes
   the dashboard's ``status`` grouping draws — with each ticket's flow badge.
-* ``tick [--dry-run]`` runs one tick (:mod:`ephor.flows.tick`); ``watch``
-  runs one every ``--interval`` seconds until Ctrl-C, which is how flows keep
-  running while the dashboard is closed.
-* ``ls [--all]`` lists runs, newest first; ``approve`` / ``deny`` answer a
-  run that is awaiting confirmation, by id or unique prefix.
+* ``tick [--dry-run] [--force]`` runs one tick (:mod:`ephor.flows.tick`);
+  ``watch`` runs one every ``--interval`` seconds until Ctrl-C, which is how
+  flows keep running while the dashboard is closed.
+* ``ls [--all] [--ticket K] [--flow F]`` lists runs, newest first; ``show``
+  prints one in full (payload, attempts, timestamps, its output's tail);
+  ``approve`` / ``deny`` answer a run that is awaiting confirmation, by id
+  or unique prefix; ``retry`` re-arms a stuck, failed or expired one.
+* ``explain <KEY> [flow]`` says, rule by rule, whether it would fire on a
+  ticket now, and the first gate that stops it — read-only.
 * ``pause`` / ``resume`` set and clear the flag that stops every dispatch.
 * ``check`` validates board.toml and asks Jira who you are.
 """
@@ -17,7 +21,9 @@ subcommand per phase:
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -49,6 +55,11 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         action="store_true",
         help="Report what would happen; write nothing and launch nothing",
     )
+    tick_p.add_argument(
+        "--force",
+        action="store_true",
+        help=f"Tick even if the snapshot is younger than {flows_tick.COALESCE_SEC:g}s",
+    )
     watch_p = sub.add_parser("watch", help="Run a tick every --interval seconds until Ctrl-C")
     watch_p.add_argument(
         "--interval",
@@ -61,10 +72,23 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
     ls_p.add_argument(
         "--all", action="store_true", help="Include every finished run, not just recent ones"
     )
+    ls_p.add_argument("--ticket", metavar="KEY", help="Only runs for this ticket")
+    ls_p.add_argument("--flow", metavar="NAME", help="Only runs of this flow")
+    show_p = sub.add_parser("show", help="Print one run: payload, attempts, timestamps, output")
+    show_p.add_argument("run", help="Run id, or a unique prefix of one")
     approve_p = sub.add_parser("approve", help="Approve a run that is awaiting confirmation")
     approve_p.add_argument("run", help="Run id, or a unique prefix of one")
     deny_p = sub.add_parser("deny", help="Deny a run that is awaiting confirmation")
     deny_p.add_argument("run", help="Run id, or a unique prefix of one")
+    retry_p = sub.add_parser(
+        "retry", help="Re-arm a stuck, failed or expired run (back to awaiting confirmation)"
+    )
+    retry_p.add_argument("run", help="Run id, or a unique prefix of one")
+    explain_p = sub.add_parser(
+        "explain", help="Say why each flow would, or would not, fire on a ticket now"
+    )
+    explain_p.add_argument("ticket", help="Ticket key, e.g. DR-8222")
+    explain_p.add_argument("flow", nargs="?", help="Only this flow")
     sub.add_parser("pause", help="Stop every flow from dispatching until `resume`")
     sub.add_parser("resume", help="Let flows dispatch again")
     sub.add_parser("check", help="Validate board.toml and probe Jira")
@@ -76,15 +100,21 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if command == "board":
         return cmd_board(refresh=bool(args.refresh))
     if command == "tick":
-        return cmd_tick(dry_run=bool(args.dry_run))
+        return cmd_tick(dry_run=bool(args.dry_run), force=bool(args.force))
     if command == "watch":
         return cmd_watch(interval=float(args.interval))
     if command == "ls":
-        return cmd_ls(show_all=bool(args.all))
+        return cmd_ls(show_all=bool(args.all), ticket=args.ticket, flow=args.flow)
+    if command == "show":
+        return cmd_show(str(args.run))
     if command == "approve":
         return cmd_answer(str(args.run), approve=True)
     if command == "deny":
         return cmd_answer(str(args.run), approve=False)
+    if command == "retry":
+        return cmd_retry(str(args.run))
+    if command == "explain":
+        return cmd_explain(str(args.ticket), args.flow)
     if command == "pause":
         return cmd_pause()
     if command == "resume":
@@ -142,7 +172,8 @@ def cmd_board(*, refresh: bool) -> int:
     if refresh:
         # A tick, never the rule-less refresh: a refresh would consume the
         # moves it saw, and the flow rules would never get to fire on them.
-        result = flows_tick.run(config).refresh
+        # Asked for by name: a fresh snapshot is no reason to skip it.
+        result = flows_tick.run(config, force=True).refresh
         if not result.ok:
             print(f"ephor: refresh: {result.message}", file=sys.stderr)
             status = 1
@@ -164,7 +195,9 @@ def cmd_board(*, refresh: bool) -> int:
     tickets = snap.on_board()
     lanes: dict[str, list[tuple[str, TicketState]]] = {}
     for key in sorted(tickets, key=ticket_sort_key):
-        lanes.setdefault(settings.column_for(tickets[key].status), []).append((key, tickets[key]))
+        record = tickets[key]
+        lane = settings.column_for(record.status, record.status_category)
+        lanes.setdefault(lane, []).append((key, record))
     sessions = _live_sessions_by_ticket(snap)
     badges = runs.badges_by_ticket(runs.list_runs())
     configured = {column.name for column in settings.columns}
@@ -211,14 +244,14 @@ def _load_config() -> board.BoardConfig | None:
     return config
 
 
-def cmd_tick(*, dry_run: bool) -> int:
+def cmd_tick(*, dry_run: bool, force: bool = False) -> int:
     """Run one tick and say what it did (or, with --dry-run, would do)."""
     config = _load_config()
     if config is None:
         return 1
-    result = flows_tick.run(config, dry_run=dry_run)
+    result = flows_tick.run(config, dry_run=dry_run, force=force)
     prefix = "dry run: " if dry_run else ""
-    if result.status is flows_tick.TickStatus.LOCKED:
+    if result.status in (flows_tick.TickStatus.LOCKED, flows_tick.TickStatus.SKIPPED):
         print(f"ephor: {result.message}")
         return 0
     if not result.ok:
@@ -312,7 +345,8 @@ def _watch_once(last: str) -> str:
         line = f"board.toml [board] has {len(config.board_errors)} error(s) — `ephor flows check`"
     else:
         result = flows_tick.run(config)
-        if result.status is flows_tick.TickStatus.LOCKED:
+        if result.status in (flows_tick.TickStatus.LOCKED, flows_tick.TickStatus.SKIPPED):
+            # Another ticker got there first (or very recently): normal.
             return last
         if not result.ok:
             line = f"tick: {result.message}"
@@ -336,13 +370,17 @@ def _watch_once(last: str) -> str:
 _LS_RECENT_SEC = 24 * 3600.0
 
 
-def cmd_ls(*, show_all: bool) -> int:
+def cmd_ls(*, show_all: bool, ticket: str | None = None, flow: str | None = None) -> int:
     """Runs newest first: pending ones always, finished ones for a day (or --all)."""
     now = datetime.now(UTC)
+    wanted_ticket = (ticket or "").strip().upper()
+    wanted_flow = (flow or "").strip().lower()
     listed = [
         r
         for r in runs.list_runs()
-        if show_all or not r.terminal or (runs.age_sec(r.updated_at, now) or 0.0) < _LS_RECENT_SEC
+        if (show_all or not r.terminal or (runs.age_sec(r.updated_at, now) or 0.0) < _LS_RECENT_SEC)
+        and (not wanted_ticket or r.ticket == wanted_ticket)
+        and (not wanted_flow or r.flow == wanted_flow)
     ]
     if runs.is_paused():
         print("flows are PAUSED — `ephor flows resume` to dispatch again")
@@ -373,6 +411,118 @@ def cmd_answer(ref: str, *, approve: bool) -> int:
         print(f"ephor: {message}", file=sys.stderr)
         return 1
     print(message)
+    return 0
+
+
+def cmd_retry(ref: str) -> int:
+    """Re-arm one stuck, failed or expired run: it waits for confirmation again."""
+    target, problem = runs.resolve(ref)
+    if target is None:
+        print(f"ephor: {problem}", file=sys.stderr)
+        return 1
+    updated, message = runs.retry(target.run_id)
+    if updated is None:
+        print(f"ephor: {message}", file=sys.stderr)
+        return 1
+    print(message)
+    print(f"  `ephor flows approve {updated.run_id}` to launch it on the next tick")
+    return 0
+
+
+# The run fields `show` prints, in order: identity, what fired it, where it went.
+_SHOW_FIELDS = (
+    "state",
+    "reason",
+    "flow",
+    "ticket",
+    "title",
+    "trigger",
+    "event",
+    "generation",
+    "kind",
+    "from_status",
+    "to_status",
+    "pr_number",
+    "pr_url",
+    "head_sha",
+    "session_id",
+    "idle_since",
+    "stale",
+    "attempts",
+    "retries",
+    "created_at",
+    "approved_at",
+    "rearmed_at",
+    "attempt_at",
+    "retry_at",
+    "launched_at",
+    "updated_at",
+    "window",
+    "pane",
+    "exit_code",
+    "payload_path",
+)
+
+
+def cmd_show(ref: str, *, log_lines: int = 20) -> int:
+    """Print one run in full: its fields, its payload, and the tail of its output log."""
+    target, problem = runs.resolve(ref)
+    if target is None:
+        print(f"ephor: {problem}", file=sys.stderr)
+        return 1
+    print(target.run_id)
+    for name in _SHOW_FIELDS:
+        value = getattr(target, name)
+        if value in ("", None, 0, False) and name not in ("state", "attempts"):
+            continue
+        shown = printable(str(value), 200)
+        print(f"  {name + ':':<14}{shown}")
+    payload_file = runs.payload_path(target.run_id)
+    try:
+        payload = json.loads(payload_file.read_text())
+    except (OSError, ValueError):
+        payload = None
+    print()
+    if payload is None:
+        print("payload: none written yet (it is written when the run launches)")
+    else:
+        print(f"payload ({payload_file}):")
+        for line in json.dumps(payload, indent=2, sort_keys=True).splitlines():
+            print(f"  {printable(line, 200)}")
+    tail = runs.read_log_tail(target.run_id, log_lines)
+    if tail is not None:
+        print()
+        print(f"output, last {len(tail)} line(s) ({runs.log_path(target.run_id)}):")
+        for line in tail:
+            print(f"  {printable(line, 200)}")
+    return 0
+
+
+def cmd_explain(ticket: str, flow: str | None = None) -> int:
+    """Say, for each flow (or ``flow``), whether it would fire on ``ticket`` now."""
+    config = _load_config()
+    if config is None:
+        return 1
+    found, problem = flows_tick.explain(config, ticket, flow)
+    if problem:
+        print(f"ephor: {problem}", file=sys.stderr)
+        return 1
+    key = ticket.strip().upper()
+    snap = board_snapshot.load()
+    record = snap.tickets.get(key) if snap is not None else None
+    if record is not None:
+        title = printable(record.title, 60)
+        print(f"{key}  {printable(record.status, 30) or '?'}  {title}")
+    for item in found:
+        print()
+        verdict = "would fire" if item.fires else f"does not fire — {item.gate}"
+        print(f"{item.flow}: {verdict}")
+        for check in item.passed:
+            print(f"  ✓ {printable(check, 120)}")
+        mark = "✓" if item.fires else "✗"
+        print(f"  {mark} {printable(item.detail, 160)}")
+        for note in item.notes:
+            print(f"  · {printable(note, 160)}")
     return 0
 
 
@@ -423,10 +573,21 @@ def cmd_check() -> int:
         print(f"  search: {config.board.search_jql()}")
         for rule in config.rules:
             what = f"start={rule.start!r}" if rule.start else f"command={rule.command!r}"
+            extra = "".join(
+                f" {name}={value!r}"
+                for name, value in (
+                    ("from", list(rule.from_statuses)),
+                    ("jql", rule.jql),
+                    ("repo", rule.repo),
+                )
+                if value
+            )
             print(
                 f"  flow {rule.name}: {rule.trigger}={rule.value!r} assignee={rule.assignee} "
-                f"mode={rule.mode} {what}"
+                f"mode={rule.mode} {what}{extra}"
             )
+    for warning in check_warnings(config):
+        print(f"  warn: {warning}")
     # Before the Jira probe, which can end the check early.
     if runs.is_paused():
         print("flows: PAUSED — `ephor flows resume` to dispatch again")
@@ -444,7 +605,52 @@ def cmd_check() -> int:
         # site does not have) otherwise only shows up as a tick that fails.
         found = jira_api.search(config.board.search_jql(), ("status",), page_size=1, max_pages=1)
         if found is None:
-            print("jira: the board search failed — check [board] jql and projects")
+            failure = jira_api.last_error()
+            why = f" ({failure.summary})" if failure is not None else ""
+            print(f"jira: the board search failed{why} — check [board] jql and projects")
             return 1
         print("jira: board search ok")
+        for rule in config.rules:
+            if not rule.jql:
+                continue
+            # The board's scope AND the rule's condition: does Jira accept it?
+            query = f"project in ({', '.join(config.board.projects)}) AND ({rule.jql})"
+            if jira_api.search(query, ("status",), page_size=1, max_pages=1) is None:
+                failure = jira_api.last_error()
+                why = f" ({failure.summary})" if failure is not None else ""
+                print(f"jira: flow {rule.name}: its jql was rejected{why}")
+                status = 1
+            else:
+                print(f"jira: flow {rule.name}: jql ok")
     return status
+
+
+def check_warnings(config: board.BoardConfig) -> list[str]:
+    """board.toml's warnings, plus what only a look at the snapshot and the environment shows.
+
+    Warnings never disable anything (see :mod:`ephor.board`). Shared with
+    ``ephor doctor``, which shows them as warn.
+    """
+    found = list(config.warnings)
+    snap = board_snapshot.load()
+    if config.lanes_ok and snap is not None:
+        seen = frozenset(t.status.strip().lower() for t in snap.on_board().values() if t.status)
+        # Only the "in a column, but no ticket is in it" half is new here.
+        found.extend(
+            w
+            for w in board.status_warnings(config.board, config.rules, seen)
+            if w not in config.warnings
+        )
+    if config.rules and not config.flows.tmux_session and not os.environ.get("TMUX"):
+        found.append(
+            "[flows] tmux_session is empty and this shell is not inside tmux: a tick run "
+            "from here (a timer, a plain terminal) has no session to open flow windows in — "
+            'set tmux_session = "main" (any session that exists)'
+        )
+    if (held := flows_tick.backoff_until()) is not None:
+        until, why = held
+        found.append(
+            f"Jira rate-limited the board search ({why}); ticks wait until "
+            f"{until.astimezone().strftime('%H:%M:%S')}"
+        )
+    return found

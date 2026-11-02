@@ -15,7 +15,7 @@ from ephor import board, eventlog
 from ephor.flows import printable, ticket_sort_key
 from ephor.flows import snapshot as snap
 from ephor.flows.snapshot import (
-    DROP_AFTER_UNSEEN,
+    DROP_AFTER_UNSEEN_SEC,
     PrState,
     SessionSeen,
     Snapshot,
@@ -159,17 +159,33 @@ def test_a_returning_ticket_resets_unseen_and_compares_to_its_last_status() -> N
 
 
 def test_a_ticket_unseen_for_too_long_is_dropped() -> None:
+    """Measured in time, not searches: a thousand quick ticks drop nothing."""
     current, _ = snap.advance(None, [_issue("DR-1", "In Progress", "3")], now=T0)
-    for _ in range(DROP_AFTER_UNSEEN):
+    for _ in range(1000):
         current, _ = snap.advance(current, [], now=T0)
-    assert current.tickets["DR-1"].unseen_ticks == DROP_AFTER_UNSEEN
-    current, _ = snap.advance(current, [], now=T0)
+    assert current.tickets["DR-1"].unseen_ticks == 1000
+    assert current.tickets["DR-1"].unseen_since == "2026-10-01T12:00:00+00:00"
+    current, _ = snap.advance(current, [], now=T0 + timedelta(seconds=DROP_AFTER_UNSEEN_SEC - 1))
+    assert "DR-1" in current.tickets
+    current, _ = snap.advance(current, [], now=T0 + timedelta(seconds=DROP_AFTER_UNSEEN_SEC + 1))
     assert "DR-1" not in current.tickets
 
 
+def test_a_ticket_seen_again_restarts_its_unseen_clock() -> None:
+    current, _ = snap.advance(None, [_issue("DR-1", "In Progress", "3")], now=T0)
+    current, _ = snap.advance(current, [], now=T0 + timedelta(minutes=50))
+    current, _ = snap.advance(
+        current, [_issue("DR-1", "In Progress", "3")], now=T0 + timedelta(minutes=55)
+    )
+    assert current.tickets["DR-1"].unseen_since == ""
+    current, _ = snap.advance(current, [], now=T0 + timedelta(minutes=70))
+    current, _ = snap.advance(current, [], now=T0 + timedelta(minutes=100))
+    assert "DR-1" in current.tickets
+
+
 def _drop(current: Snapshot, *, now: datetime = T0) -> Snapshot:
-    for _ in range(DROP_AFTER_UNSEEN + 1):
-        current, _ = snap.advance(current, [], now=now)
+    current, _ = snap.advance(current, [], now=now)
+    current, _ = snap.advance(current, [], now=now + timedelta(seconds=DROP_AFTER_UNSEEN_SEC + 1))
     return current
 
 
@@ -179,7 +195,7 @@ def test_a_dropped_ticket_returning_elsewhere_gets_a_new_seq() -> None:
     gone = _drop(second)
     assert "DR-1" not in gone.tickets
     assert gone.dropped["DR-1"].seq == 1
-    assert gone.dropped["DR-1"].dropped_at == "2026-10-01T12:00:00+00:00"
+    assert gone.dropped["DR-1"].dropped_at == "2026-10-01T13:00:01+00:00"
     assert (gone.dropped["DR-1"].status, gone.dropped["DR-1"].status_id) == ("Peer Review", "10")
     back, moves = snap.advance(gone, [_issue("DR-1", "QA", "11")], now=T0)
     assert back.tickets["DR-1"].seq == 2
@@ -420,3 +436,98 @@ def test_ticket_sort_key_orders_numerically() -> None:
 
 def test_snapshot_lives_beside_the_session_state(tmp_path: Path) -> None:
     assert snap.snapshot_path() == tmp_path / "flows" / "snapshot.json"
+
+
+# --- entered_at, flagged, from_status, PR ci, prs_for -----------------------------------------
+
+
+def test_entered_at_is_the_tick_that_saw_the_move_and_an_estimate_before_that() -> None:
+    jira_date = "2026-09-28T08:00:00+00:00"
+    first, _ = snap.advance(
+        None, [_issue("DR-1", "To Do", "1", status_changed_at=jira_date)], now=T0
+    )
+    record = first.tickets["DR-1"]
+    assert (record.entered_at, record.entered_estimated) == (jira_date, True)
+    # Same status a tick later: kept.
+    later = T0 + timedelta(minutes=1)
+    second, _ = snap.advance(
+        first, [_issue("DR-1", "To Do", "1", status_changed_at=jira_date)], now=later
+    )
+    assert second.tickets["DR-1"].entered_at == jira_date
+    # A move: the tick's own clock, not an estimate, and where it came from.
+    moved_at = T0 + timedelta(minutes=2)
+    third, _ = snap.advance(second, [_issue("DR-1", "In Progress", "3")], now=moved_at)
+    moved = third.tickets["DR-1"]
+    assert (moved.entered_at, moved.entered_estimated) == (runs_iso(moved_at), False)
+    assert (moved.from_status, moved.from_status_id) == ("To Do", "1")
+    fourth, _ = snap.advance(third, [_issue("DR-1", "In Progress", "3")], now=moved_at)
+    assert fourth.tickets["DR-1"].entered_at == runs_iso(moved_at)
+    assert fourth.tickets["DR-1"].from_status == "To Do"
+
+
+def runs_iso(moment: datetime) -> str:
+    return moment.isoformat(timespec="seconds")
+
+
+def test_an_old_snapshot_without_entered_at_borrows_the_estimate() -> None:
+    old = Snapshot.from_dict(
+        {"taken_at": runs_iso(T0), "tickets": {"DR-1": {"status": "QA", "status_id": "4"}}}
+    )
+    record = old.tickets["DR-1"]
+    assert (record.entered_at, record.entered_estimated, record.flagged) == ("", False, False)
+    new, _ = snap.advance(
+        old, [_issue("DR-1", "QA", "4", status_changed_at="2026-09-30T00:00:00+00:00")], now=T0
+    )
+    assert new.tickets["DR-1"].entered_at == "2026-09-30T00:00:00+00:00"
+    assert new.tickets["DR-1"].entered_estimated
+
+
+def test_the_new_fields_round_trip() -> None:
+    ticket = TicketState(
+        status="QA",
+        entered_at=runs_iso(T0),
+        entered_estimated=True,
+        flagged=True,
+        from_status="In Progress",
+        from_status_id="3",
+        unseen_since=runs_iso(T0),
+    )
+    original = Snapshot(
+        taken_at=runs_iso(T0),
+        tickets={"DR-1": ticket},
+        prs={"DR-1": (PrState(5, "OPEN", ci="fail"), PrState(6, "MERGED", ci="bogus"))},
+        pr_repos={"DR-1": "/repo"},
+        flagged_field="customfield_10021",
+        flagged_for="abc",
+        sessions_seen={"s": SessionSeen(ticket="DR-1", status="IDLE", idle_since=runs_iso(T0))},
+    )
+    back = Snapshot.from_dict(json.loads(original.to_json()))
+    assert back.tickets["DR-1"] == ticket
+    assert [pr.ci for pr in back.prs["DR-1"]] == ["fail", ""]  # an unknown word is unknown
+    assert back.pr_repos == {"DR-1": "/repo"}
+    assert (back.flagged_field, back.flagged_for) == ("customfield_10021", "abc")
+    assert back.sessions_seen["s"].idle_since == runs_iso(T0)
+    assert back.prs_for("dr-1") == back.prs["DR-1"]
+    assert back.prs_for("DR-9") == ()
+
+
+def test_the_flag_comes_from_the_issue() -> None:
+    new, _ = snap.advance(None, [_issue("DR-1", "QA", "4", flagged=True)], now=T0)
+    assert new.tickets["DR-1"].flagged
+    unflagged, _ = snap.advance(new, [_issue("DR-1", "QA", "4")], now=T0)
+    assert not unflagged.tickets["DR-1"].flagged
+
+
+def test_the_search_asks_for_the_flagged_field_only_when_known() -> None:
+    asked: list[tuple[str, ...]] = []
+
+    def search(jql: str, fields: tuple[str, ...]) -> list[Issue]:
+        asked.append(fields)
+        return []
+
+    settings = _config().board
+    snap.fetch(settings, search=search)
+    snap.fetch(settings, search=search, flagged_field="customfield_10021")
+    assert asked[0] == snap.SEARCH_FIELDS
+    assert "statuscategorychangedate" in asked[0]
+    assert asked[1] == (*snap.SEARCH_FIELDS, "customfield_10021")

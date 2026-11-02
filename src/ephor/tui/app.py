@@ -60,6 +60,7 @@ from ephor.account_usage import (
 from ephor.account_usage import (
     save_store as save_account_store,
 )
+from ephor.board import BoardConfig
 from ephor.constants import WORK_ATTENTION_DISPLAY, AgentStatus, WorkAttention
 from ephor.flows import runs as flow_runs
 from ephor.flows.runs import Run, RunState
@@ -89,13 +90,17 @@ from ephor.tmux.navigator import (
     jump_to,
     kill_session,
 )
+from ephor.tui import prefs
 from ephor.tui.activity import ActivitySampler
 from ephor.tui.flows_screen import FlowsScreen
+from ephor.tui.help_screen import HelpScreen
 from ephor.tui.lanes import (
     SNAPSHOT_REFRESH_INTERVAL,
+    LaneCounts,
     LaneData,
     Lanes,
     TicketRow,
+    jira_browse_url,
     markup_text,
 )
 from ephor.tui.lanes import (
@@ -128,6 +133,9 @@ from ephor.usage import (
 REFRESH_INTERVAL = 0.5  # seconds
 RECONCILE_INTERVAL = 30.0  # how often to sweep dead state files / reset stuck waits
 KILL_CONFIRM_WINDOW_SEC = 3.0  # second-press window to actually fire the kill
+# Same two-press guard for `N` on a ticket row, which opens a worktree and
+# starts an agent on a ticket nobody is working on yet.
+START_CONFIRM_WINDOW_SEC = 3.0
 # ccusage is local-transcript-driven (no rate limit), but each invocation
 # rescans hundreds of MB of JSONL — typical 3-5s. The transcripts only
 # update on assistant turn completion, so refreshing more often than this
@@ -182,7 +190,8 @@ class EphorApp(App[int]):
         Binding("r", "refresh", "refresh now"),
         Binding("x", "kill", "kill selected session"),
         Binding("s", "summarize", "summarize selected session"),
-        Binding("o", "open_pr", "open the selected session's pull request"),
+        Binding("o", "open_pr", "open the selected row's pull request (ticket row: else Jira)"),
+        Binding("J", "open_jira", "open the selected row's ticket in Jira"),
         Binding("p", "pin_ticket", "pin a ticket to the selected session"),
         Binding("t", "jump_speaking", "jump to TTS speaking session"),
         Binding("m", "toggle_mute", "mute / unmute TTS playback"),
@@ -206,12 +215,18 @@ class EphorApp(App[int]):
             "g", "cycle_grouping", "group rows by ticket / repo / Jira status lane / not at all"
         ),
         Binding("z", "toggle_collapse", "collapse or expand the group at the cursor"),
+        Binding("B", "toggle_board", "status lanes (the board) on / off"),
+        Binding("left_square_bracket", "prev_lane", "cursor to the previous group header"),
+        Binding("right_square_bracket", "next_lane", "cursor to the next group header"),
         # Ticket flows (board.toml): y / n inside the screen, never a / d,
         # which answer permission requests out here.
         Binding("f", "flows", "flow runs: approve / deny"),
         # Launching, not just watching.
-        Binding("N", "new_session", "start another session on this row's ticket"),
+        Binding(
+            "N", "new_session", "start a session on this row's ticket (ticket row: press twice)"
+        ),
         Binding("R", "resume_session", "reopen this session in a new tmux window"),
+        Binding("question_mark", "help", "keys and the flow badge legend"),
     ]
 
     # Grouping modes, in the order `g` cycles them.
@@ -259,13 +274,23 @@ class EphorApp(App[int]):
         # act on many sessions reads this first and falls back to the cursor.
         self._selected: set[str] = set()
         # Fleet shape: how rows are grouped, and which groups are folded away.
-        self._group_by: str = "none"
+        # The grouping is remembered across launches (see ephor.tui.prefs).
+        self._group_by: str = prefs.load_grouping(self.GROUPINGS)
+        # What `B` returns to when it leaves the status lanes.
+        self._group_before_board: str = "none" if self._group_by == "status" else self._group_by
         self._collapsed: set[str] = set()
         # Status lanes (the "status" grouping): board.toml, the board
         # snapshot, and the tickets that currently have a live session —
         # a board ticket without one is drawn as a ticket row.
         self._lanes = Lanes()
         self._session_tickets: set[str] = set()
+        # Every lane header's numbers, counted once per refresh in
+        # _visible_order rather than once per header per repaint.
+        self._lane_counts: dict[str, LaneCounts] = {}
+        self._board_line: Static | None = None
+        # `N` on a ticket row arms; a second press within the window starts.
+        self._start_armed: str | None = None
+        self._start_armed_at: float = 0.0
         self._board_in_flight: bool = False
         # A tick was asked for (a run was just approved) while one was
         # running; run another as soon as it lands.
@@ -334,6 +359,11 @@ class EphorApp(App[int]):
         with Container(id="main"):
             self._header_bar = HeaderBar()
             yield self._header_bar
+            # The status lanes' first line: how old the board is. Shown only
+            # in the status grouping.
+            self._board_line = Static("", id="board-line")
+            self._board_line.display = self._group_by == "status"
+            yield self._board_line
             yield ListView(id="session-list")
             self._summary_line = Static("", id="summary-line")
             yield self._summary_line
@@ -547,9 +577,7 @@ class EphorApp(App[int]):
             for i, (row_id, agent) in enumerate(visible):
                 if is_virtual_row(row_id):
                     ticket = ticket_of_virtual_row(row_id)
-                    ticket_row = TicketRow(
-                        ticket, self._lanes.ticket(ticket), self._lanes.badge_for(ticket)
-                    )
+                    ticket_row = TicketRow(self._lanes.row_data(ticket))
                     item = ListItem(ticket_row)
                     new_tickets[row_id] = ticket_row
                 elif agent is None:
@@ -744,7 +772,7 @@ class EphorApp(App[int]):
                 self._paint_row(row, agent, speaking_sid)
         for row_id, ticket_row in self._tickets_by_id.items():
             ticket = ticket_of_virtual_row(row_id)
-            ticket_row.update_ticket(self._lanes.ticket(ticket), self._lanes.badge_for(ticket))
+            ticket_row.update_ticket(self._lanes.row_data(ticket))
         if not self._headers_by_id:
             return
         members = self._group_members(agents)
@@ -798,12 +826,11 @@ class EphorApp(App[int]):
         if self._group_by == "none":
             return [(a.session_id, a) for a in agents]
         if self._group_by == "status":
-            self._lanes.apply_default_folds(self._collapsed)
-            return self._lanes.rows(
-                self._group_members(agents),
-                self._lanes.tickets_without_session(self._session_tickets, self._filter),
-                self._collapsed,
-            )
+            members = self._group_members(agents)
+            tickets = self._lanes.tickets_without_session(self._session_tickets, self._filter)
+            self._lane_counts = self._lanes.lane_counts(members, tickets, self._ticket_for_agent)
+            self._lanes.apply_default_folds(self._collapsed, frozenset(members))
+            return self._lanes.rows(members, tickets, self._collapsed)
         grouped: dict[str, list[AgentState]] = {}
         for agent in agents:
             grouped.setdefault(self._group_key(agent), []).append(agent)
@@ -823,8 +850,12 @@ class EphorApp(App[int]):
 
         collapsed = key in self._collapsed
         if self._group_by == "status":
-            sessionless = self._lanes.tickets_without_session(self._session_tickets, self._filter)
-            return self._lanes.header_markup(key, members, len(sessionless.get(key, [])), collapsed)
+            return self._lanes.header_markup(
+                key,
+                self._lane_counts.get(key, LaneCounts()),
+                collapsed,
+                stale=self._lanes.is_stale(),
+            )
         caret = "▸" if collapsed else "▾"
         needs = sum(1 for a in members if a.status in ATTENTION_STATUSES)
         working = sum(1 for a in members if a.status is AgentStatus.WORKING)
@@ -1040,9 +1071,26 @@ class EphorApp(App[int]):
         """
         summary = StatusSummary.from_agents(agents)
         if self._header_bar is not None:
+            awaiting, queued, blocked, stuck, any_badge = self._lanes.flow_counts()
             self._header_bar.update_summary(
-                summary, self._lanes.awaiting_count, self._lanes.health()
+                summary,
+                awaiting,
+                self._lanes.health(),
+                flows_queued=queued,
+                flows_blocked=blocked,
+                flows_stuck=stuck,
+                flows_any=any_badge,
             )
+        if self._board_line is not None:
+            in_board = self._group_by == "status"
+            self._board_line.display = in_board
+            if in_board:
+                snap = self._lanes.snapshot
+                on_board = snap.on_board() if snap is not None else {}
+                off_board = sum(
+                    1 for a in agents if (t := self._ticket_for_agent(a)) and t not in on_board
+                )
+                self._board_line.update(self._lanes.board_line(off_board))
         if self._summary_line is not None:
             self._summary_line.update(
                 _render_summary_line(
@@ -1089,6 +1137,8 @@ class EphorApp(App[int]):
         self._prs.invalidate()
         await self._refresh_table()
         self._refresh_prs()
+        if not self._board_in_flight:
+            self._refresh_board(force=True)
         self._set_toast("refreshed — re-resolving tickets and pull requests")
 
     def action_filter(self) -> None:
@@ -1302,9 +1352,25 @@ class EphorApp(App[int]):
         self._set_toast(f"cleared {count} mark(s)" if count else "nothing was marked")
 
     def action_cycle_grouping(self) -> None:
-        """Cycle none → ticket → repo. A flat list is hostile at 25 rows."""
+        """Cycle none → ticket → repo → status. A flat list is hostile at 25 rows."""
         index = self.GROUPINGS.index(self._group_by) if self._group_by in self.GROUPINGS else 0
-        self._group_by = self.GROUPINGS[(index + 1) % len(self.GROUPINGS)]
+        self._set_grouping(self.GROUPINGS[(index + 1) % len(self.GROUPINGS)])
+
+    def action_toggle_board(self) -> None:
+        """Status lanes on, or back to the grouping before them. Bound to `B`."""
+        if self._group_by == "status":
+            self._set_grouping(self._group_before_board)
+        else:
+            self._set_grouping("status")
+
+    def _set_grouping(self, group_by: str) -> None:
+        """Switch grouping, remember it for the next launch, and say what it is."""
+        if self._group_by != "status":
+            self._group_before_board = self._group_by
+        self._group_by = group_by
+        prefs.save_grouping(group_by)
+        if self._board_line is not None:
+            self._board_line.display = group_by == "status"
         # Group names differ per mode, so folds from the previous mode would
         # hide nothing and confuse everything.
         self._collapsed.clear()
@@ -1320,6 +1386,37 @@ class EphorApp(App[int]):
             )
             return
         self._set_toast(f"grouping: {self._group_by}")
+
+    def _step_lane(self, forward: bool) -> None:
+        """Move the cursor to the next (or previous) group header, wrapping."""
+        if self._group_by == "none":
+            self._set_toast("not grouped — press g, or B for the status lanes")
+            return
+        list_view = self.query_one(ListView)
+        headers = [i for i, row_id in enumerate(self._sid_by_row) if is_group_row(row_id)]
+        if not headers:
+            self._set_toast("no groups")
+            return
+        cursor = list_view.index if list_view.index is not None else -1
+        if forward:
+            target = next((i for i in headers if i > cursor), headers[0])
+        else:
+            target = next((i for i in reversed(headers) if i < cursor), headers[-1])
+        list_view.index = target
+
+    def action_next_lane(self) -> None:
+        """Cursor to the next group header. Bound to `]`."""
+        self._step_lane(forward=True)
+
+    def action_prev_lane(self) -> None:
+        """Cursor to the previous group header. Bound to `[`."""
+        self._step_lane(forward=False)
+
+    def action_help(self) -> None:
+        """Every key, and what the flow badges mean. Bound to `?`."""
+        if not self._on_dashboard():
+            return
+        self.push_screen(HelpScreen(self.BINDINGS))
 
     def action_toggle_collapse(self) -> None:
         """Fold or unfold the group at the cursor."""
@@ -1420,6 +1517,11 @@ class EphorApp(App[int]):
         went down a dead end, or you want a second agent on an independent
         part of it — and until now it meant leaving the dashboard.
         """
+        row_id = self._cursor_sid(self.query_one(ListView))
+        if is_virtual_row(row_id):
+            assert row_id is not None
+            self._start_on_ticket_row(ticket_of_virtual_row(row_id))
+            return
         sid = self._cursor_session_sid()
         if sid is None:
             self._set_toast("select a session row first")
@@ -1430,6 +1532,47 @@ class EphorApp(App[int]):
             return
         agent = self._agents_by_sid.get(sid)
         self._start_work(ticket, agent.provider if agent else "claude", agent.cwd if agent else "")
+
+    def _start_on_ticket_row(self, ticket: str) -> None:
+        """`N` on a ticket row: the first press arms, a second within 3s starts an agent.
+
+        Only ever this one ticket — a ticket row never reaches the marked
+        sessions. The repo comes from board.toml (``resolve_repo``), which
+        probes git, so it is resolved on a worker thread.
+        """
+        config = self._lanes.config
+        if config is None:
+            self._set_toast(
+                f'no board.toml — add [repos] {ticket.partition("-")[0]} = "~/path/to/repo" '
+                "to say where its agents run"
+            )
+            return
+        now = time.monotonic()
+        armed = (
+            self._start_armed == ticket and now - self._start_armed_at < START_CONFIRM_WINDOW_SEC
+        )
+        if not armed:
+            self._start_armed = ticket
+            self._start_armed_at = now
+            self._set_toast(f"press N again within 3s to start an agent on {markup_text(ticket)}")
+            return
+        self._start_armed = None
+        self._set_toast(f"starting {markup_text(ticket)}…")
+        self._start_ticket_worker(ticket, config)
+
+    @work(thread=True, exit_on_error=False, group="launch")
+    def _start_ticket_worker(self, ticket: str, config: BoardConfig) -> None:
+        """Find where the ticket's agent runs, then hand off to ``_start_work``."""
+        path, how = config.resolve_repo(ticket, work_items.load(ticket))
+        if path is None:
+            project = ticket.partition("-")[0]
+            self.call_from_thread(
+                self._set_toast,
+                f"{markup_text(ticket)}: {markup_text(how)} — add [repos] {project} = "
+                f'"~/path/to/repo" to board.toml',
+            )
+            return
+        self.call_from_thread(self._start_work, ticket, "claude", str(path))
 
     def action_resume_session(self) -> None:
         """Reopen the cursor row's session in a fresh tmux window."""
@@ -1581,12 +1724,8 @@ class EphorApp(App[int]):
             self.action_toggle_collapse()
             return
         if row_id is not None and is_virtual_row(row_id):
-            # A ticket row has no pane to jump to. Say what it is instead.
-            ticket = ticket_of_virtual_row(row_id)
-            record = self._lanes.ticket(ticket)
-            # Jira status names are admin-typed text; the toast parses markup.
-            status = f" · {markup_text(record.status, 40)}" if record and record.status else ""
-            self._set_toast(f"{markup_text(ticket)}{status} — no session on this ticket")
+            # A ticket row has no pane to jump to: open the ticket instead.
+            self._open_jira(ticket_of_virtual_row(row_id))
             return
 
         sid = row_id if is_session_row(row_id) else None
@@ -1918,6 +2057,48 @@ class EphorApp(App[int]):
 
     # ---- pull requests --------------------------------------------------
 
+    def _open_jira(self, ticket: str) -> None:
+        """Open ``ticket`` in Jira, or say why not (and what it is)."""
+        url = jira_browse_url(ticket)
+        if url:
+            self.open_url(url)
+            self._set_toast(f"opening {markup_text(ticket)} in Jira — {markup_text(url)}")
+            return
+        record = self._lanes.ticket(ticket)
+        # Jira status names are admin-typed text; the toast parses markup.
+        status = f" · {markup_text(record.status, 40)}" if record and record.status else ""
+        self._set_toast(
+            f"{markup_text(ticket)}{status} — set EPHOR_JIRA_URL (or JIRA_URL) to open it in Jira"
+        )
+
+    def action_open_jira(self) -> None:
+        """Open the cursor row's ticket in Jira. Bound to `J`; the cursor row only."""
+        row_id = self._cursor_sid(self.query_one(ListView))
+        if is_virtual_row(row_id):
+            assert row_id is not None
+            self._open_jira(ticket_of_virtual_row(row_id))
+            return
+        if not is_session_row(row_id):
+            self._no_target_toast()
+            return
+        assert row_id is not None
+        ticket = self._ticket_for_sid(row_id)
+        if not ticket:
+            self._set_toast("no ticket on this row — pin one with p")
+            return
+        self._open_jira(ticket)
+
+    def _open_ticket_pr(self, ticket: str) -> None:
+        """`o` on a ticket row: its PR from the board snapshot, else the ticket in Jira."""
+        prs = self._lanes.prs_for(ticket)
+        known = [pr for pr in prs if pr.url]
+        if not known:
+            self._open_jira(ticket)
+            return
+        pr = max(known, key=lambda p: (p.is_open, p.number))
+        self.open_url(pr.url)
+        self._set_toast(f"opening PR #{pr.number} — {markup_text(pr.url)}")
+
     def action_open_pr(self, sid: str | None = None) -> None:
         """Open the pull request for a session in the browser.
 
@@ -1928,6 +2109,12 @@ class EphorApp(App[int]):
         key until the background sweep catches up) is worse.
         """
         if sid is None:
+            row_id = self._cursor_sid(self.query_one(ListView))
+            if is_virtual_row(row_id):
+                # A ticket row: this ticket only, never the marked sessions.
+                assert row_id is not None
+                self._open_ticket_pr(ticket_of_virtual_row(row_id))
+                return
             # No explicit row (a keypress, not a click): open every marked
             # row's review at once, which is how a batch of finished work
             # actually gets looked at.
@@ -2120,12 +2307,15 @@ class EphorApp(App[int]):
     # ---- status lanes ----------------------------------------------------
 
     def action_flows(self) -> None:
-        """Open the flow runs screen (``y`` approve, ``n`` deny). Bound to `f`."""
+        """Open the flow runs screen (``y`` approve, ``N N`` deny). Bound to `f`."""
+        snap = self._lanes.snapshot
         self.push_screen(
             FlowsScreen(
                 self._lanes.runs,
                 on_change=self._on_flow_answered,
                 paused=flow_runs.is_paused(),
+                config=self._lanes.config,
+                tickets=dict(snap.tickets) if snap is not None else {},
             )
         )
 
@@ -2154,7 +2344,7 @@ class EphorApp(App[int]):
             return
         self._refresh_board()
 
-    def _refresh_board(self) -> None:
+    def _refresh_board(self, *, force: bool = False) -> None:
         """Schedule a flows tick (and with it the snapshot), unless one is still running.
 
         A thread worker cannot be cancelled once started, so ``exclusive``
@@ -2164,10 +2354,10 @@ class EphorApp(App[int]):
         if self._board_in_flight:
             return
         self._board_in_flight = True
-        self._board_worker()
+        self._board_worker(force)
 
     @work(thread=True, exit_on_error=False, group="board")
-    def _board_worker(self) -> None:
+    def _board_worker(self, force: bool = False) -> None:
         """Background worker: re-read board.toml and run one flows tick.
 
         The tick searches Jira, persists the snapshot, and creates, tends and
@@ -2178,7 +2368,7 @@ class EphorApp(App[int]):
         """
         data: LaneData | None = None
         try:
-            data = gather_lanes(refresh=True)
+            data = gather_lanes(refresh=True, force=force)
         finally:
             self.call_from_thread(self._on_board_data, data)
 

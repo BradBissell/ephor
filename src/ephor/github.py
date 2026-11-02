@@ -383,6 +383,64 @@ def _names_ticket(pr: PullRequest, ticket: str) -> bool:
 # may have been cut short before the ticket's own PR, so it is not an answer.
 _TICKET_PR_LIMIT = 100
 
+# The repo-wide listing the flows tick makes once per repo per PR poll: the
+# ticket lookup's fields plus the CI rollup, which is what fills a board
+# card's CI dot. One call answers every ticket in the repo.
+_REPO_PR_FIELDS = f"{_TICKET_PR_FIELDS},statusCheckRollup"
+REPO_PR_LIMIT = 200
+
+
+@dataclass(frozen=True)
+class RepoPrs:
+    """The newest PRs of one repo, in every state, as one ``gh pr list`` returned them.
+
+    ``complete`` is False when the listing filled its limit: PRs older than
+    the oldest one here exist and were not returned. Every PR *newer* than
+    that is in it — so a ticket matching none of them has no new PR, but a
+    PR seen earlier and missing now has only aged off the page, and is not
+    gone.
+    """
+
+    prs: tuple[PullRequest, ...]
+    complete: bool
+
+    def naming(self, ticket: str) -> list[PullRequest]:
+        """The PRs that are ``ticket``'s own (see :func:`_names_ticket`)."""
+        return [pr for pr in self.prs if _names_ticket(pr, ticket)]
+
+
+def list_repo_prs(repo_path: Path, limit: int = REPO_PR_LIMIT) -> RepoPrs | None:
+    """The newest ``limit`` PRs in ``repo_path``'s GitHub repo, all states. Blocking.
+
+    One call per repo replaces a ``gh pr list --search`` per ticket: the
+    tickets are matched against it locally, with the same rule
+    :func:`find_prs_for_ticket` applies to its search hits. None when ``gh``
+    could not answer.
+    """
+    if not repo_path.is_dir():
+        return None
+    out = _gh(
+        ["pr", "list", "--state", "all", "--limit", str(limit), "--json", _REPO_PR_FIELDS],
+        repo_path,
+    )
+    if out is None:
+        return None
+    try:
+        items = json.loads(out or "[]")
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(items, list):
+        return None
+    found = tuple(pr for pr in (_parse_pr(item) for item in items) if pr is not None)
+    return RepoPrs(prs=found, complete=len(items) < limit)
+
+
+def ci_word(state: CiState) -> str:
+    """A PR's rolled-up CI as the board stores it: pass | fail | pending | "" (none)."""
+    return {CiState.PASSING: "pass", CiState.FAILING: "fail", CiState.PENDING: "pending"}.get(
+        state, ""
+    )
+
 
 def find_prs_for_ticket(repo_path: Path, ticket: str) -> list[PullRequest] | None:
     """Every PR in ``repo_path``'s GitHub repo that names ``ticket``. Blocking.

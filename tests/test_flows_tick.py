@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from ephor import board, eventlog, work_items
+from ephor import board, eventlog, github, jira_api, work_items
 from ephor.board import BoardConfig
 from ephor.filelock import locked
 from ephor.flows import runners, runs
@@ -83,6 +83,11 @@ class FakeJira:
         self.account: str | None = ME
         self.myself_calls = 0
         self.fresh_calls: list[str] = []
+        # A rule's jql filter: which keys match it (None: the search fails),
+        # and what the failure was.
+        self.jql_match: set[str] | None = set()
+        self.error: jira_api.RequestError | None = None
+        self.jql_queries: list[str] = []
 
     def put(
         self, key: str, status: str, status_id: str, *, assignee: str = ME, title: str = "Title"
@@ -97,6 +102,12 @@ class FakeJira:
         )
 
     def search(self, jql: str, fields: tuple[str, ...]) -> list[Issue] | None:
+        if jql.startswith("key in ("):
+            self.jql_queries.append(jql)
+            if self.jql_match is None:
+                return None
+            asked = jql[len("key in (") :].split(")", 1)[0].split(", ")
+            return [self.issues[k] for k in asked if k in self.jql_match and k in self.issues]
         return None if self.fail_search else list(self.issues.values())
 
     def myself(self) -> str | None:
@@ -190,9 +201,14 @@ class World:
         # run id -> pane of the flow windows tmux reports; None = tmux silent.
         self.flow_panes: dict[str, str] | None = {}
         self.pane_listings = 0
-        # ticket -> what `gh pr list --search` says; a missing key is "no PRs".
+        # ticket -> its PRs in the repo listing; a missing key is "no PRs", and
+        # a None anywhere makes the whole `gh pr list` fail.
         self.prs: dict[str, list[PullRequest] | None] = {}
-        self.pr_calls: list[tuple[Path, str]] = []
+        # One entry per `gh pr list` (per repo per PR poll).
+        self.pr_calls: list[Path] = []
+        # Per-ticket searches: only for a PR that aged off a full listing.
+        self.find_calls: list[tuple[Path, str]] = []
+        self.listing_complete = True
         self.dead_pids: set[int] = set()
 
     def live_panes(self) -> runners.LivePanes | None:
@@ -203,9 +219,16 @@ class World:
         return runners.LivePanes(self.server, frozenset(self.panes), dict(self.flow_panes))
 
     def find_prs(self, repo: Path, key: str) -> list[PullRequest] | None:
-        self.pr_calls.append((repo, key))
+        self.find_calls.append((repo, key))
         found = self.prs.get(key, [])
         return None if found is None else list(found)
+
+    def list_prs(self, repo: Path) -> github.RepoPrs | None:
+        self.pr_calls.append(repo)
+        if any(found is None for found in self.prs.values()):
+            return None
+        every = [pr for found in self.prs.values() for pr in found or ()]
+        return github.RepoPrs(prs=tuple(every), complete=self.listing_complete)
 
     def deps(self) -> TickDeps:
         return TickDeps(
@@ -218,7 +241,10 @@ class World:
             work_item=self.work.get,
             live_panes=self.live_panes,
             find_prs=self.find_prs,
+            list_prs=self.list_prs,
             pid_alive=lambda pid: pid not in self.dead_pids,
+            search_error=lambda: self.jira.error,
+            flagged_field=lambda: "",
             launchers=runners.Launchers(
                 start=self.launch.start,
                 open_window=self.launch.open_window,
@@ -226,8 +252,10 @@ class World:
             ),
         )
 
-    def tick(self, config: BoardConfig, at: datetime, *, dry_run: bool = False) -> TickResult:
-        return flows_tick.run(config, dry_run=dry_run, deps=self.deps(), now=at)
+    def tick(
+        self, config: BoardConfig, at: datetime, *, dry_run: bool = False, force: bool = False
+    ) -> TickResult:
+        return flows_tick.run(config, dry_run=dry_run, force=force, deps=self.deps(), now=at)
 
 
 @pytest.fixture
@@ -650,12 +678,15 @@ def test_paused_blocks_before_every_other_guard(world: World, repo: Path) -> Non
     assert world.jira.fresh_calls == []
 
 
-def test_max_active_agents_counts_every_live_session(world: World, repo: Path) -> None:
+def test_max_active_agents_queues_behind_every_working_session(world: World, repo: Path) -> None:
     config = _config(REVIEW, repos={"DR": str(repo)}, max_active_agents=2)
     _approved_review(world, config)
     world.sessions = [_agent("s1"), _agent("s2"), _agent("s3", status="DEAD")]
     world.tick(config, T0 + timedelta(minutes=2))
-    assert _only_run().reason.startswith("max_active_agents: 2")
+    run = _only_run()
+    assert (run.state, run.block_key) == (RunState.BLOCKED, runs.QUEUED_KEY)
+    assert run.reason == "queued: 2/2 agent slots busy"
+    assert runs.is_queued(run) and runs.badge(run) == "⧗ review"
 
 
 @pytest.mark.parametrize("how", ["session", "started", "work"])
@@ -705,8 +736,8 @@ def test_command_flows_skip_the_agent_guards(world: World) -> None:
     assert _only_run().state is RunState.LAUNCHED
 
 
-def test_max_runs_per_hour_caps_launches_across_flows(world: World) -> None:
-    config = _config(NOTIFY, max_runs_per_hour=1)
+def test_max_commands_per_hour_caps_command_launches_across_flows(world: World) -> None:
+    config = _config(NOTIFY, max_commands_per_hour=1)
     world.jira.put("DR-1", "In Progress", "3")
     world.jira.put("DR-2", "In Progress", "3")
     world.tick(config, T0)
@@ -716,14 +747,48 @@ def test_max_runs_per_hour_caps_launches_across_flows(world: World) -> None:
     states = {r.ticket: (r.state, r.reason) for r in runs.list_runs()}
     assert states["DR-1"][0] is RunState.LAUNCHED
     assert states["DR-2"][0] is RunState.BLOCKED
-    assert states["DR-2"][1].startswith("max_runs_per_hour")
+    assert states["DR-2"][1].startswith("max_commands_per_hour")
     # An hour later the cap has room again, and the blocked run goes.
     world.tick(config, T0 + timedelta(minutes=62))
     assert {r.ticket: r.state for r in runs.list_runs()}["DR-2"] is RunState.LAUNCHED
 
 
-def test_the_ticket_breaker_stops_a_ticket_bouncing(world: World) -> None:
-    config = _config(NOTIFY, ticket_breaker=2)
+def test_command_flows_spend_neither_agent_cap(world: World) -> None:
+    """max_runs_per_hour and ticket_breaker are the agent budget; a script is not an agent."""
+    config = _config(NOTIFY, max_runs_per_hour=1, ticket_breaker=1)
+    world.panes = None
+    _baseline(world, config)
+    at = T0
+    for _ in range(3):
+        at += timedelta(minutes=1)
+        world.jira.put("DR-1", "In Progress", "3")
+        world.tick(config, at)
+        at += timedelta(minutes=1)
+        _move_to_review(world, config, at)
+    assert [r.state for r in runs.list_runs()] == [RunState.LAUNCHED] * 3
+
+
+def test_max_runs_per_hour_caps_agent_launches(world: World, repo: Path) -> None:
+    config = _config({**REVIEW, "assignee": "any"}, repos={"DR": str(repo)}, max_runs_per_hour=1)
+    world.jira.put("DR-1", "In Progress", "3")
+    world.jira.put("DR-2", "In Progress", "3")
+    world.tick(config, T0)
+    world.jira.put("DR-1", "Peer Review", "10")
+    world.jira.put("DR-2", "Peer Review", "10")
+    world.tick(config, T0 + timedelta(minutes=1))
+    for found in runs.list_runs():
+        runs.approve(found.run_id)
+    world.tick(config, T0 + timedelta(minutes=2))
+    states = {r.ticket: (r.state, r.reason) for r in runs.list_runs()}
+    assert states["DR-1"][0] is RunState.LAUNCHED
+    assert states["DR-2"] == (
+        RunState.BLOCKED,
+        "max_runs_per_hour: 1 agent launches in the last hour",
+    )
+
+
+def test_the_ticket_breaker_stops_a_ticket_bouncing(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)}, ticket_breaker=2)
     world.panes = None  # the windows' fate is not what this is about
     _baseline(world, config)
     at = T0
@@ -733,6 +798,11 @@ def test_the_ticket_breaker_stops_a_ticket_bouncing(world: World) -> None:
         world.tick(config, at)
         at += timedelta(minutes=1)
         _move_to_review(world, config, at)
+        for pending in runs.list_runs():
+            if pending.state is RunState.AWAITING_CONFIRM:
+                runs.approve(pending.run_id)
+        at += timedelta(seconds=50)
+        world.tick(config, at)
     found = sorted(runs.list_runs(), key=lambda r: r.seq)
     assert [r.state for r in found] == [RunState.LAUNCHED, RunState.LAUNCHED, RunState.BLOCKED]
     assert found[-1].reason.startswith("ticket_breaker")
@@ -760,19 +830,19 @@ def test_a_blocked_run_goes_once_the_guard_clears(world: World, repo: Path) -> N
 # --- the pre-launch re-check --------------------------------------------------------------
 
 
-def test_a_ticket_that_already_left_is_superseded_before_launch(world: World, repo: Path) -> None:
+def test_a_ticket_that_already_left_is_expired_before_launch(world: World, repo: Path) -> None:
     config = _config(REVIEW, repos={"DR": str(repo)})
     _approved_review(world, config)
     world.jira.fresh["DR-1"] = Issue(key="DR-1", status="QA", status_id="11", assignee_id=ME)
     world.tick(config, T0 + timedelta(minutes=2))
     run = _only_run()
-    assert run.state is RunState.SUPERSEDED
+    assert run.state is RunState.EXPIRED
     assert "QA" in run.reason
     assert world.launch.windows == []
-    assert len(_events(eventlog.EventKind.FLOW_CANCELLED)) == 1
+    assert len(_events(eventlog.EventKind.FLOW_EXPIRED)) == 1
 
 
-def test_a_ticket_reassigned_away_is_superseded(world: World, repo: Path) -> None:
+def test_a_ticket_reassigned_away_is_expired(world: World, repo: Path) -> None:
     config = _config(REVIEW, repos={"DR": str(repo)})
     _approved_review(world, config)
     world.jira.fresh["DR-1"] = Issue(
@@ -792,7 +862,7 @@ def test_an_unanswered_recheck_blocks_rather_than_launching(world: World, repo: 
     assert world.launch.windows == []
 
 
-# --- expiry and supersession -----------------------------------------------------------------
+# --- expiry -----------------------------------------------------------------------------------
 
 
 def test_an_unconfirmed_run_expires_after_confirm_ttl(world: World) -> None:
@@ -821,14 +891,14 @@ def test_an_unconfirmed_run_expires_when_its_ticket_moves_on(world: World) -> No
     assert approved is None and "expired" in message
 
 
-def test_a_blocked_run_whose_ticket_moved_is_superseded(world: World) -> None:
+def test_a_blocked_run_whose_ticket_moved_is_expired(world: World) -> None:
     config = _config(REVIEW)
     _approved_review(world, config)
     world.tick(config, T0 + timedelta(minutes=2))
     assert _only_run().state is RunState.BLOCKED
     world.jira.put("DR-1", "In Progress", "3")
     world.tick(config, T0 + timedelta(minutes=3))
-    assert _only_run().state is RunState.SUPERSEDED
+    assert _only_run().state is RunState.EXPIRED
 
 
 def test_a_run_for_a_removed_flow_expires(world: World) -> None:
@@ -842,21 +912,51 @@ def test_a_run_for_a_removed_flow_expires(world: World) -> None:
 # --- launch failures, retries, stuck --------------------------------------------------------------
 
 
-def test_a_failed_launch_is_retried_then_stuck(world: World) -> None:
+def test_a_failed_launch_backs_off_then_goes_stuck(world: World) -> None:
+    """Regression (B2): tmux down used to burn every attempt in two minutes."""
     config = _config(NOTIFY)
     world.launch.fail = "tmux new-window failed: no server"
     _baseline(world, config)
-    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    start = T0 + timedelta(minutes=1)
+    _move_to_review(world, config, start)
     run = _only_run()
     assert (run.state, run.attempts) == (RunState.BLOCKED, 1)
     assert run.reason.startswith("launch failed")
-    world.tick(config, T0 + timedelta(minutes=2))
-    world.tick(config, T0 + timedelta(minutes=3))
+    # A failed attempt opened no window: it is not a launch the caps count.
+    assert run.launched_at == "" and run.attempt_at == runs.iso(start)
+    assert run.retry_at == runs.iso(start + timedelta(seconds=flows_tick.retry_delay(1)))
+    # The very next tick does not retry it.
+    result = world.tick(config, start + timedelta(seconds=50))
+    assert [a.verb for a in result.actions] == ["waiting"]
+    assert len(world.launch.windows) == 1
+    at = start + timedelta(seconds=50)
+    for attempt in range(1, runs.MAX_ATTEMPTS):
+        at += timedelta(seconds=flows_tick.retry_delay(attempt))
+        world.tick(config, at)
     run = _only_run()
-    assert (run.state, run.attempts) == (RunState.STUCK, 3)
-    assert len(world.launch.windows) == 3
-    world.tick(config, T0 + timedelta(minutes=4))
-    assert len(world.launch.windows) == 3
+    assert (run.state, run.attempts) == (RunState.STUCK, runs.MAX_ATTEMPTS)
+    assert len(world.launch.windows) == runs.MAX_ATTEMPTS
+    assert at - start >= timedelta(minutes=15)
+    assert len(_events(eventlog.EventKind.FLOW_STUCK)) == 1
+    world.tick(config, at + timedelta(hours=1))
+    assert len(world.launch.windows) == runs.MAX_ATTEMPTS
+
+
+def test_failed_attempts_count_against_no_cap(world: World) -> None:
+    """Regression (B2): failed attempts set launched_at, so they used up the caps."""
+    config = _config(NOTIFY, max_commands_per_hour=1)
+    world.launch.fail = "tmux: no server"
+    world.jira.put("DR-1", "In Progress", "3")
+    world.jira.put("DR-2", "In Progress", "3")
+    world.tick(config, T0)
+    world.jira.put("DR-1", "Peer Review", "10")
+    world.jira.put("DR-2", "Peer Review", "10")
+    world.tick(config, T0 + timedelta(minutes=1))
+    assert all(r.launched_at == "" for r in runs.list_runs())
+    world.launch.fail = ""
+    world.tick(config, T0 + timedelta(minutes=3))
+    states = [r.state for r in runs.list_runs()]
+    assert states.count(RunState.LAUNCHED) == 1
 
 
 def test_a_runs_own_failed_attempt_does_not_count_against_its_caps(world: World) -> None:
@@ -940,12 +1040,12 @@ def test_an_agent_whose_launch_was_never_recorded_is_done_not_relaunched(
 
 def test_a_claim_out_of_attempts_is_stuck(world: World) -> None:
     config = _config({**NOTIFY, "mode": "confirm"})
-    _crashed_mid_launch(world, config, 3, T0 + timedelta(minutes=1), flow="notify")
+    _crashed_mid_launch(world, config, runs.MAX_ATTEMPTS, T0 + timedelta(minutes=1), flow="notify")
     world.tick(config, T0 + timedelta(minutes=12))
     run = _only_run()
     assert run.state is RunState.STUCK
     assert world.launch.windows == []
-    assert len(_events(eventlog.EventKind.FLOW_FINISHED)) == 1
+    assert len(_events(eventlog.EventKind.FLOW_STUCK)) == 1
 
 
 # --- finishing launched runs ------------------------------------------------------------------------
@@ -1141,7 +1241,8 @@ def test_max_active_agents_counts_agents_this_tick_launched(world: World, repo: 
     assert verbs == ["blocked", "blocked", "dispatched"]
     assert len(world.launch.windows) == 1
     blocked = [r for r in runs.list_runs() if r.state is RunState.BLOCKED]
-    assert {r.reason for r in blocked} == {"max_active_agents: 2 sessions running"}
+    assert {r.reason for r in blocked} == {"queued: 2/2 agent slots busy"}
+    assert all(runs.is_queued(r) for r in blocked)
 
 
 def test_two_agent_flows_on_one_move_launch_one_agent(world: World, repo: Path) -> None:
@@ -1158,7 +1259,7 @@ def test_two_agent_flows_on_one_move_launch_one_agent(world: World, repo: Path) 
 
 
 def test_a_dry_run_counts_its_own_would_be_launches_against_the_caps(world: World) -> None:
-    config = _config(NOTIFY, max_runs_per_hour=1)
+    config = _config(NOTIFY, max_commands_per_hour=1)
     world.jira.put("DR-1", "In Progress", "3")
     world.jira.put("DR-2", "In Progress", "3")
     world.tick(config, T0)
@@ -1168,7 +1269,7 @@ def test_a_dry_run_counts_its_own_would_be_launches_against_the_caps(world: Worl
     verbs = [a.verb for a in result.actions if a.verb != "created"]
     assert sorted(verbs) == ["blocked", "dispatch"]
     (blocked,) = [a for a in result.actions if a.verb == "blocked"]
-    assert blocked.detail.startswith("max_runs_per_hour")
+    assert blocked.detail.startswith("max_commands_per_hour")
     assert runs.list_runs() == []
     assert world.launch.windows == []
 
@@ -1197,7 +1298,7 @@ def _dropped_from_review(world: World, config: BoardConfig) -> datetime:
     world.tick(config, at)
     assert [r.run_id for r in runs.list_runs()] == ["DR-9.notify.10-0"]
     del world.jira.issues["DR-9"]
-    for _ in range(snap.DROP_AFTER_UNSEEN + 1):
+    for _ in range(int(snap.DROP_AFTER_UNSEEN_SEC // 60) + 2):
         at += timedelta(minutes=1)
         world.tick(config, at)
     stored = snap.load()
@@ -1455,13 +1556,15 @@ PR_PING = {"name": "pr-ping", "on_pr": "opened", "command": "ping.sh {ticket}", 
 SHIPPED = {"name": "shipped", "on_pr": "merged", "command": "shipped.sh {ticket}", "mode": "auto"}
 
 
-def _pr(number: int, state: str = "OPEN", sha: str = "abc123") -> PullRequest:
+def _pr(
+    number: int, state: str = "OPEN", sha: str = "abc123", *, ticket: str = "DR-1"
+) -> PullRequest:
     return PullRequest(
         number=number,
         url=f"https://github.com/o/r/pull/{number}",
         state=state,
-        title=f"DR-1: change {number}",
-        head_ref="feature/DR-1-x",
+        title=f"{ticket}: change {number}",
+        head_ref=f"feature/{ticket}-x",
         head_sha=sha,
     )
 
@@ -1509,7 +1612,7 @@ def test_on_pr_lookups_are_spaced_by_pr_interval(world: World, repo: Path) -> No
     assert runs.list_runs() == []
     world.tick(config, T0 + timedelta(minutes=5))
     assert len(world.pr_calls) == 2
-    assert world.pr_calls[-1] == (repo, "DR-1")
+    assert world.pr_calls[-1] == repo
     stored = snap.load()
     assert stored is not None and stored.pr_checked_at == runs.iso(T0 + timedelta(minutes=5))
     assert [r.run_id for r in runs.list_runs()] == ["DR-1.pr-ping.pr12"]
@@ -1545,7 +1648,7 @@ def test_a_pr_already_open_at_the_first_lookup_is_a_baseline(world: World, repo:
     world.tick(config, T0 + timedelta(minutes=5))
     # A ticket new to the board whose PR is already open: also a baseline.
     world.jira.put("DR-2", "In Progress", "3")
-    world.prs["DR-2"] = [_pr(13)]
+    world.prs["DR-2"] = [_pr(13, ticket="DR-2")]
     world.tick(config, T0 + timedelta(minutes=10))
     world.tick(config, T0 + timedelta(minutes=15))
     assert runs.list_runs() == []
@@ -1579,7 +1682,8 @@ def test_a_done_ticket_with_no_open_pr_is_not_looked_up(world: World, repo: Path
     world.jira.put("DR-1", "Done", "20")
     world.jira.put("DR-2", "In Progress", "3")
     world.tick(config, T0)
-    assert [key for _, key in world.pr_calls] == ["DR-2"]
+    stored = snap.load()
+    assert stored is not None and list(stored.prs) == ["DR-2"]
 
 
 def test_on_pr_only_asks_about_tickets_a_rule_could_fire_on(world: World, repo: Path) -> None:
@@ -1587,7 +1691,8 @@ def test_on_pr_only_asks_about_tickets_a_rule_could_fire_on(world: World, repo: 
     world.jira.put("DR-1", "In Progress", "3")
     world.jira.put("DR-2", "In Progress", "3", assignee="acct-other")
     world.tick(config, T0)
-    assert [key for _, key in world.pr_calls] == ["DR-1"]
+    stored = snap.load()
+    assert stored is not None and list(stored.prs) == ["DR-1"]
 
 
 def test_a_gh_failure_keeps_the_baseline_and_fires_nothing(world: World, repo: Path) -> None:
@@ -1770,15 +1875,36 @@ def test_on_session_idle_fires_after_settle(world: World, repo: Path) -> None:
     assert runs.list_runs() == []
     world.tick(config, went_idle + timedelta(minutes=10))
     run = _only_run()
-    assert run.run_id == f"DR-1.on-idle.{SID[:12]}"
+    # Named by the session and the start of the spell (its last hook event).
+    assert run.run_id == f"DR-1.on-idle.{SID[:12]}-20261020120100"
+    assert run.idle_since == runs.iso(went_idle)
     assert run.state is RunState.AWAITING_CONFIRM
-    # Work, then idle again: the same session never fires the rule twice.
+    # Seen again on later ticks of the same spell: nothing new.
+    world.tick(config, went_idle + timedelta(minutes=11))
+    assert len(runs.list_runs()) == 1
+
+
+def test_on_session_idle_fires_once_per_idle_spell(world: World, repo: Path) -> None:
+    """Regression: the generation was the session, so a second idle spell never fired."""
+    config = _config(IDLE, repos={"DR": str(repo)}, settle="10m")
+    _session_baseline(world, config, _session(status="WORKING"))
+    world.sessions = [_session(status="IDLE", last_event=T0 + timedelta(minutes=1))]
+    world.tick(config, T0 + timedelta(minutes=11))
+    assert len(runs.list_runs()) == 1
+    # Work, then idle again: a new spell, a new run.
     world.sessions = [_session(status="WORKING", last_event=T0 + timedelta(minutes=12))]
     world.tick(config, T0 + timedelta(minutes=12))
     later = T0 + timedelta(minutes=13)
     world.sessions = [_session(status="IDLE", last_event=later)]
     world.tick(config, later + timedelta(minutes=11))
-    assert len(runs.list_runs()) == 1
+    found = sorted(r.run_id for r in runs.list_runs())
+    assert found == [
+        f"DR-1.on-idle.{SID[:12]}-20261020120100",
+        f"DR-1.on-idle.{SID[:12]}-20261020121300",
+    ]
+    # The first spell's run is over: its session worked in between.
+    first = runs.load(found[0])
+    assert first is not None and first.state is RunState.EXPIRED
 
 
 def test_an_idle_run_expires_when_its_session_works_again(world: World, repo: Path) -> None:
@@ -1924,7 +2050,7 @@ def test_an_auto_command_run_edited_into_a_start_flow_never_launches_unapproved(
     world.tick(v2, T0 + timedelta(minutes=2))
     assert world.launch.windows == [] and world.launch.starts == []
     run = _only_run()
-    assert (run.state, run.reason) == (RunState.SUPERSEDED, flows_tick.FLOW_CHANGED)
+    assert (run.state, run.reason) == (RunState.EXPIRED, flows_tick.FLOW_CHANGED)
 
 
 def test_an_auto_run_whose_rule_now_wants_a_confirmation_does_not_launch(world: World) -> None:
@@ -1934,7 +2060,7 @@ def test_an_auto_run_whose_rule_now_wants_a_confirmation_does_not_launch(world: 
     runs.resume()
     world.tick(_config({**NOTIFY, "mode": "confirm"}), T0 + timedelta(minutes=2))
     assert world.launch.windows == []
-    assert _only_run().state is RunState.SUPERSEDED
+    assert _only_run().state is RunState.EXPIRED
 
 
 def test_an_approved_run_whose_template_changed_does_not_launch(world: World, repo: Path) -> None:
@@ -1944,7 +2070,7 @@ def test_an_approved_run_whose_template_changed_does_not_launch(world: World, re
     world.tick(edited, T0 + timedelta(minutes=2))
     assert world.launch.windows == []
     assert (_only_run().state, _only_run().reason) == (
-        RunState.SUPERSEDED,
+        RunState.EXPIRED,
         flows_tick.FLOW_CHANGED,
     )
 
@@ -1971,7 +2097,7 @@ def test_a_start_run_never_approved_does_not_launch(world: World, repo: Path) ->
     assert forged is not None and not forged.approved_at
     world.tick(config, T0 + timedelta(minutes=2))
     assert world.launch.windows == []
-    assert _only_run().state is RunState.SUPERSEDED
+    assert _only_run().state is RunState.EXPIRED
 
 
 def test_approve_records_when(world: World) -> None:
@@ -2095,7 +2221,7 @@ def test_an_approve_racing_expiry_is_still_checked_for_currency(
     monkeypatch.setattr(flows_tick, "_tend_awaiting", racing)
     world.tick(config, T0 + timedelta(minutes=18))
     run = _only_run()
-    assert run.state is RunState.SUPERSEDED
+    assert run.state is RunState.EXPIRED
     assert world.launch.windows == []
 
 
@@ -2279,3 +2405,362 @@ def test_the_launch_guard_says_how_long_ago_a_session_started(world: World, repo
     world.starts = {"DR-1": (T0 - timedelta(minutes=3)).isoformat()}
     world.tick(config, T0 + timedelta(minutes=2))
     assert _only_run().reason == "launch guard: a session was started on DR-1 5m ago"
+
+
+# --- B1: a PR seen for the first time ------------------------------------------------------
+
+
+def test_a_repo_change_rebaselines_instead_of_firing(world: World, tmp_path: Path) -> None:
+    """Regression (B1): a worktree appearing made its PRs read as just merged / opened."""
+    root = tmp_path / "root"
+    root.mkdir()
+    config = _config(SHIPPED, PR_PING, repos={"DR": str(root)})
+    _pr_baseline(world, config)
+    # A worktree for DR-1 appears; the new repo's listing has an old merged
+    # PR and an open one nobody saw opening.
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    world.work["DR-1"] = WorkItem(key="DR-1", worktree=str(tree))
+    world.prs["DR-1"] = [_pr(3, "MERGED"), _pr(4, "OPEN")]
+    real = flows_tick.pr_repo_for
+    try:
+        flows_tick.pr_repo_for = lambda *a: tree  # type: ignore[assignment]
+        world.tick(config, T0 + timedelta(minutes=5))
+    finally:
+        flows_tick.pr_repo_for = real  # type: ignore[assignment]
+    assert runs.list_runs() == []
+    stored = snap.load()
+    assert stored is not None and stored.pr_repos == {"DR-1": str(tree)}
+    assert world.launch.windows == []
+
+
+def test_a_pr_first_seen_merged_never_fires_shipped(world: World, repo: Path) -> None:
+    """Regression (B1): `shipped` is auto — a merge it did not see happen must not run it."""
+    config = _config(SHIPPED, repos={"DR": str(repo)})
+    _pr_baseline(world, config)
+    world.prs["DR-1"] = [_pr(9, "MERGED")]
+    world.tick(config, T0 + timedelta(minutes=5))
+    assert runs.list_runs() == [] and world.launch.windows == []
+
+
+# --- B3: an idle session does not hold the launch guard ----------------------------------
+
+
+def _idle_agent(sid: str, ticket: str, quiet_since: datetime) -> AgentState:
+    return AgentState.from_dict(
+        {
+            "session_id": sid,
+            "cwd": "/nowhere",
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "status": "IDLE",
+            "ticket": ticket,
+            "last_event_time": runs.iso(quiet_since),
+            "schema_version": 4,
+        }
+    )
+
+
+def test_a_session_idle_past_settle_does_not_hold_the_launch_guard(
+    world: World, repo: Path
+) -> None:
+    """Regression (B3): an idle start-work session held the review until confirm_ttl."""
+    config = _config(REVIEW, repos={"DR": str(repo)}, settle="10m")
+    _approved_review(world, config)
+    at = T0 + timedelta(minutes=2)
+    # Quiet for five minutes: still on the ticket.
+    world.sessions = [_idle_agent("impl-sess", "DR-1", at - timedelta(minutes=5))]
+    world.tick(config, at)
+    run = _only_run()
+    assert (run.state, run.reason) == (
+        RunState.BLOCKED,
+        "launch guard: session impl-ses is live on DR-1",
+    )
+    # Quiet for longer than settle: done with it, and the review goes.
+    world.tick(config, at + timedelta(minutes=6))
+    assert _only_run().state is RunState.LAUNCHED
+
+
+def test_a_session_idle_past_settle_frees_its_agent_slot(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)}, settle="10m", max_active_agents=1)
+    _approved_review(world, config)
+    at = T0 + timedelta(minutes=2)
+    # Quiet for five minutes: maybe only thinking, so it keeps its slot.
+    world.sessions = [_idle_agent("other", "DR-7", at - timedelta(minutes=5))]
+    world.tick(config, at)
+    assert runs.is_queued(_only_run())
+    # Quiet past settle: finished, and the queued review takes its slot.
+    world.tick(config, at + timedelta(minutes=6))
+    assert _only_run().state is RunState.LAUNCHED
+
+
+def _queue_three(world: World, config: BoardConfig) -> dict[str, Run]:
+    """Three reviews queued behind one busy session, approved DR-3, DR-1, DR-2."""
+    for key in ("DR-1", "DR-2", "DR-3"):
+        world.jira.put(key, "In Progress", "3")
+    world.tick(config, T0)
+    for key in ("DR-1", "DR-2", "DR-3"):
+        world.jira.put(key, "Peer Review", "10")
+    world.tick(config, T0 + timedelta(minutes=1))
+    by_ticket = {r.ticket: r for r in runs.list_runs()}
+    for n, key in enumerate(("DR-3", "DR-1", "DR-2")):
+        approved, _ = runs.approve(
+            by_ticket[key].run_id, now=T0 + timedelta(minutes=1, seconds=10 + n)
+        )
+        assert approved is not None
+    world.sessions = [_agent("busy")]
+    world.tick(config, T0 + timedelta(minutes=2))
+    return {r.ticket: r for r in runs.list_runs()}
+
+
+def test_the_agent_queue_launches_first_approved_first(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)}, max_active_agents=1)
+    queued = _queue_three(world, config)
+    assert all(runs.is_queued(r) for r in queued.values())
+    order = [r.ticket for r in runs.queue(queued.values())]
+    assert order == ["DR-3", "DR-1", "DR-2"]
+    assert runs.queue_positions(queued.values())[queued["DR-1"].run_id] == 2
+    # The busy session ends: one slot, and it goes to the head of the queue.
+    world.sessions = []
+    world.tick(config, T0 + timedelta(minutes=3))
+    states = {r.ticket: r.state for r in runs.list_runs()}
+    assert states == {
+        "DR-3": RunState.LAUNCHED,
+        "DR-1": RunState.BLOCKED,
+        "DR-2": RunState.BLOCKED,
+    }
+    assert [w["env"]["EPHOR_TICKET"] for w in world.launch.windows] == ["DR-3"]
+
+
+def test_a_queued_run_outlives_confirm_ttl_but_not_queue_ttl(world: World, repo: Path) -> None:
+    config = _config(
+        REVIEW,
+        repos={"DR": str(repo)},
+        max_active_agents=1,
+        confirm_ttl="1h",
+        queue_ttl="3h",
+        max_event_age="6h",
+    )
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    runs.approve("DR-1.review.10-1", now=T0 + timedelta(minutes=1))
+    world.sessions = [_agent("busy")]
+    for minute in (2, 90, 170):
+        world.tick(config, T0 + timedelta(minutes=minute))
+        assert runs.is_queued(_only_run())
+    world.tick(config, T0 + timedelta(minutes=200))
+    run = _only_run()
+    assert (run.state, run.reason) == (RunState.EXPIRED, flows_tick.QUEUED_TOO_LONG)
+    assert world.launch.windows == []
+
+
+# --- coalescing and Retry-After -----------------------------------------------------------
+
+
+def test_a_tick_on_a_fresh_snapshot_is_skipped_before_asking_jira(world: World) -> None:
+    config = _config(NOTIFY)
+    _baseline(world, config)
+    calls: list[str] = []
+    real = world.jira.search
+    world.jira.search = lambda jql, fields: calls.append(jql) or real(jql, fields)  # type: ignore[method-assign]
+    result = world.tick(config, T0 + timedelta(seconds=30))
+    assert result.status is TickStatus.SKIPPED and result.ok
+    assert calls == []
+    assert result.snapshot is not None and result.refresh.ok
+    assert "--force" in result.message
+    assert world.tick(config, T0 + timedelta(seconds=30), force=True).status is TickStatus.OK
+    assert world.tick(config, T0 + timedelta(seconds=80)).status is TickStatus.OK
+
+
+def test_an_approval_since_the_snapshot_is_not_coalesced(world: World, repo: Path) -> None:
+    """The dashboard approves, then ticks at once: that tick must dispatch."""
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    runs.approve("DR-1.review.10-1", now=T0 + timedelta(minutes=1, seconds=10))
+    result = world.tick(config, T0 + timedelta(minutes=1, seconds=20))
+    assert result.status is TickStatus.OK
+    assert _only_run().state is RunState.LAUNCHED
+
+
+def test_a_429_backs_off_for_its_retry_after(world: World) -> None:
+    config = _config(NOTIFY)
+    _baseline(world, config)
+    world.jira.fail_search = True
+    world.jira.error = jira_api.RequestError(429, "Rate limited", retry_after=300.0)
+    result = world.tick(config, T0 + timedelta(minutes=1))
+    assert result.status is TickStatus.SEARCH_FAILED
+    assert "HTTP 429: Rate limited" in result.message
+    world.jira.fail_search = False
+    held = world.tick(config, T0 + timedelta(minutes=3), force=True)
+    assert held.status is TickStatus.BACKOFF and not held.ok
+    assert "back off" in held.refresh.message
+    assert world.tick(config, T0 + timedelta(minutes=7)).status is TickStatus.OK
+    assert not flows_tick.backoff_path().exists()
+
+
+def test_a_failed_search_says_why(world: World) -> None:
+    config = _config(NOTIFY)
+    _baseline(world, config)
+    world.jira.fail_search = True
+    world.jira.error = jira_api.RequestError(401, "Unauthorized")
+    result = world.tick(config, T0 + timedelta(minutes=1))
+    assert result.refresh.message == (
+        "Jira search failed (HTTP 401: Unauthorized) — snapshot left as it was"
+    )
+    assert not flows_tick.backoff_path().exists()
+
+
+# --- from =, jql =, repo =, template values --------------------------------------------------
+
+
+def test_from_fires_only_on_a_move_from_a_named_status(world: World) -> None:
+    config = _config({**NOTIFY, "from": ["In Progress"]})
+    world.jira.put("DR-1", "In Progress", "3")
+    world.jira.put("DR-2", "To Do", "1")
+    world.tick(config, T0)
+    world.jira.put("DR-1", "Peer Review", "10")
+    world.jira.put("DR-2", "Peer Review", "10")
+    world.jira.put("DR-3", "Peer Review", "10")  # appeared: came from nowhere
+    world.tick(config, T0 + timedelta(minutes=1))
+    assert [r.run_id for r in runs.list_runs()] == ["DR-1.notify.10-1"]
+
+
+def test_a_jql_filter_drops_candidates_with_one_search(world: World) -> None:
+    config = _config({**NOTIFY, "jql": "labels = urgent"})
+    for key in ("DR-1", "DR-2", "DR-3"):
+        world.jira.put(key, "In Progress", "3")
+    world.tick(config, T0)
+    for key in ("DR-1", "DR-2", "DR-3"):
+        world.jira.put(key, "Peer Review", "10")
+    world.jira.jql_match = {"DR-2"}
+    world.tick(config, T0 + timedelta(minutes=1))
+    assert [r.ticket for r in runs.list_runs()] == ["DR-2"]
+    assert world.jira.jql_queries == ["key in (DR-1, DR-2, DR-3) AND (labels = urgent)"]
+
+
+def test_a_jql_filter_that_does_not_answer_holds_the_move_for_next_tick(world: World) -> None:
+    config = _config({**NOTIFY, "jql": "labels = urgent"})
+    _baseline(world, config)
+    world.jira.jql_match = None
+    result = _move_to_review(world, config, T0 + timedelta(minutes=1))
+    assert runs.list_runs() == []
+    assert "jql filter did not answer" in result.dispatch_note
+    stored = snap.load()
+    assert stored is not None and stored.tickets["DR-1"].status == "In Progress"
+    # Next tick: the filter answers, and the held move fires.
+    world.jira.jql_match = {"DR-1"}
+    world.tick(config, T0 + timedelta(minutes=2))
+    assert [r.run_id for r in runs.list_runs()] == ["DR-1.notify.10-1"]
+
+
+def test_a_jql_filter_jira_rejects_does_not_hold_the_board(world: World) -> None:
+    config = _config({**NOTIFY, "jql": "nosuchfield = 1"})
+    _baseline(world, config)
+    world.jira.jql_match = None
+    world.jira.error = jira_api.RequestError(400, "Field 'nosuchfield' does not exist")
+    result = _move_to_review(world, config, T0 + timedelta(minutes=1))
+    assert runs.list_runs() == []
+    assert "Jira rejected it" in result.dispatch_note
+    stored = snap.load()
+    assert stored is not None and stored.tickets["DR-1"].status == "Peer Review"
+
+
+def test_a_rule_repo_is_where_the_flow_runs(world: World, repo: Path, tmp_path: Path) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    config = _config(
+        {**NOTIFY, "repo": str(elsewhere), "command": "notify.sh {ticket} {repo} {from_status}"},
+        repos={"DR": str(repo)},
+    )
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    (window,) = world.launch.windows
+    assert window["cwd"] == elsewhere
+    assert window["env"]["EPHOR_FLOW_COMMAND"] == f"notify.sh DR-1 {elsewhere} 'In Progress'"
+
+
+# --- the audit trail ---------------------------------------------------------------------------
+
+
+def test_a_runs_life_is_in_the_event_log(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _approved_review(world, config)
+    world.tick(config, T0 + timedelta(minutes=2))
+    kinds = [e.kind for e in eventlog.read() if e.kind.startswith("flow_") and e.ticket == "DR-1"]
+    assert kinds == [
+        eventlog.EventKind.FLOW_CREATED,
+        eventlog.EventKind.FLOW_APPROVED,
+        eventlog.EventKind.FLOW_DISPATCHED,
+    ]
+
+
+def test_an_expiry_is_logged_as_expired(world: World) -> None:
+    config = _config(REVIEW)
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    world.jira.put("DR-1", "Done", "20")
+    world.tick(config, T0 + timedelta(minutes=2))
+    (event,) = _events(eventlog.EventKind.FLOW_EXPIRED)
+    assert event.extra["run_id"] == "DR-1.review.10-1"
+
+
+# --- explain -----------------------------------------------------------------------------------
+
+
+def _explain(world: World, config: BoardConfig, key: str = "DR-1", **kw: Any) -> dict[str, Any]:
+    found, problem = flows_tick.explain(
+        config, key, deps=world.deps(), now=kw.pop("at", T0 + timedelta(minutes=2)), **kw
+    )
+    assert problem == ""
+    return {e.flow: e for e in found}
+
+
+def test_explain_names_the_first_gate_that_fails(world: World, repo: Path) -> None:
+    other = {**NOTIFY, "name": "qa-ping", "on_enter": "QA"}
+    mine_only = {**NOTIFY, "name": "mine"}
+    config = _config(REVIEW, other, mine_only, repos={"DR": str(repo)})
+    world.jira.put("DR-1", "In Progress", "3", assignee="acct-other")
+    world.tick(config, T0)
+    world.jira.put("DR-1", "Peer Review", "10", assignee="acct-other")
+    world.tick(config, T0 + timedelta(minutes=1))
+    found = _explain(world, config)
+    assert found["review"].gate == "assignee"
+    assert found["mine"].gate == "assignee"
+    any_config = _config(
+        {**REVIEW, "assignee": "any"}, {**other, "assignee": "any"}, repos={"DR": str(repo)}
+    )
+    world.tick(any_config, T0 + timedelta(minutes=2))  # adopts the edited rules
+    found = _explain(world, any_config, at=T0 + timedelta(minutes=3))
+    assert found["qa-ping"].gate == "status match"
+    assert "not QA" in found["qa-ping"].detail
+    assert found["review"].fires, found["review"]
+    assert any("no run exists" in n for n in found["review"].notes)
+
+
+def test_explain_reports_an_existing_run_and_the_guards(world: World, repo: Path) -> None:
+    config = _config(REVIEW, repos={"DR": str(repo)})
+    _baseline(world, config)
+    _move_to_review(world, config, T0 + timedelta(minutes=1))
+    found = _explain(world, config)
+    assert found["review"].gate == "run exists"
+    assert "awaiting_confirm" in found["review"].detail
+    runs.approve("DR-1.review.10-1")
+    world.sessions = [_agent("s1", "DR-1", status="WORKING")]
+    found = _explain(world, config)
+    assert found["review"].gate == "launch guard"
+    runs.pause()
+    assert _explain(world, config)["review"].gate == "paused"
+    # Read-only: nothing moved.
+    assert _only_run().state is RunState.CLAIMED
+    assert world.launch.windows == []
+
+
+def test_explain_says_adopting_and_not_on_board(world: World) -> None:
+    config = _config(NOTIFY)
+    _baseline(world, config)
+    later = _config(NOTIFY, {**NOTIFY, "name": "fresh"})
+    found = _explain(world, later)
+    assert found["fresh"].gate == "adopting"
+    assert _explain(world, config, "DR-99")["notify"].gate == "not on board"
+    found, problem = flows_tick.explain(config, "DR-1", "nope", deps=world.deps(), now=T0)
+    assert found == [] and "no flow named" in problem

@@ -8,20 +8,37 @@ snapshots" model, applied to pull requests and to agent sessions — and each
 event is named by what it is about (``pr<number>``, the session id), so a
 rule fires on it once.
 
-**on_pr** asks ``gh`` (:func:`ephor.github.find_prs_for_ticket`) which pull
-requests name each ticket, in the ticket's own worktree or its project's
-``[repos]`` checkout:
+**on_pr** lists each repo's newest pull requests with one ``gh pr list``
+(:func:`ephor.github.list_repo_prs`) — the repo being the ticket's own
+worktree or its project's ``[repos]`` checkout — and matches the board's
+tickets against that list locally:
 
 * ``opened`` — a PR is open now that the ticket's previous observation did
   not have open. Its run is keyed on the PR number, so it fires once per
   PR: a PR closed and reopened later does not fire again;
-* ``merged`` — a PR is merged now that was not merged before.
+* ``merged`` — a PR is merged now that the previous observation had
+  **open**. A PR never seen open — one that was already merged the first
+  time ephor saw it — is history, not an event.
 
 A ``gh`` call costs a second, so the lookups are spaced ``[flows]
 pr_interval`` apart (``pr_checked_at``), and a ticket in a Done status is
 asked about only while one of its PRs was last seen open — the merge still
 to come. A ticket's first observation is a **baseline** and fires nothing:
-its PRs were already there when ephor started looking. The opened/merged
+its PRs were already there when ephor started looking.
+
+**The question includes the repo.** Each ticket's observation records the
+repo it was read from (``pr_repos``). A ticket whose repo changes — its
+worktree appeared, or was removed and the ``[repos]`` checkout answers
+instead — is asked a different question, and the answer is a fresh
+baseline, silently. Without that, every PR the new repo happens to hold
+would read as just opened, or just merged, and ``mode = "auto"`` flows on
+them would run unattended.
+
+A repo listing that fills its limit has older PRs it did not return. A
+ticket whose previously-seen PR has aged off it is asked about on its own
+(:func:`ephor.github.find_prs_for_ticket`), and a PR that search turns up
+for the first time is baselined rather than fired on: a fuzzy search
+starting to match an old PR is not that PR opening. The opened/merged
 pair is keyed on the PR *number*; a head-sha generation is reserved for a
 later ``on_pr = "pushed"``.
 
@@ -42,7 +59,9 @@ ticket:
   A session waiting on a permission prompt is blocked, not idle. It fires on
   the tick that sees it cross that line, and only for a session the previous
   tick saw on the near side of it: a session first seen already settled is
-  a baseline, like a PR.
+  a baseline, like a PR. Its generation is the session *and* the start of
+  the idle spell (the last hook event before it), so a session that works,
+  goes quiet, works again and goes quiet again fires once per quiet spell.
 
 **Unknown never means unmet.** A ``gh`` that did not answer, a ticket with no
 repo, a state directory that could not be read: each leaves that part of the
@@ -61,7 +80,7 @@ from ephor.board import Assignee, FlowRule, Trigger
 from ephor.constants import AgentStatus
 from ephor.flows import runs, ticket_sort_key
 from ephor.flows.snapshot import PrState, SessionSeen, Snapshot, TicketState
-from ephor.github import PullRequest
+from ephor.github import PullRequest, RepoPrs, ci_word
 from ephor.state.models import AgentState
 
 PR_OPENED = "opened"
@@ -70,6 +89,7 @@ SESSION_DIED = "died"
 SESSION_IDLE = "idle"
 
 FindPrs = Callable[[Path, str], list[PullRequest] | None]
+ListPrs = Callable[[Path], RepoPrs | None]
 RepoFor = Callable[[str], Path | None]
 TicketOf = Callable[[AgentState], str]
 PidAlive = Callable[[int], bool]
@@ -86,6 +106,7 @@ class TriggerEvent:
     detail: str
     pr: PrState | None = None
     session_id: str = ""
+    idle_since: str = ""  # on_session = "idle": the spell's start
 
 
 def assignee_ok(rule: FlowRule, record: TicketState, myself: str) -> bool:
@@ -132,7 +153,22 @@ def pr_tickets(snap: Snapshot, rules: Iterable[FlowRule], myself: str) -> list[s
 
 
 def _pr_state(pr: PullRequest) -> PrState:
-    return PrState(number=pr.number, state=pr.state.upper(), head_sha=pr.head_sha, url=pr.url)
+    return PrState(
+        number=pr.number,
+        state=pr.state.upper(),
+        head_sha=pr.head_sha,
+        url=pr.url,
+        ci=ci_word(pr.ci),
+    )
+
+
+@dataclass(frozen=True)
+class PrObservation:
+    """One round of PR lookups: ticket -> PRs, ticket -> the repo they came from, and events."""
+
+    prs: dict[str, tuple[PrState, ...]]
+    repos: dict[str, str]
+    events: list[TriggerEvent]
 
 
 def observe_prs(
@@ -141,49 +177,92 @@ def observe_prs(
     *,
     tickets: Mapping[str, TicketState],
     repo_for: RepoFor,
+    list_prs: ListPrs,
     find: FindPrs,
-) -> tuple[dict[str, tuple[PrState, ...]], list[TriggerEvent]]:
+    previous_repos: Mapping[str, str] | None = None,
+) -> PrObservation:
     """Look up ``keys``' PRs: the new observation, and the events it holds.
 
-    Entries for tickets not looked up this round are dropped, so a ticket
-    that returns (reassigned back, say) starts from a fresh baseline rather
-    than firing for whatever happened while ephor was not looking. A ticket
-    that was looked up but has no repo, or whose lookup did not answer,
-    keeps its entry as it was: unknown is not unmet.
+    One ``list_prs`` per distinct repo, matched per ticket locally. Entries
+    for tickets not looked up this round are dropped, so a ticket that
+    returns (reassigned back, say) starts from a fresh baseline rather than
+    firing for whatever happened while ephor was not looking. A ticket that
+    was looked up but has no repo, or whose repo's listing did not answer,
+    keeps its entry (and its repo) as it was: unknown is not unmet. A
+    ticket whose repo is not the one its previous entry was read from is
+    re-baselined: the new answer is stored and nothing fires from it.
     """
     wanted = list(keys)
     keep = set(wanted)
+    was_in = previous_repos or {}
     observed: dict[str, tuple[PrState, ...]] = {
         key: found for key, found in previous.items() if key in keep and key in tickets
     }
+    repos: dict[str, str] = {key: was_in[key] for key in observed if key in was_in}
     events: list[TriggerEvent] = []
+    groups: dict[str, tuple[Path, list[str]]] = {}
     for key in wanted:
-        repo = repo_for(key)
+        repo = None
+        with contextlib.suppress(Exception):
+            repo = repo_for(key)
         if repo is None:
             continue
-        found: list[PullRequest] | None = None
+        groups.setdefault(str(repo), (repo, []))[1].append(key)
+    for where, (repo, group) in groups.items():
+        listing: RepoPrs | None = None
         with contextlib.suppress(Exception):
-            found = find(repo, key)
-        if found is None:
+            listing = list_prs(repo)
+        if listing is None:
             continue
-        by_number = {pr.number: _pr_state(pr) for pr in found if pr.number > 0}
-        now_prs = tuple(by_number[n] for n in sorted(by_number))
-        observed[key] = now_prs
-        before = previous.get(key)
-        if before is not None:
-            events.extend(pr_events(key, before, now_prs))
-    return observed, events
+        for key in group:
+            before = previous.get(key)
+            found: list[PullRequest] | None = listing.naming(key)
+            searched = False
+            if not listing.complete and before:
+                listed = {pr.number for pr in found or ()}
+                if any(pr.number not in listed for pr in before):
+                    # Aged off a full listing: ask about this ticket alone.
+                    found, searched = None, True
+                    with contextlib.suppress(Exception):
+                        found = find(repo, key)
+            if found is None:
+                continue
+            by_number = {pr.number: _pr_state(pr) for pr in found if pr.number > 0}
+            now_prs = tuple(by_number[n] for n in sorted(by_number))
+            observed[key] = now_prs
+            repos[key] = where
+            if before is not None and was_in.get(key) == where:
+                events.extend(pr_events(key, before, now_prs, new_may_open=not searched))
+    return PrObservation(prs=observed, repos=repos, events=events)
 
 
-def pr_events(key: str, before: Iterable[PrState], after: Iterable[PrState]) -> list[TriggerEvent]:
-    """What changed between two observations of one ticket's PRs."""
+def pr_events(
+    key: str,
+    before: Iterable[PrState],
+    after: Iterable[PrState],
+    *,
+    new_may_open: bool = True,
+) -> list[TriggerEvent]:
+    """What changed between two observations of one ticket's PRs, from the same repo.
+
+    * a PR not in ``before`` fires ``opened`` only if it is open (and only
+      when ``new_may_open``: a per-ticket search that newly matches an old
+      PR is not that PR opening) — never ``merged``: a PR first seen merged
+      was merged before ephor was looking;
+    * a PR seen before fires ``opened`` when it is open and was not, and
+      ``merged`` only when it was last seen open.
+    """
     old = {pr.number: pr for pr in before}
     events: list[TriggerEvent] = []
     for pr in after:
         prior = old.get(pr.number)
-        if pr.is_open and (prior is None or not prior.is_open):
+        if prior is None:
+            if not (pr.is_open and new_may_open):
+                continue
             value = PR_OPENED
-        elif pr.is_merged and (prior is None or not prior.is_merged):
+        elif pr.is_open and not prior.is_open:
+            value = PR_OPENED
+        elif pr.is_merged and prior.is_open:
             value = PR_MERGED
         else:
             continue
@@ -265,7 +344,16 @@ def observe_sessions(
         pid = agent.agent_pid if isinstance(agent.agent_pid, int) and agent.agent_pid > 0 else 0
         is_dead = agent.status is AgentStatus.DEAD
         settled = not is_dead and is_settled(agent, settle, now)
-        seen[sid] = SessionSeen(ticket=ticket, status=str(agent.status), pid=pid, settled=settled)
+        # While settled, no hook event has moved last_event_time: it is the
+        # moment this idle spell began, and the same on every tick of it.
+        idle_since = agent.last_event_time if settled else ""
+        seen[sid] = SessionSeen(
+            ticket=ticket,
+            status=str(agent.status),
+            pid=pid,
+            settled=settled,
+            idle_since=idle_since,
+        )
         if old is None:
             continue  # a baseline: whatever it is doing, it was doing it before we looked
         if is_dead and old.status != dead:
@@ -274,8 +362,12 @@ def observe_sessions(
             if pid and pid_alive(pid):
                 continue
             events.append(_session_event(old.ticket or ticket, sid, SESSION_DIED))
-        elif settled and not old.settled:
-            events.append(_session_event(ticket, sid, SESSION_IDLE))
+        elif settled and (
+            not old.settled or (bool(old.idle_since) and old.idle_since != idle_since)
+        ):
+            # A new spell: it was busy last tick, or it woke and settled again
+            # in between (a settle shorter than the tick spacing).
+            events.append(_session_event(ticket, sid, SESSION_IDLE, idle_since=idle_since))
     for sid, old in previous.items():
         if sid in seen or old.status == dead:
             continue
@@ -287,18 +379,28 @@ def observe_sessions(
     return seen, events
 
 
-def _session_event(ticket: str, session_id: str, value: str) -> TriggerEvent:
+def _session_event(
+    ticket: str, session_id: str, value: str, *, idle_since: str = ""
+) -> TriggerEvent:
+    generation = runs.session_generation(session_id)
+    if idle_since:
+        generation = runs.idle_generation(session_id, idle_since)
     return TriggerEvent(
         key=ticket,
         trigger=Trigger.ON_SESSION,
         value=value,
-        generation=runs.session_generation(session_id),
+        generation=generation,
         detail=f"session {session_id[:8]} {value}",
         session_id=session_id,
+        idle_since=idle_since,
     )
 
 
-def session_still_idle(session_id: str, sessions: Mapping[str, SessionSeen]) -> bool:
-    """True while the last tick saw ``session_id`` settled-idle."""
+def session_still_idle(
+    session_id: str, sessions: Mapping[str, SessionSeen], idle_since: str = ""
+) -> bool:
+    """True while the last tick saw ``session_id`` settled-idle — in the same spell, if named."""
     seen = sessions.get(session_id)
-    return seen is not None and seen.settled
+    if seen is None or not seen.settled:
+        return False
+    return not idle_since or not seen.idle_since or seen.idle_since == idle_since

@@ -131,3 +131,12 @@ StatusToast {
     color: $ink-dim;
     padding: 0 1;
 }
+
+/* The status lanes' first line: how old the board snapshot is. */
+
+#board-line {
+    height: 1;
+    background: $surface-alt;
+    color: $ink-dim;
+    padding: 0 1;
+}

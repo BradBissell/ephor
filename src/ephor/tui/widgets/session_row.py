@@ -33,8 +33,10 @@ leading icon cell, which is how the row affords a status signal for free.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Protocol
 
 from textual import events
 from textual.widgets import Static
@@ -251,14 +253,7 @@ def render_ticket_cell(
     if ticket == "—":
         return f"[dim]{ticket:<{width}}[/]"
     if pr is not None:
-        state = pr.state.upper()
-        if state == "MERGED":
-            color = "#bc8cff"
-        elif state == "CLOSED":
-            color = "#f85149"
-        else:
-            color = "#7ee787"
-        style = f"{color} underline"
+        style = f"{pr_state_color(pr.state)} underline"
     elif confident:
         style = "#7ee787"
     else:
@@ -347,6 +342,57 @@ def render_work_cell(
         if not pr.is_open
         else (f"{body}{' ' * max(0, width - visible)}")
     )
+
+
+class _SnapshotPr(Protocol):
+    """The parts of :class:`ephor.flows.snapshot.PrState` the PR cell reads."""
+
+    @property
+    def number(self) -> int: ...
+    @property
+    def state(self) -> str: ...
+    @property
+    def ci(self) -> str: ...
+
+
+# The flow tick's CI words, read into the dashboard's own CI states so a
+# ticket row draws exactly the glyphs a session row does.
+_SNAPSHOT_CI: dict[str, CiState] = {
+    "pass": CiState.PASSING,
+    "fail": CiState.FAILING,
+    "pending": CiState.PENDING,
+}
+
+
+def pr_state_color(state: str) -> str:
+    """The colour a PR's state is drawn in: green open, purple merged, red closed."""
+    upper = (state or "").upper()
+    if upper == "MERGED":
+        return "#bc8cff"
+    if upper == "CLOSED":
+        return "#f85149"
+    return "#7ee787"
+
+
+def render_snapshot_pr_cell(prs: Sequence[_SnapshotPr], width: int = _WORK_W) -> str:
+    """The work cell for a ticket row, from the board snapshot's PRs.
+
+    Same vocabulary as :func:`render_work_cell`: the number coloured by PR
+    state (as :func:`render_ticket_cell` colours a key), then the CI glyph.
+    The snapshot knows no review verdict, so that glyph is left out; a
+    ticket with several PRs shows the most relevant one and ``+N``.
+    """
+    if not prs:
+        return f"[dim]{'—':<{width}}[/]"
+    pr = max(prs, key=lambda p: (p.state.upper() == "OPEN", p.number))
+    number = f"#{pr.number}"
+    ci_char, ci_color = _CI_GLYPH.get(_SNAPSHOT_CI.get(pr.ci, CiState.NONE), (" ", "dim"))
+    extra = f"+{len(prs) - 1}" if len(prs) > 1 else ""
+    if len(number) + 2 + len(extra) > width:
+        extra = ""
+    body = f"[{pr_state_color(pr.state)}]{number}[/] [{ci_color}]{ci_char}[/][dim]{extra}[/]"
+    visible = len(number) + 2 + len(extra)
+    return f"{body}{' ' * max(0, width - visible)}"
 
 
 def _warning(context: RowContext, stale: bool) -> tuple[str, str, str] | None:

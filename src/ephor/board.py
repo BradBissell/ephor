@@ -24,6 +24,12 @@ Two levels of "valid" fall out of that:
   half-understood is exactly the rule that launches an agent you did not ask
   for.
 
+A third level sits below both: **warnings**. A warning is something that is
+probably a mistake but cannot launch anything you did not ask for — a flow
+watching a status that no column names, say, which is a typo as often as it
+is a status the lanes simply do not draw. Warnings are shown (``ephor flows
+check``, ``ephor doctor``) and never disable anything.
+
 **Agent-launching flows are confirm-only.** ``mode = "auto"`` is accepted on
 a ``command =`` flow and rejected on a ``start =`` flow. Your own skills move
 tickets through Jira with your own token, so nothing ephor can see tells your
@@ -73,7 +79,11 @@ _DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)([smhd])")
 _DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 
 # The only names a ``start =`` / ``command =`` template may interpolate.
-TEMPLATE_FIELDS = frozenset({"ticket", "title", "status"})
+# Each is "" when the event does not carry it (no PR on a status move).
+TEMPLATE_FIELDS = frozenset(
+    {"ticket", "title", "status", "from_status", "pr_url", "pr_number", "repo", "session_id"}
+)
+_TEMPLATE_NAMES = ", ".join(f"{{{name}}}" for name in sorted(TEMPLATE_FIELDS))
 
 
 class Trigger(StrEnum):
@@ -101,10 +111,20 @@ class Assignee(StrEnum):
 
 @dataclass(frozen=True)
 class Column:
-    """One lane: a display name and the status names it gathers (lowercased)."""
+    """One lane: a display name and the status names it gathers (lowercased).
+
+    ``wip`` is how many tickets the lane should hold at most, and
+    ``warn_after`` / ``alert_after`` how long (seconds) a ticket may sit in
+    it before its card is drawn as ageing, then as stuck. All three are for
+    the eye only — nothing is blocked or fired on them — and None is "no
+    limit".
+    """
 
     name: str
     statuses: tuple[str, ...]
+    wip: int | None = None
+    warn_after: float | None = None
+    alert_after: float | None = None
 
 
 @dataclass(frozen=True)
@@ -130,14 +150,30 @@ class BoardSettings:
         query = f"{scope} AND ({where})" if where else scope
         return f"{query} ORDER BY {order}" if order else query
 
-    def column_for(self, status: str) -> str:
-        """The lane ``status`` belongs in — matched case-insensitively — or Other."""
+    def column_for(self, status: str, category: str = "") -> str:
+        """The lane ``status`` belongs in — matched case-insensitively.
+
+        A status no column names falls back on its Jira status *category*:
+        ``done`` goes to the last column and ``new`` (to-do) to the first, so
+        a team's extra "Won't Do" or "Backlog" lands where it reads right;
+        anything else (or no category) goes to Other.
+        """
         wanted = (status or "").strip().lower()
         if wanted:
             for column in self.columns:
                 if wanted in column.statuses:
                     return column.name
+        kind = (category or "").strip().lower()
+        if self.columns and kind == "done":
+            return self.columns[-1].name
+        if self.columns and kind == "new":
+            return self.columns[0].name
         return OTHER_LANE
+
+    def has_status(self, status: str) -> bool:
+        """True when some column names ``status`` (case-insensitively)."""
+        wanted = (status or "").strip().lower()
+        return any(wanted in column.statuses for column in self.columns)
 
     def lane_names(self) -> tuple[str, ...]:
         """Every lane in display order: the configured columns, then Other."""
@@ -149,11 +185,20 @@ class FlowSettings:
     """The ``[flows]`` table: guard rails shared by every rule. Durations in seconds."""
 
     tmux_session: str = ""
+    # Agent slots: how many sessions may be *working* before a new agent run
+    # queues. A session idle past ``settle`` has finished and frees its slot.
     max_active_agents: int = 4
-    max_runs_per_hour: int = 6
-    ticket_breaker: int = 3
+    max_runs_per_hour: int = 6  # agent (start=) launches only
+    ticket_breaker: int = 3  # agent (start=) launches only
+    # command= launches have a cap of their own: a notification script is
+    # not an agent, and must neither use up nor be held by the agent budget.
+    max_commands_per_hour: int = 60
     max_event_age: float = 30 * 60.0
     confirm_ttl: float = 24 * 3600.0
+    # How long an approved agent run may wait in the queue for a free slot
+    # (max_active_agents) before it expires. Longer than confirm_ttl: a
+    # queued run is waiting its turn, not waiting on a guard to clear.
+    queue_ttl: float = 3 * 24 * 3600.0
     pr_interval: float = 5 * 60.0
     settle: float = 10 * 60.0
 
@@ -171,6 +216,14 @@ class FlowRule:
     provider: str = "claude"
     worktree: bool = False
     mode: Mode = Mode.CONFIRM
+    # on_enter only: fire only when the ticket came from one of these
+    # statuses (lowercased). Empty: from anywhere, including off the board.
+    from_statuses: tuple[str, ...] = ()
+    # An extra JQL condition the ticket must also meet when the rule fires,
+    # checked with one search per tick that has candidates for it.
+    jql: str = ""
+    # Where the flow runs, instead of the ticket's worktree / [repos] entry.
+    repo: str = ""
 
     @property
     def launches_agent(self) -> bool:
@@ -185,6 +238,12 @@ class FlowRule:
         """True when ``status`` is the one an on_enter/on_exit rule names."""
         return (status or "").strip().lower() == self.value.strip().lower()
 
+    def matches_from(self, status: str) -> bool:
+        """True when an on_enter rule's ``from =`` accepts ``status`` (always, when unset)."""
+        if not self.from_statuses:
+            return True
+        return (status or "").strip().lower() in self.from_statuses
+
     @property
     def fingerprint(self) -> str:
         """Identity of *which tickets this rule fires on*, for adopt mode.
@@ -196,10 +255,19 @@ class FlowRule:
         editing what a rule *runs* does not re-adopt, while pointing it at a
         different status does.
         """
-        canonical = json.dumps(
-            [self.name, str(self.trigger), self.value.strip().lower(), str(self.assignee)],
-            separators=(",", ":"),
-        )
+        parts: list[Any] = [
+            self.name,
+            str(self.trigger),
+            self.value.strip().lower(),
+            str(self.assignee),
+        ]
+        # Appended only when set, so a rule that uses neither keeps the
+        # fingerprint it had before they existed and does not re-adopt.
+        if self.from_statuses:
+            parts.append(["from", *self.from_statuses])
+        if self.jql:
+            parts.append(["jql", self.jql])
+        canonical = json.dumps(parts, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
     @property
@@ -214,13 +282,28 @@ class FlowRule:
         """
         canonical = json.dumps(
             ["start" if self.launches_agent else "command", self.template, self.provider]
-            + ([self.worktree] if self.launches_agent else []),
+            + ([self.worktree] if self.launches_agent else [])
+            + ([["repo", self.repo]] if self.repo else []),
             separators=(",", ":"),
         )
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
-    def render(self, *, ticket: str, title: str = "", status: str = "") -> str:
-        """The rule's template with ``{ticket}``, ``{title}`` and ``{status}`` filled in.
+    def render(
+        self,
+        *,
+        ticket: str,
+        title: str = "",
+        status: str = "",
+        from_status: str = "",
+        pr_url: str = "",
+        pr_number: int | str = "",
+        repo: str = "",
+        session_id: str = "",
+    ) -> str:
+        """The rule's template with every :data:`TEMPLATE_FIELDS` placeholder filled in.
+
+        A value the event does not carry renders as "" (``{pr_url}`` on a
+        status move, a ``{pr_number}`` of 0).
 
         For a ``command =`` flow every value is shell-quoted: a ticket title
         is text anyone with edit rights on the ticket chose, and it must
@@ -235,7 +318,16 @@ class FlowRule:
         and validation makes it begin with literal text, so ticket text can
         never be read as a command-line option.
         """
-        values = {"ticket": ticket, "title": title, "status": status}
+        values = {
+            "ticket": ticket,
+            "title": title,
+            "status": status,
+            "from_status": from_status,
+            "pr_url": pr_url,
+            "pr_number": str(pr_number) if pr_number else "",
+            "repo": repo,
+            "session_id": session_id,
+        }
         if self.command:
             values = {k: shlex.quote(v) for k, v in values.items()}
         return self.template.format_map(values)
@@ -254,6 +346,8 @@ class BoardConfig:
     # dispatches). Human-readable, one per problem, each naming where it is.
     board_errors: tuple[str, ...] = ()
     flow_errors: tuple[str, ...] = ()
+    # Probably-mistakes that disable nothing (see the module docstring).
+    warnings: tuple[str, ...] = ()
 
     @property
     def errors(self) -> tuple[str, ...]:
@@ -304,6 +398,21 @@ class BoardConfig:
                 return path, f"repos.{project}"
             return None, f"no repo: repos.{project} = {configured} does not exist"
         return None, "no repo"
+
+    def repo_for_rule(
+        self, rule: FlowRule, ticket: str, work: WorkItem | None = None
+    ) -> tuple[Path | None, str]:
+        """Where ``rule``'s flow for ``ticket`` runs: its own ``repo =``, else :meth:`resolve_repo`.
+
+        A rule's ``repo`` that no longer exists is "no repo", never a quiet
+        fall back to the ticket's checkout — the author said where it runs.
+        """
+        if not rule.repo:
+            return self.resolve_repo(ticket, work)
+        path = Path(rule.repo).expanduser()
+        if path.is_dir():
+            return path, "rule"
+        return None, f"no repo: flow {rule.name} repo = {rule.repo} does not exist"
 
 
 def _same_dir(path: Path, configured: str | None) -> bool:
@@ -398,6 +507,7 @@ def parse(data: Mapping[str, Any], *, path: Path | None = None) -> BoardConfig:
     repos = _parse_repos(data.get("repos", {}), flow_errors)
     flows = _parse_flow_settings(data.get("flows", {}), flow_errors)
     rules = _parse_rules(data.get("flow", []), flow_errors)
+    warnings = status_warnings(board, rules) if not board_errors else []
 
     return BoardConfig(
         path=path or board_path(),
@@ -407,7 +517,39 @@ def parse(data: Mapping[str, Any], *, path: Path | None = None) -> BoardConfig:
         rules=rules,
         board_errors=tuple(board_errors),
         flow_errors=tuple(flow_errors),
+        warnings=tuple(warnings),
     )
+
+
+def status_warnings(
+    board: BoardSettings, rules: tuple[FlowRule, ...], seen: frozenset[str] | None = None
+) -> list[str]:
+    """Status names the rules mention that no column names — and, with ``seen``, none seen.
+
+    A status in no column still works (its tickets sit in Other), so this is
+    a warning, not an error: it is a typo as often as it is a status the
+    lanes simply do not draw. ``seen`` (lowercased status names from the
+    last snapshot) adds the stronger check ``ephor flows check`` can make:
+    a status no ticket on the board is in may not exist on this site.
+    """
+    found: list[str] = []
+    for rule in rules:
+        if rule.trigger not in (Trigger.ON_ENTER, Trigger.ON_EXIT):
+            continue
+        names = [(str(rule.trigger), rule.value), *(("from", s) for s in rule.from_statuses)]
+        for key, name in names:
+            low = name.strip().lower()
+            if not board.has_status(low):
+                found.append(
+                    f"[[flow]] {rule.name}: {key} = {name!r} is not in any [board] column "
+                    "(its tickets sit in Other — check the spelling)"
+                )
+            elif seen is not None and low not in seen:
+                found.append(
+                    f"[[flow]] {rule.name}: {key} = {name!r} — no ticket on the board is in "
+                    "that status right now (fine if none is; check the spelling if one should be)"
+                )
+    return found
 
 
 def _parse_board(raw: object, errors: list[str]) -> BoardSettings:
@@ -457,10 +599,11 @@ def _parse_columns(raw: object, errors: list[str]) -> tuple[Column, ...]:
     claimed: dict[str, str] = {}
     for index, entry in enumerate(raw):
         where = f"[board] columns[{index}]"
+        limits: dict[str, Any] = {}
         if isinstance(entry, str):
             name, statuses = entry.strip(), [entry]
         elif isinstance(entry, dict):
-            extra = set(entry) - {"name", "statuses"}
+            extra = set(entry) - {"name", "statuses", *_COLUMN_LIMITS}
             if extra:
                 errors.append(f"{where}: unknown key(s) {', '.join(sorted(extra))}")
             name = str(entry.get("name") or "").strip()
@@ -471,6 +614,7 @@ def _parse_columns(raw: object, errors: list[str]) -> tuple[Column, ...]:
                 errors.append(f"{where}: statuses must be a list of status names")
                 continue
             statuses = raw_statuses
+            limits = _parse_column_limits(entry, where, errors)
         else:
             errors.append(f"{where}: must be a status name or {{ name, statuses }}")
             continue
@@ -497,8 +641,34 @@ def _parse_columns(raw: object, errors: list[str]) -> tuple[Column, ...]:
                 errors.append(f"{where}: status {status!r} is already in column {owner!r}")
             else:
                 claimed[status] = name
-        columns.append(Column(name=name, statuses=normalized))
+        columns.append(Column(name=name, statuses=normalized, **limits))
     return tuple(columns) or BoardSettings().columns
+
+
+_COLUMN_LIMITS = ("wip", "warn_after", "alert_after")
+
+
+def _parse_column_limits(entry: Mapping[str, Any], where: str, errors: list[str]) -> dict[str, Any]:
+    """A column's ``wip``, ``warn_after`` and ``alert_after``, as Column keyword arguments."""
+    limits: dict[str, Any] = {}
+    if "wip" in entry:
+        wip = entry["wip"]
+        if isinstance(wip, bool) or not isinstance(wip, int) or wip < 1:
+            errors.append(f"{where}: wip must be a whole number of at least 1")
+        else:
+            limits["wip"] = wip
+    for key in ("warn_after", "alert_after"):
+        if key not in entry:
+            continue
+        seconds = parse_duration(entry[key])
+        if seconds is None:
+            errors.append(f'{where}: {key} = {entry[key]!r} is not a duration (e.g. "36h", "3d")')
+        else:
+            limits[key] = seconds
+    warn, alert = limits.get("warn_after"), limits.get("alert_after")
+    if warn is not None and alert is not None and alert < warn:
+        errors.append(f"{where}: alert_after must not be shorter than warn_after")
+    return limits
 
 
 def _parse_repos(raw: object, errors: list[str]) -> dict[str, str]:
@@ -525,8 +695,13 @@ def _parse_repos(raw: object, errors: list[str]) -> dict[str, str]:
     return repos
 
 
-_FLOW_INT_FIELDS = ("max_active_agents", "max_runs_per_hour", "ticket_breaker")
-_FLOW_DURATION_FIELDS = ("max_event_age", "confirm_ttl", "pr_interval", "settle")
+_FLOW_INT_FIELDS = (
+    "max_active_agents",
+    "max_runs_per_hour",
+    "ticket_breaker",
+    "max_commands_per_hour",
+)
+_FLOW_DURATION_FIELDS = ("max_event_age", "confirm_ttl", "queue_ttl", "pr_interval", "settle")
 
 
 def _parse_flow_settings(raw: object, errors: list[str]) -> FlowSettings:
@@ -574,7 +749,19 @@ def _parse_flow_settings(raw: object, errors: list[str]) -> FlowSettings:
 _E = TypeVar("_E", bound=StrEnum)
 
 _RULE_KEYS = frozenset(
-    {"name", "start", "command", "assignee", "provider", "worktree", "mode", *map(str, Trigger)}
+    {
+        "name",
+        "start",
+        "command",
+        "assignee",
+        "provider",
+        "worktree",
+        "mode",
+        "from",
+        "jql",
+        "repo",
+        *map(str, Trigger),
+    }
 )
 
 
@@ -671,6 +858,22 @@ def _parse_rule(index: int, entry: object, errors: list[str]) -> FlowRule | None
             f'{where}: mode = "auto" is not allowed on a start= flow — '
             "agent-launching flows are confirm-only"
         )
+    from_statuses = _parse_from(entry, trigger, where, errors)
+    jql = entry.get("jql", "")
+    if not isinstance(jql, str):
+        errors.append(f"{where}: jql must be a string")
+        jql = ""
+    jql = jql.strip()
+    if jql and split_order_by(jql)[1] is not None:
+        errors.append(f"{where}: jql is a condition, and cannot have an ORDER BY")
+    repo = entry.get("repo", "")
+    if not isinstance(repo, str):
+        errors.append(f"{where}: repo must be a path")
+        repo = ""
+    repo = repo.strip()
+    if repo and not Path(repo).expanduser().is_absolute():
+        errors.append(f"{where}: repo must be an absolute path (or start with ~)")
+
     if start and trigger is Trigger.ON_SESSION and value == "idle":
         errors.append(
             f'{where}: on_session = "idle" cannot use start= — the idle session is itself '
@@ -690,7 +893,31 @@ def _parse_rule(index: int, entry: object, errors: list[str]) -> FlowRule | None
         provider=provider,
         worktree=worktree,
         mode=mode,
+        from_statuses=from_statuses,
+        jql=jql,
+        repo=repo,
     )
+
+
+def _parse_from(
+    entry: Mapping[str, Any], trigger: Trigger | None, where: str, errors: list[str]
+) -> tuple[str, ...]:
+    """``from =``: one status name or a list of them, on an on_enter rule only."""
+    if "from" not in entry:
+        return ()
+    raw = entry["from"]
+    if trigger is not Trigger.ON_ENTER:
+        errors.append(f"{where}: from applies only to on_enter flows")
+        return ()
+    names = [raw] if isinstance(raw, str) else raw
+    if (
+        not isinstance(names, list)
+        or not names
+        or not all(isinstance(n, str) and n.strip() for n in names)
+    ):
+        errors.append(f"{where}: from must be a status name or a non-empty list of them")
+        return ()
+    return tuple(dict.fromkeys(n.strip().lower() for n in names))
 
 
 def _enum_field(
@@ -713,7 +940,7 @@ def _enum_field(
 def _template_problem(template: str) -> str:
     """Why ``template`` cannot be rendered, or "" when it can.
 
-    Only bare ``{ticket}``, ``{title}`` and ``{status}`` are allowed. Format
+    Only bare :data:`TEMPLATE_FIELDS` placeholders are allowed. Format
     specs, attribute access and indexing are rejected: they are never what a
     flow author meant, and ``{ticket.__class__}`` is not something a config
     file should be able to evaluate.
@@ -730,7 +957,7 @@ def _template_problem(template: str) -> str:
         if field_name not in TEMPLATE_FIELDS or spec or conversion:
             return (
                 f"template placeholder {{{field_name}}} is not one of "
-                "{ticket}, {title}, {status} (write {{ and }} for literal braces)"
+                f"{_TEMPLATE_NAMES} (write {{{{ and }}}} for literal braces)"
             )
     return ""
 

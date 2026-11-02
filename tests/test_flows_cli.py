@@ -35,6 +35,7 @@ def _jira_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EPHOR_JIRA_URL", "https://example.atlassian.net")
     monkeypatch.setenv("EPHOR_JIRA_EMAIL", "me@example.com")
     monkeypatch.setenv("EPHOR_JIRA_TOKEN", "t")
+    monkeypatch.setattr(jira_api, "flagged_field_id", lambda: "")
 
 
 def test_flows_without_a_subcommand_prints_help(capsys: pytest.CaptureFixture[str]) -> None:

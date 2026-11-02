@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,17 @@ def _wrapper_exit(command: str, tmp_path: Path) -> int | None:
 def test_the_wrapper_records_the_exit_status(command: str, code: int, tmp_path: Path) -> None:
     assert _wrapper_exit(command, tmp_path) == code
     assert not any(p.name.startswith(".tmp.") for p in runs.runs_dir().iterdir())
+
+
+def test_the_wrapper_tees_the_output_and_still_records_the_commands_status(
+    tmp_path: Path,
+) -> None:
+    """POSIX sh has no pipefail: the status must be the command's, never tee's."""
+    assert _wrapper_exit("echo out; echo err >&2; exit 4", tmp_path) == 4
+    assert runs.read_log_tail(RUN.run_id) == ["out", "err"]
+    # A second attempt appends.
+    assert _wrapper_exit("echo again", tmp_path) == 0
+    assert runs.read_log_tail(RUN.run_id) == ["out", "err", "again"]
 
 
 def _fake_window(
@@ -132,6 +144,30 @@ def test_a_command_gets_quoted_values_and_the_safe_env(tmp_path: Path) -> None:
     assert env["EPHOR_FLOW_RUN"] == RUN.run_id
     assert env["EPHOR_TICKET"] == "DR-1"
     assert call["command"] == f"sh -c {shlex.quote(runners.command_wrapper(RUN.run_id))}"
+
+
+def test_a_command_can_use_the_event_placeholders(tmp_path: Path) -> None:
+    calls: list[dict[str, Any]] = []
+    pr_run = replace(RUN, trigger="on_pr", event="opened", pr_number=12, pr_url="https://x/pull/12")
+    rule = _command_rule("note.sh {pr_number} {pr_url} {from_status} {repo}")
+    outcome = runners.launch(
+        pr_run,
+        rule,
+        repo=tmp_path,
+        repo_is_worktree=False,
+        payload=tmp_path / "p.json",
+        settings=FlowSettings(),
+        launchers=runners.Launchers(open_window=_fake_window(calls)),
+    )
+    assert outcome.ok
+    command = calls[0]["env"]["EPHOR_FLOW_COMMAND"]
+    assert shlex.split(command) == [
+        "note.sh",
+        "12",
+        "https://x/pull/12",
+        "In Progress",
+        str(tmp_path),
+    ]
 
 
 def test_a_command_window_failure_is_an_outcome(tmp_path: Path) -> None:
