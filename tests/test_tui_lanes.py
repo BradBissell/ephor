@@ -995,3 +995,36 @@ async def test_r_forces_a_board_tick_past_coalescing(
         await app.action_refresh()
         await app.workers.wait_for_complete()
         assert forced == [True]
+
+
+@pytest.mark.asyncio
+async def test_n_twice_with_a_start_prompt_opens_the_agent_in_place(
+    lanes_fleet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    body = _BOARD.replace(
+        "[board]\n", '[board]\nstart_prompt = "/next-step {ticket} {context}"\n', 1
+    )
+    _write_board(body + f'\n[repos]\nDR = "{repo}"\n')
+    opened: list[tuple[str, object, object]] = []
+    started: list[object] = []
+
+    def fake_open(ticket: str, cwd: object, **kwargs: object) -> launcher.StartResult:
+        opened.append((ticket, cwd, kwargs.get("prompt")))
+        return launcher.StartResult(True, "ok")
+
+    monkeypatch.setattr(launcher, "open_agent", fake_open)
+    monkeypatch.setattr(launcher, "start", lambda *a, **k: started.append(a))
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _cursor_on(app, virtual_row_id("DR-3"))
+        await pilot.press("N", "N")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+    assert started == []
+    ((ticket, cwd, prompt),) = opened
+    assert (ticket, cwd) == ("DR-3", repo)
+    assert isinstance(prompt, str) and prompt.startswith("/next-step DR-3")

@@ -24,6 +24,12 @@ columns = [
   { name = "Review", statuses = ["Peer Review", "QA"], wip = 4, warn_after = "36h", alert_after = "3d" },
   "Done",
 ]
+# The opening prompt of a session started with N on a ticket row. It opens in
+# the ticket's worktree (or the [repos] checkout) and creates nothing. A column
+# can set its own, e.g. { name = "Review", ..., start_prompt = "/review-pr {ticket}" }.
+# Placeholders: {ticket} {title} {status} {lane} {age} {pr_url} {pr_number}
+# {ci} {repo}, and {context}, a one-line summary of all of them.
+start_prompt = "/next-step {ticket} {context}"
 
 [repos]
 # Where a project's flows run when the ticket has no worktree of its own.

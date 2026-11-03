@@ -34,7 +34,16 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, ListItem, ListView, Static
 
-from ephor import eventlog, gitinfo, jira, launcher, permissions, ticket_pins, work_items
+from ephor import (
+    eventlog,
+    gitinfo,
+    jira,
+    launcher,
+    permissions,
+    start_prompt,
+    ticket_pins,
+    work_items,
+)
 from ephor.account import AccountConfig, load_account_config
 from ephor.account_usage import (
     AccountFingerprint,
@@ -64,6 +73,7 @@ from ephor.board import BoardConfig
 from ephor.constants import WORK_ATTENTION_DISPLAY, AgentStatus, WorkAttention
 from ephor.flows import runs as flow_runs
 from ephor.flows.runs import Run, RunState
+from ephor.flows.snapshot import Snapshot
 from ephor.github import PrResolver, PullRequest
 from ephor.jira import clear_cwd_cache, match_for_agent, ticket_for_agent
 from ephor.jira_api import IssueResolver
@@ -1558,11 +1568,19 @@ class EphorApp(App[int]):
             return
         self._start_armed = None
         self._set_toast(f"starting {markup_text(ticket)}…")
-        self._start_ticket_worker(ticket, config)
+        self._start_ticket_worker(ticket, config, self._lanes.snapshot)
 
     @work(thread=True, exit_on_error=False, group="launch")
-    def _start_ticket_worker(self, ticket: str, config: BoardConfig) -> None:
-        """Find where the ticket's agent runs, then hand off to ``_start_work``."""
+    def _start_ticket_worker(
+        self, ticket: str, config: BoardConfig, snap: Snapshot | None = None
+    ) -> None:
+        """Find where the ticket's agent runs, then start it there.
+
+        With a ``start_prompt`` configured the agent opens on it, in the
+        ticket's worktree or else the repo root, and creates a worktree
+        itself only if the work needs one. Without one, ``ephor start`` as
+        before: a fresh worktree and a bare agent.
+        """
         path, how = config.resolve_repo(ticket, work_items.load(ticket))
         if path is None:
             project = ticket.partition("-")[0]
@@ -1572,7 +1590,14 @@ class EphorApp(App[int]):
                 f'"~/path/to/repo" to board.toml',
             )
             return
-        self.call_from_thread(self._start_work, ticket, "claude", str(path))
+        prompt = start_prompt.prompt_for(config, ticket, snap, repo=str(path))
+        if not prompt:
+            self.call_from_thread(self._start_work, ticket, "claude", str(path))
+            return
+        result = launcher.open_agent(ticket, path, prompt=prompt)
+        self.call_from_thread(
+            self._set_toast, f"start {markup_text(ticket)}: {markup_text(result.message)}"
+        )
 
     def action_resume_session(self) -> None:
         """Reopen the cursor row's session in a fresh tmux window."""
