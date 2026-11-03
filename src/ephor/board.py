@@ -83,7 +83,15 @@ _DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 TEMPLATE_FIELDS = frozenset(
     {"ticket", "title", "status", "from_status", "pr_url", "pr_number", "repo", "session_id"}
 )
-_TEMPLATE_NAMES = ", ".join(f"{{{name}}}" for name in sorted(TEMPLATE_FIELDS))
+
+# The names a ``start_prompt`` (the opening prompt of a session started from
+# a ticket row with ``N``) may interpolate.
+# ``{context}`` is the board's one-line summary of the ticket — status, lane,
+# time in status, flag, PR and CI — so the agent starts from what the board
+# already knows. Each is "" when the board does not know it.
+START_PROMPT_FIELDS = frozenset(
+    {"ticket", "title", "status", "lane", "age", "pr_url", "pr_number", "ci", "context", "repo"}
+)
 
 
 class Trigger(StrEnum):
@@ -125,6 +133,9 @@ class Column:
     wip: int | None = None
     warn_after: float | None = None
     alert_after: float | None = None
+    # The opening prompt of a session started by hand on one of this lane's
+    # tickets; "" falls back on [board] start_prompt.
+    start_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -134,6 +145,11 @@ class BoardSettings:
     projects: tuple[str, ...] = ()
     jql: str = DEFAULT_JQL
     columns: tuple[Column, ...] = tuple(Column(n, (n.lower(),)) for n in DEFAULT_COLUMNS)
+    # The opening prompt of a session started from a ticket row (``N``).
+    # "" keeps the old behaviour: ``ephor start``'s fresh worktree and a bare
+    # agent. A column's own start_prompt wins for its tickets. ``ephor
+    # start`` never reads it: scripts call it and pass their own --prompt.
+    start_prompt: str = ""
 
     def search_jql(self) -> str:
         """The board's JQL, scoped to its projects.
@@ -149,6 +165,13 @@ class BoardSettings:
         # wrapped clause and re-attached after the scope.
         query = f"{scope} AND ({where})" if where else scope
         return f"{query} ORDER BY {order}" if order else query
+
+    def start_prompt_for(self, lane: str) -> str:
+        """The start_prompt template for a ticket in ``lane``: the column's, else the board's."""
+        for column in self.columns:
+            if column.name == lane and column.start_prompt:
+                return column.start_prompt
+        return self.start_prompt
 
     def column_for(self, status: str, category: str = "") -> str:
         """The lane ``status`` belongs in — matched case-insensitively.
@@ -557,7 +580,7 @@ def _parse_board(raw: object, errors: list[str]) -> BoardSettings:
         errors.append("[board] must be a table")
         return BoardSettings()
     for key in raw:
-        if key not in {"projects", "jql", "columns"}:
+        if key not in {"projects", "jql", "columns", "start_prompt"}:
             errors.append(f"[board]: unknown key {key!r}")
 
     projects: tuple[str, ...]
@@ -587,7 +610,39 @@ def _parse_board(raw: object, errors: list[str]) -> BoardSettings:
         errors.append("[board] jql: ORDER BY has no field list")
 
     columns = _parse_columns(raw.get("columns", list(DEFAULT_COLUMNS)), errors)
-    return BoardSettings(projects=projects, jql=jql, columns=columns)
+    start_prompt = _parse_start_prompt(raw, "[board]", errors)
+    return BoardSettings(projects=projects, jql=jql, columns=columns, start_prompt=start_prompt)
+
+
+def _parse_start_prompt(entry: Mapping[str, Any], where: str, errors: list[str]) -> str:
+    """``start_prompt`` from a [board] table or a column, validated; "" when absent or bad."""
+    value = entry.get("start_prompt", "")
+    if not isinstance(value, str):
+        errors.append(f"{where}: start_prompt must be a string")
+        return ""
+    value = value.strip()
+    problem = _template_problem(value, START_PROMPT_FIELDS)
+    if problem:
+        errors.append(f"{where}: start_prompt: {problem}")
+        return ""
+    if value and _starts_with_placeholder_or_dash(value):
+        errors.append(
+            f"{where}: start_prompt must begin with literal text "
+            "(e.g. /next-step {ticket}), not a placeholder or '-'"
+        )
+        return ""
+    return value
+
+
+def render_start_prompt(template: str, values: Mapping[str, str]) -> str:
+    """``template`` with every :data:`START_PROMPT_FIELDS` placeholder filled ("" when unknown).
+
+    The result is one argument to the agent CLI (the launcher quotes it), and
+    validation made it begin with literal text, so ticket text cannot arrive
+    as an option.
+    """
+    filled = {name: str(values.get(name, "") or "") for name in START_PROMPT_FIELDS}
+    return template.format_map(filled).strip()
 
 
 def _parse_columns(raw: object, errors: list[str]) -> tuple[Column, ...]:
@@ -603,7 +658,7 @@ def _parse_columns(raw: object, errors: list[str]) -> tuple[Column, ...]:
         if isinstance(entry, str):
             name, statuses = entry.strip(), [entry]
         elif isinstance(entry, dict):
-            extra = set(entry) - {"name", "statuses", *_COLUMN_LIMITS}
+            extra = set(entry) - {"name", "statuses", "start_prompt", *_COLUMN_LIMITS}
             if extra:
                 errors.append(f"{where}: unknown key(s) {', '.join(sorted(extra))}")
             name = str(entry.get("name") or "").strip()
@@ -615,6 +670,8 @@ def _parse_columns(raw: object, errors: list[str]) -> tuple[Column, ...]:
                 continue
             statuses = raw_statuses
             limits = _parse_column_limits(entry, where, errors)
+            if "start_prompt" in entry:
+                limits["start_prompt"] = _parse_start_prompt(entry, where, errors)
         else:
             errors.append(f"{where}: must be a status name or {{ name, statuses }}")
             continue
@@ -937,7 +994,7 @@ def _enum_field(
         return default
 
 
-def _template_problem(template: str) -> str:
+def _template_problem(template: str, fields: frozenset[str] = TEMPLATE_FIELDS) -> str:
     """Why ``template`` cannot be rendered, or "" when it can.
 
     Only bare :data:`TEMPLATE_FIELDS` placeholders are allowed. Format
@@ -954,10 +1011,11 @@ def _template_problem(template: str) -> str:
     for _, field_name, spec, conversion in parts:
         if field_name is None:
             continue
-        if field_name not in TEMPLATE_FIELDS or spec or conversion:
+        if field_name not in fields or spec or conversion:
+            names = ", ".join(f"{{{name}}}" for name in sorted(fields))
             return (
                 f"template placeholder {{{field_name}}} is not one of "
-                f"{_TEMPLATE_NAMES} (write {{{{ and }}}} for literal braces)"
+                f"{names} (write {{{{ and }}}} for literal braces)"
             )
     return ""
 

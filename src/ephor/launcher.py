@@ -471,6 +471,44 @@ def start(
     )
 
 
+def open_agent(
+    ticket_raw: str,
+    cwd: str | Path,
+    *,
+    provider: str = "claude",
+    prompt: str = "",
+) -> StartResult:
+    """Open an agent on ``ticket`` in ``cwd`` as it is — no worktree is created.
+
+    For a session that starts by looking at a ticket (``N`` on a ticket row
+    with a start_prompt): it runs in the ticket's existing worktree, or the
+    repo root when it has none, and makes the worktree itself (``ephor
+    start``) only if the work turns out to need one. A peek at somebody
+    else's PR leaves no branch behind.
+    """
+    ticket = normalize_ticket(ticket_raw)
+    if ticket is None:
+        return StartResult(False, f"{ticket_raw!r} is not a ticket key (expected e.g. DR-8222)")
+    target = Path(cwd).expanduser()
+    if not target.is_dir():
+        return StartResult(False, f"{target} does not exist")
+    try:
+        command, env = agent_invocation(provider, ticket=ticket, prompt=prompt)
+    except (KeyError, ValueError):
+        return StartResult(False, f"unknown provider {provider!r}")
+    window, pane, message = open_window(ticket, target, command, env)
+    if window is None:
+        return StartResult(False, message, worktree=str(target))
+    eventlog.append(
+        eventlog.EventKind.SESSION_STARTED,
+        ticket=ticket,
+        detail=f"{get_provider(provider).display_name} in {target.name}",
+        provider=get_provider(provider).name,
+        worktree=str(target),
+    )
+    return StartResult(True, message, worktree=str(target), window=window, pane=pane)
+
+
 def resume(
     session_id: str,
     *,

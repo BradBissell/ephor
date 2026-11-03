@@ -128,6 +128,41 @@ current status can have started.
 
 `Other` and `Unticketed` are reserved lane names.
 
+#### `start_prompt`: what `N` on a ticket row opens with
+
+`start_prompt` can go in `[board]`, and in a column table to override it for
+that lane's tickets. Pressing `N` twice on a ticket row then opens the agent
+on that prompt, **in place**: in the ticket's own worktree if it has one,
+otherwise the `[repos]` checkout. No worktree is created; the agent makes one
+itself if the work needs it. Without a `start_prompt`, `N` does what
+`ephor start` does: a fresh worktree and an agent with no prompt. `ephor
+start` itself never reads `start_prompt`, because scripts call it with their
+own `--prompt`.
+
+```toml
+[board]
+projects = ["DR"]
+start_prompt = "/next-step {ticket} {context}"
+columns = [
+  "To Do",
+  { name = "Review", statuses = ["Peer Review"], start_prompt = "/review-pr {ticket}" },
+  "Done",
+]
+```
+
+The prompt must begin with literal text, and may use:
+
+| Placeholder | Value (from the last flows snapshot; `""` when unknown) |
+|---|---|
+| `{ticket}`, `{title}`, `{status}`, `{lane}` | The ticket, its title, its Jira status and the lane it's in. |
+| `{age}` | How long it's been in its status, e.g. `3d` (`~3d` when estimated). |
+| `{pr_url}`, `{pr_number}`, `{ci}` | Its open PR (else its newest one) and that PR's CI: `pass`, `fail` or `pending`. |
+| `{context}` | All of that as one line: `status: Peer Review (lane Review, 3d in status); flagged; PR #812 open, CI fail https://…` |
+| `{repo}` | The directory the agent opens in. |
+
+PRs are only known when a flow uses `on_pr`, because that's when the tick asks
+`gh`.
+
 ### `[repos]`
 
 ```toml

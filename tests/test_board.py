@@ -715,3 +715,30 @@ def test_a_rule_repo_overrides_and_never_falls_back(tmp_path: Path) -> None:
     assert config.repo_for_rule(rule, "DR-1") == (tmp_path / "other", "rule")
     plain = replace(rule, repo="")
     assert config.repo_for_rule(plain, "DR-1") == (tmp_path, "repos.DR")
+
+
+def test_start_prompt_on_the_board_and_per_column() -> None:
+    config = _rules(
+        "",
+        header='[board]\nprojects = ["DR"]\nstart_prompt = "/next-step {ticket} {context}"\n'
+        'columns = ["To Do", { name = "Review", statuses = ["Peer Review"], '
+        'start_prompt = "/review-pr {ticket}" }, "Done"]\n',
+    )
+    assert config.errors == ()
+    assert config.board.start_prompt_for("To Do") == "/next-step {ticket} {context}"
+    assert config.board.start_prompt_for("Review") == "/review-pr {ticket}"
+    assert config.board.start_prompt_for("Other") == "/next-step {ticket} {context}"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "problem"),
+    [
+        ("{title} go", "must begin with literal text"),
+        ("-x {ticket}", "must begin with literal text"),
+        ("/next-step {session_id}", "is not one of"),
+    ],
+)
+def test_a_bad_start_prompt_is_an_error(prompt: str, problem: str) -> None:
+    config = _rules("", header=f'[board]\nprojects = ["DR"]\nstart_prompt = "{prompt}"\n')
+    assert any(problem in e and "start_prompt" in e for e in config.board_errors)
+    assert config.board.start_prompt == ""

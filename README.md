@@ -260,7 +260,7 @@ shows what would happen. The full reference is
 | `[` / `]` | cursor to the previous / next group header |
 | `a` / `d` | allow / deny the marked sessions' permission request |
 | `A` / `D` | standing allow for a session / revoke a decision |
-| `N` / `R` | start another session on this ticket / reopen this session; on a ticket row, `N` twice starts an agent in the ticket's repo (`[repos]` in board.toml) |
+| `N` / `R` | start another session on this ticket / reopen this session; on a ticket row, `N` twice starts an agent in the ticket's repo (`[repos]` in board.toml), on its `start_prompt` if board.toml sets one |
 | `x`, `s`, `o` | kill, summarize, open PR — all act on the marked set; `o` on a ticket row opens its PR, else the ticket in Jira |
 | `enter` / `J` | on a ticket row, open it in Jira / open the cursor row's ticket in Jira (needs `EPHOR_JIRA_URL`) |
 | `f` | flow runs: `y` approve / `N` twice deny a run awaiting confirmation |
