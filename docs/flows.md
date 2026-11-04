@@ -163,6 +163,11 @@ The prompt must begin with literal text, and may use:
 PRs are only known when a flow uses `on_pr`, because that's when the tick asks
 `gh`.
 
+Anyone who can edit the ticket or PR controls these values, so each one is
+flattened to a single line, stripped of control characters and capped at 300
+characters before it goes into the prompt. `{title}` is the most exposed;
+prefer `{context}`, which is built from statuses, PR numbers and CI states.
+
 ### `[repos]`
 
 ```toml

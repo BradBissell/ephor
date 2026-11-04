@@ -1540,11 +1540,19 @@ class EphorApp(App[int]):
         if not ticket:
             self._set_toast("no ticket on this row — pin one with p")
             return
+        config = self._lanes.config
+        if config is not None and config.board.has_start_prompt:
+            # With a start_prompt the row's kind makes no difference: a
+            # ticket that already has a session gets the same next-step
+            # session (press twice) as one that has none.
+            self._start_on_ticket_row(ticket)
+            return
         agent = self._agents_by_sid.get(sid)
         self._start_work(ticket, agent.provider if agent else "claude", agent.cwd if agent else "")
 
     def _start_on_ticket_row(self, ticket: str) -> None:
-        """`N` on a ticket row: the first press arms, a second within 3s starts an agent.
+        """`N` on a ticket row (or any row, with a start_prompt): the first press arms,
+        a second within 3s starts an agent.
 
         Only ever this one ticket — a ticket row never reaches the marked
         sessions. The repo comes from board.toml (``resolve_repo``), which
@@ -1615,7 +1623,9 @@ class EphorApp(App[int]):
     def _start_work(self, ticket: str, provider: str, cwd: str) -> None:
         """Create the worktree and window off the event loop — git is slow."""
         result = launcher.start(ticket, provider=provider or "claude", cwd=cwd or None)
-        self.call_from_thread(self._set_toast, f"start {ticket}: {result.message}")
+        self.call_from_thread(
+            self._set_toast, f"start {markup_text(ticket)}: {markup_text(result.message)}"
+        )
 
     @work(thread=True, exit_on_error=False, group="launch")
     def _resume_worker(self, sid: str, provider: str, cwd: str, ticket: str) -> None:

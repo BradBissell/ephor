@@ -1028,3 +1028,36 @@ async def test_n_twice_with_a_start_prompt_opens_the_agent_in_place(
     ((ticket, cwd, prompt),) = opened
     assert (ticket, cwd) == ("DR-3", repo)
     assert isinstance(prompt, str) and prompt.startswith("/next-step DR-3")
+
+
+@pytest.mark.asyncio
+async def test_n_on_a_session_row_uses_the_start_prompt_and_needs_two_presses(
+    lanes_fleet: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a ticket with a session got a bare `ephor start` per press, no prompt."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    body = _BOARD.replace("[board]\n", '[board]\nstart_prompt = "/next-step {ticket}"\n', 1)
+    _write_board(body + f'\n[repos]\nDR = "{repo}"\n')
+    opened: list[tuple[str, object]] = []
+    started: list[object] = []
+
+    def fake_open(ticket: str, cwd: object, **kwargs: object) -> launcher.StartResult:
+        opened.append((ticket, kwargs.get("prompt")))
+        return launcher.StartResult(True, "ok")
+
+    monkeypatch.setattr(launcher, "open_agent", fake_open)
+    monkeypatch.setattr(launcher, "start", lambda *a, **k: started.append(a))
+    app = EphorApp(manager=StateManager(lanes_fleet))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _cursor_on(app, "s1")
+        await pilot.press("N")
+        await app.workers.wait_for_complete()
+        assert opened == [] and started == []
+        await pilot.press("N")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+    assert started == []
+    assert opened == [("DR-1", "/next-step DR-1")]

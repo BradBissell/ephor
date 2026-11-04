@@ -335,7 +335,14 @@ def open_window(
         return None, "", f"invalid tmux session name {target_session!r}"
     prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(env.items()))
     full = f"exec env {prefix} {command}" if prefix else f"exec {command}"
-    args = ["/usr/bin/env", "tmux", "new-window", "-P", "-F", "#{window_id} #{pane_id}"]
+    args = [
+        "/usr/bin/env",
+        "tmux",
+        "new-window",
+        "-P",
+        "-F",
+        "#{window_id} #{pane_id} #{session_name}:#{window_index}",
+    ]
     if detached:
         args.append("-d")
     if target_session:
@@ -344,10 +351,13 @@ def open_window(
     code, out, err = _run(args)
     if code != 0:
         return None, "", f"tmux new-window failed: {err or 'unknown error'}"
-    window, _, pane = out.partition(" ")
+    window, _, rest = out.strip().partition(" ")
     if not window:
         return None, "", "tmux new-window printed no window id"
-    return window, pane.strip(), f"opened tmux window {window}"
+    pane, _, where = rest.partition(" ")
+    # Name the session: a dashboard running outside tmux opens the window in
+    # whichever session tmux picks, and "@34" alone does not say where to look.
+    return window, pane.strip(), f"opened tmux window {where.strip() or window}"
 
 
 def agent_invocation(provider: str, *, ticket: str, prompt: str = "") -> tuple[str, dict[str, str]]:

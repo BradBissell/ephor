@@ -438,8 +438,17 @@ def test_open_window_by_default_switches_to_the_window_in_the_current_session(
     args = calls[0]
     assert "-d" not in args
     assert "-t" not in args
-    assert args[args.index("-F") + 1] == "#{window_id} #{pane_id}"
+    assert args[args.index("-F") + 1] == "#{window_id} #{pane_id} #{session_name}:#{window_index}"
     assert args[-1] == "exec env A='b c' claude"
+
+
+def test_open_window_names_the_session_it_opened_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dashboard outside tmux needs to be told where the window went."""
+    _capture_run(monkeypatch, stdout="@34 %51 work:15\n")
+    window, pane, message = launcher.open_window("DR-1", tmp_path, "claude", {})
+    assert (window, pane, message) == ("@34", "%51", "opened tmux window work:15")
 
 
 def test_open_window_detached_into_a_named_session(
