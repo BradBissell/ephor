@@ -166,6 +166,11 @@ class BoardSettings:
         query = f"{scope} AND ({where})" if where else scope
         return f"{query} ORDER BY {order}" if order else query
 
+    @property
+    def has_start_prompt(self) -> bool:
+        """True when the board or any column sets a start_prompt."""
+        return bool(self.start_prompt) or any(c.start_prompt for c in self.columns)
+
     def start_prompt_for(self, lane: str) -> str:
         """The start_prompt template for a ticket in ``lane``: the column's, else the board's."""
         for column in self.columns:
@@ -634,14 +639,34 @@ def _parse_start_prompt(entry: Mapping[str, Any], where: str, errors: list[str])
     return value
 
 
+# C0/C1 controls, DEL and Unicode line/paragraph separators.
+_PROMPT_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+START_PROMPT_VALUE_MAX = 300
+
+
+def _prompt_value(raw: object) -> str:
+    """One placeholder value made safe to splice into an agent prompt.
+
+    Values come from Jira and GitHub, which anyone with edit rights on a
+    ticket or PR controls. Each one is flattened to a single line (so a title
+    cannot open a fake instruction on a line of its own), stripped of
+    terminal escape sequences, and capped in length.
+    """
+    text = " ".join(_PROMPT_UNSAFE.sub(" ", str(raw or "")).split())
+    if len(text) > START_PROMPT_VALUE_MAX:
+        text = text[: START_PROMPT_VALUE_MAX - 1].rstrip() + "…"
+    return text
+
+
 def render_start_prompt(template: str, values: Mapping[str, str]) -> str:
     """``template`` with every :data:`START_PROMPT_FIELDS` placeholder filled ("" when unknown).
 
     The result is one argument to the agent CLI (the launcher quotes it), and
     validation made it begin with literal text, so ticket text cannot arrive
-    as an option.
+    as an option. Each value is one line with no control characters
+    (:func:`_prompt_value`).
     """
-    filled = {name: str(values.get(name, "") or "") for name in START_PROMPT_FIELDS}
+    filled = {name: _prompt_value(values.get(name, "")) for name in START_PROMPT_FIELDS}
     return template.format_map(filled).strip()
 
 
