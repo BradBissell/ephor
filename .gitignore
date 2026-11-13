@@ -13,3 +13,7 @@ build/
 # Internal-only design notes and handoff docs.
 # Tracked locally; never published.
 /docs/internal/
+
+# Local env files and their backups — may contain secrets.
+.env
+.env.*
